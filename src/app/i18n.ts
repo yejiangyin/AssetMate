@@ -1,0 +1,732 @@
+import type { Language } from "./context/AppContext";
+import type { DCAFrequency, MarketType } from "./services/tradingCalendar";
+
+export const appText = {
+  zh: {
+    appName: "资产助手",
+    common: {
+      all: "全部",
+      back: "返回",
+      cancel: "取消",
+      save: "保存",
+      saving: "保存中...",
+      confirmDelete: "确认删除",
+      delete: "删除",
+      edit: "编辑",
+      create: "新建",
+      refresh: "刷新",
+      loading: "加载中...",
+      noData: "暂无真实数据",
+      noChart: "暂无图表",
+      quote: "行情",
+      sharesUnit: "只",
+      notGrouped: "未分组",
+      local: "本地",
+      live: "实时",
+      matched: "已匹配",
+      referenceOnly: "仅供参考",
+    },
+    nav: {
+      dashboard: "总览",
+      holdings: "持仓",
+      market: "行情",
+      settings: "设置",
+    },
+    dashboard: {
+      totalAsset: "总资产（CNY）",
+      today: "今日",
+      todayPnl: "今日盈亏",
+      cumulativePnl: "累计盈亏",
+      costBasis: "持仓成本",
+      positionsGroups: (positions: number, groups: number) => `${positions} 只 · ${groups} 组`,
+      snapshotTrend: "近 30 日走势（账户快照）",
+      estimatedTrend: "近 30 日走势（历史估算）",
+      trendLoading: "趋势数据加载中…",
+      noTrend: "暂无足够趋势数据",
+      addHoldingsForTrend: "录入持仓后显示趋势",
+      allocation: "资产配置",
+      holdingDetails: "持仓明细 ›",
+      marketTitle: "全球行情",
+      marketDesc: "美股 · 港股 · A股 · 加密 · 大宗 · 汇率",
+      view: "查看",
+      movers: "今日盈亏排行",
+      gainRank: "盈利榜",
+      lossRank: "亏损榜",
+      volatilityRank: "波动榜",
+      emptyType: "该类型暂无持仓",
+    },
+    holdings: {
+      title: "持仓总览",
+      add: "录入",
+      addHolding: "录入持仓",
+      editHolding: "编辑持仓",
+      addNewHolding: "录入新持仓",
+      firstHolding: "录入第一笔持仓",
+      totalMarketValue: "持仓市值",
+      todayPnl: "今日盈亏",
+      cumulativePnl: "累计盈亏",
+      searchPlaceholder: "搜索代码或名称",
+      searchSecurityPlaceholder: "搜索代码或名称，例如 006479 / 苹果 / BTC",
+      allGroups: (groups: number) => `全部分组 · ${groups} 个自定义分组`,
+      currentGroup: (name: string) => `当前分组：${name}`,
+      positionCount: (count: number) => `${count} 个持仓`,
+      groupAssetRatio: "分组资产占比",
+      emptyGroup: "当前分组暂无持仓",
+      noHoldingsInGroup: "暂无持仓 · 录入时选择此分组",
+      noGroups: "暂无分组",
+      addGroup: "+ 分组",
+      newGroup: "新建分组",
+      editGroup: "编辑分组",
+      saveChanges: "保存修改",
+      confirmCreate: "确认创建",
+      groupName: "分组名称",
+      groupNamePlaceholder: "例如：海外资产、加密资产",
+      groupColor: "分组颜色",
+      deleteHolding: "删除持仓",
+      deleteGroup: "删除分组",
+      deleteHoldingDesc: "此操作不可撤销。",
+      deleteGroupDesc: (name: string) => `删除“${name}”后，其中持仓会移到未分组，数据不会丢。`,
+      basicInfo: "基本信息",
+      holdingInfo: "持仓信息",
+      security: "证券 *",
+      assetType: "资产类型",
+      currency: "币种",
+      group: "分组",
+      quantity: "持仓数量 *",
+      costPrice: "成本均价 *",
+      currentPrice: "当前价",
+      autoFill: "自动带入",
+      noGroup: "— 不分组 —",
+      selectAfterSecurity: "选择证券后自动带入",
+      estimatedMarketValue: "预估市值",
+      returnRate: "收益率",
+      waitingQuote: "待报价",
+      cost: "成本",
+      price: "现价",
+      estimated: "估算",
+      nav: "净值",
+      quote: "报价",
+      dca: "定投",
+      dcaPaused: "定投暂停",
+      buy: "加仓",
+      sell: "减仓",
+      byQuantity: "按数量",
+      byAmount: "按金额",
+      transactionPrice: "成交价格",
+      inputTransactionPrice: "输入成交价",
+      buyQuantity: (unit: string) => `加仓数量（${unit}）`,
+      sellQuantity: (unit: string) => `减仓数量（${unit}）`,
+      buyAmount: (currency: string) => `加仓金额（${currency}）`,
+      sellAmount: (currency: string) => `减仓金额（${currency}）`,
+      inputBuyQuantity: "输入买入数量",
+      inputBuyAmount: "输入买入金额",
+      max: (value: string) => `最多 ${value}`,
+      estimatedTrade: (mode: "buy" | "sell", qty: string, unit: string) => `预计${mode === "buy" ? "买入" : "卖出"} ${qty} ${unit}`,
+      remaining: (qty: string, unit: string) => `剩余约 ${qty} ${unit}`,
+      sellAmountError: "减仓金额不能超过当前持仓市值。",
+      sellQuantityError: "减仓数量不能超过当前持仓。",
+      confirmBuy: "确认加仓",
+      confirmSell: "确认减仓",
+      confirmInput: "确认录入",
+      sortMarketValue: "市值",
+      sortToday: "今日%",
+      sortTotal: "总收益%",
+      units: { stock: "股", fund: "份", crypto: "枚", bond: "张" },
+    },
+    market: {
+      title: "全球行情",
+      refresh: "刷新行情",
+      count: (count: number) => `${count} 个`,
+      categories: {
+        全部: "全部",
+        美股: "美股",
+        港股: "港股",
+        A股: "A股",
+        日股: "日股",
+        加密: "加密",
+        大宗: "大宗",
+        汇率: "汇率",
+      },
+      sections: {
+        美股: ["美股指数", "美国主要股指"],
+        港股: ["港股指数", "香港主要股指"],
+        A股: ["A股指数", "中国内地主要股指"],
+        日股: ["日股行情", "日本主要股指"],
+        加密: ["加密货币", "主要数字资产"],
+        大宗: ["大宗商品", "能源 · 贵金属 · 原材料"],
+        汇率: ["外汇汇率", "主要货币对人民币"],
+      },
+    },
+    dca: {
+      title: "定投计划",
+      create: "新建定投",
+      edit: "编辑定投",
+      checker: "交易日查询",
+      new: "新建",
+      planCount: "计划数",
+      enabled: "启用中",
+      totalInvested: "总投入",
+      empty: "暂无定投计划",
+      createNow: "立即创建",
+      listNote: "定投仅可绑定已有持仓。股票/场内ETF 到期按可买状态自动加仓；场外基金会先进入待入账，等正式净值匹配后再入账。若遇到停牌、限购、不可买入或无有效报价，会自动记录原因。",
+      missingHolding: "持仓缺失",
+      suspended: "停牌",
+      limited: "限购",
+      notBuyable: "不可买",
+      executable: "可执行",
+      today: "今日",
+      tomorrow: "明日",
+      daysLater: (days: number) => `${days}天后`,
+      latestConfirmed: (date: string) => `最近入账 ${date}`,
+      pending: (date: string) => `待入账 ${date}`,
+      skipped: (reason: string) => `未入账 ${reason}`,
+      noExecutions: "暂无执行记录",
+      posted: "已入账",
+      pendingStatus: "待入账",
+      skippedStatus: "未入账",
+      amountPosted: "入账金额",
+      status: "入账状态",
+      futurePreview: "未来 5 次执行预览",
+      byTradingDays: (market: string) => `按${market}交易日`,
+      originalNonTrading: (date: string) => `(原定 ${date}，非交易日)`,
+      postponed: "顺延",
+      tradingDay: "交易日",
+      previewError: "执行预览计算失败，请检查开始日期和周期设置",
+      blockedNote: "到期执行若状态未恢复，将自动跳过并记录失败原因。",
+      postedSummary: (count: number) => `累计已入账 ${count} 次`,
+      paymentDate: "扣款日",
+      bought: "买入",
+      tradePrice: "成交价",
+      navDate: "净值日",
+      confirmedDate: "入账日",
+      original: "原定",
+      estimatedConfirm: "预计入账",
+      skipReason: "未入账原因",
+      hiddenExecutions: (count: number) => `仅展示最近 8 条明细，另有 ${count} 条较早记录已收起。`,
+      selectHolding: "关联持仓",
+      chooseHolding: "请选择持仓",
+      allHoldingsPlanned: "所有持仓都已配置定投，每个持仓仅支持一个定投计划。",
+      holdingLocked: "关联持仓不可修改",
+      amountPerPeriod: "每期金额",
+      currency: "货币",
+      autoCurrency: "自动带入",
+      frequency: "定投频率",
+      weekday: "执行星期",
+      nonTradingPostpone: "若当日为非交易日，将顺延至下一交易日",
+      dayOfMonth: "每月执行日期（1–28）",
+      day: "日",
+      startDate: "开始日期",
+      records: "入账/未入账记录",
+      savePlan: "保存计划",
+      deleteTitle: "删除定投计划？",
+      deleteDesc: "此操作不可撤销，历史执行记录将同步清除。",
+      noHoldingFirst: "请先录入持仓，再创建定投计划。",
+      validateHolding: "请选择关联持仓",
+      validateDuplicate: "该持仓已有定投计划",
+      validateAmount: "请填写有效金额",
+      dateCheckerTitle: "交易日查询",
+      isTradingDay: "交易日 ✓",
+      isClosed: "非交易日",
+    },
+    settings: {
+      title: "设置",
+      display: "显示设置",
+      currency: "基准货币",
+      language: "语言",
+      languageDesc: "切换插件界面的显示语言",
+      privacy: "隐私模式",
+      privacyDesc: "设置每次打开插件时默认隐藏或显示敏感数据",
+      theme: "外观主题",
+      themePreview: "主题预览",
+      themeLight: "浅色",
+      themeSystem: "跟随",
+      themeDark: "深色",
+      pnlColor: "涨跌颜色",
+      pnlColorDesc: "切换红涨绿跌 / 绿涨红跌",
+      redUp: "红涨",
+      greenUp: "绿涨",
+      dca: "自动定投",
+      dcaManage: "定投计划管理",
+      dcaEmpty: "尚未创建定投计划，点击新建",
+      dcaSummary: (enabled: number, total: number) => `${enabled} 个启用 · ${total} 个计划`,
+      refresh: "刷新设置",
+      autoRefresh: "自动刷新",
+      autoRefreshDesc: "定期自动获取最新数据",
+      tradeTimeOnly: "仅交易时间刷新",
+      tradeTimeOnlyDesc: "根据市场开盘时间智能刷新",
+      calendar: "交易日历",
+      calendarUpdate: "更新",
+      calendarFallback: "使用内置日历，联网后自动更新",
+      calendarUpdated: (date: string, years: string) => `${date} 已更新${years}`,
+      calendarOk: "交易日历已更新",
+      calendarFail: "交易日历更新失败，继续使用内置日历",
+      data: "数据管理",
+      exportData: "导出数据",
+      exportDesc: "导出持仓、分组、定投计划和设置为 JSON",
+      exportAction: "导出",
+      exportOk: "数据已导出成功",
+      importData: "导入数据",
+      importDesc: "从 JSON 文件恢复持仓和配置",
+      importAction: "导入",
+      importOk: "数据已导入成功",
+      importFail: "导入失败",
+      reset: "重置本地数据",
+      resetDesc: "清空本地持仓和设置，恢复为空白状态",
+      clear: "清除",
+      clearTitle: "清除缓存数据",
+      clearDesc: "此操作将清除本地持仓、分组、定投计划和设置，并恢复为空白状态。",
+      cancel: "取消",
+      confirmClear: "确认清除",
+      clearOk: "本地数据已清除",
+      privacyNotice: "所有数据仅存储在本地浏览器中，不上传至任何服务器。插件不会读取您的密码、验证码，也不会自动交易。",
+      refreshOptions: ["关闭", "1分钟", "5分钟", "15分钟", "30分钟", "1小时"],
+    },
+    routeError: {
+      title: "页面加载失败",
+      desc: "请返回首页或刷新插件后重试。",
+      action: "返回首页",
+    },
+  },
+  en: {
+    appName: "Asset Helper",
+    common: {
+      all: "All",
+      back: "Back",
+      cancel: "Cancel",
+      save: "Save",
+      saving: "Saving...",
+      confirmDelete: "Delete",
+      delete: "Delete",
+      edit: "Edit",
+      create: "Create",
+      refresh: "Refresh",
+      loading: "Loading...",
+      noData: "No live data",
+      noChart: "No chart",
+      quote: "Quote",
+      sharesUnit: "items",
+      notGrouped: "Ungrouped",
+      local: "Local",
+      live: "Live",
+      matched: "Matched",
+      referenceOnly: "For reference",
+    },
+    nav: {
+      dashboard: "Home",
+      holdings: "Holdings",
+      market: "Market",
+      settings: "Settings",
+    },
+    dashboard: {
+      totalAsset: "Total Assets (CNY)",
+      today: "Today",
+      todayPnl: "Today's P/L",
+      cumulativePnl: "Total P/L",
+      costBasis: "Cost Basis",
+      positionsGroups: (positions: number, groups: number) => `${positions} holdings · ${groups} groups`,
+      snapshotTrend: "Last 30 Days (Snapshots)",
+      estimatedTrend: "Last 30 Days (Estimated)",
+      trendLoading: "Loading trend…",
+      noTrend: "Not enough trend data",
+      addHoldingsForTrend: "Add holdings to show trend",
+      allocation: "Asset Allocation",
+      holdingDetails: "Holdings ›",
+      marketTitle: "Global Markets",
+      marketDesc: "US · HK · China A · Crypto · Commodities · FX",
+      view: "View",
+      movers: "Today's P/L Ranking",
+      gainRank: "Gainers",
+      lossRank: "Losers",
+      volatilityRank: "Movers",
+      emptyType: "No holdings in this type",
+    },
+    holdings: {
+      title: "Holdings",
+      add: "Add",
+      addHolding: "Add Holding",
+      editHolding: "Edit Holding",
+      addNewHolding: "Add New Holding",
+      firstHolding: "Add First Holding",
+      totalMarketValue: "Market Value",
+      todayPnl: "Today's P/L",
+      cumulativePnl: "Total P/L",
+      searchPlaceholder: "Search symbol or name",
+      searchSecurityPlaceholder: "Search code or name, e.g. 006479 / Apple / BTC",
+      allGroups: (groups: number) => `All groups · ${groups} custom groups`,
+      currentGroup: (name: string) => `Current group: ${name}`,
+      positionCount: (count: number) => `${count} holdings`,
+      groupAssetRatio: "Group Allocation",
+      emptyGroup: "No holdings in this group",
+      noHoldingsInGroup: "No holdings · choose this group when adding",
+      noGroups: "No groups",
+      addGroup: "+ Group",
+      newGroup: "New Group",
+      editGroup: "Edit Group",
+      saveChanges: "Save Changes",
+      confirmCreate: "Create",
+      groupName: "Group Name",
+      groupNamePlaceholder: "e.g. Overseas Assets, Crypto Assets",
+      groupColor: "Group Color",
+      deleteHolding: "Delete Holding",
+      deleteGroup: "Delete Group",
+      deleteHoldingDesc: "This cannot be undone.",
+      deleteGroupDesc: (name: string) => `After deleting "${name}", its holdings will move to Ungrouped. Data will not be lost.`,
+      basicInfo: "Basic Info",
+      holdingInfo: "Position Info",
+      security: "Security *",
+      assetType: "Asset Type",
+      currency: "Currency",
+      group: "Group",
+      quantity: "Quantity *",
+      costPrice: "Avg Cost *",
+      currentPrice: "Current Price",
+      autoFill: "Auto",
+      noGroup: "— No group —",
+      selectAfterSecurity: "Auto-filled after selecting a security",
+      estimatedMarketValue: "Est. Value",
+      returnRate: "Return",
+      waitingQuote: "Waiting quote",
+      cost: "Cost",
+      price: "Price",
+      estimated: "Est.",
+      nav: "NAV",
+      quote: "Quote",
+      dca: "DCA",
+      dcaPaused: "DCA Paused",
+      buy: "Buy",
+      sell: "Sell",
+      byQuantity: "By Qty",
+      byAmount: "By Amount",
+      transactionPrice: "Trade Price",
+      inputTransactionPrice: "Enter trade price",
+      buyQuantity: (unit: string) => `Buy Qty (${unit})`,
+      sellQuantity: (unit: string) => `Sell Qty (${unit})`,
+      buyAmount: (currency: string) => `Buy Amount (${currency})`,
+      sellAmount: (currency: string) => `Sell Amount (${currency})`,
+      inputBuyQuantity: "Enter buy quantity",
+      inputBuyAmount: "Enter buy amount",
+      max: (value: string) => `Max ${value}`,
+      estimatedTrade: (mode: "buy" | "sell", qty: string, unit: string) => `Est. ${mode === "buy" ? "buy" : "sell"} ${qty} ${unit}`,
+      remaining: (qty: string, unit: string) => `About ${qty} ${unit} left`,
+      sellAmountError: "Sell amount cannot exceed current market value.",
+      sellQuantityError: "Sell quantity cannot exceed current holdings.",
+      confirmBuy: "Confirm Buy",
+      confirmSell: "Confirm Sell",
+      confirmInput: "Add Holding",
+      sortMarketValue: "Value",
+      sortToday: "Today %",
+      sortTotal: "Total %",
+      units: { stock: "sh", fund: "units", crypto: "coins", bond: "lots" },
+    },
+    market: {
+      title: "Global Markets",
+      refresh: "Refresh market",
+      count: (count: number) => `${count} items`,
+      categories: {
+        全部: "All",
+        美股: "US",
+        港股: "HK",
+        A股: "China A",
+        日股: "Japan",
+        加密: "Crypto",
+        大宗: "Commodities",
+        汇率: "FX",
+      },
+      sections: {
+        美股: ["US Indices", "Major US indices"],
+        港股: ["HK Indices", "Major Hong Kong indices"],
+        A股: ["China A Indices", "Mainland China indices"],
+        日股: ["Japan Market", "Major Japan indices"],
+        加密: ["Crypto", "Major digital assets"],
+        大宗: ["Commodities", "Energy · Metals · Materials"],
+        汇率: ["FX Rates", "Major pairs vs CNY"],
+      },
+    },
+    dca: {
+      title: "DCA Plans",
+      create: "New DCA",
+      edit: "Edit DCA",
+      checker: "Trading Day Check",
+      new: "New",
+      planCount: "Plans",
+      enabled: "Enabled",
+      totalInvested: "Invested",
+      empty: "No DCA plans",
+      createNow: "Create Now",
+      listNote: "DCA plans can only be linked to existing holdings. Stocks and listed ETFs are added when buyable; off-exchange funds enter pending first and are posted after official NAV is matched. Suspensions, limits, not-buyable states, or missing quotes are recorded automatically.",
+      missingHolding: "Missing holding",
+      suspended: "Suspended",
+      limited: "Limited",
+      notBuyable: "Not buyable",
+      executable: "Ready",
+      today: "Today",
+      tomorrow: "Tomorrow",
+      daysLater: (days: number) => `${days}d later`,
+      latestConfirmed: (date: string) => `Latest posted ${date}`,
+      pending: (date: string) => `Pending ${date}`,
+      skipped: (reason: string) => `Skipped ${reason}`,
+      noExecutions: "No execution records",
+      posted: "Posted",
+      pendingStatus: "Pending",
+      skippedStatus: "Skipped",
+      amountPosted: "Posted Amount",
+      status: "Status",
+      futurePreview: "Next 5 Executions",
+      byTradingDays: (market: string) => `By ${market} trading days`,
+      originalNonTrading: (date: string) => `(Scheduled ${date}, non-trading day)`,
+      postponed: "Postponed",
+      tradingDay: "Trading day",
+      previewError: "Preview failed. Check start date and schedule settings.",
+      blockedNote: "If the status is still blocked on the due date, it will be skipped and recorded.",
+      postedSummary: (count: number) => `${count} posted`,
+      paymentDate: "Payment",
+      bought: "Bought",
+      tradePrice: "Price",
+      navDate: "NAV date",
+      confirmedDate: "Posted",
+      original: "Scheduled",
+      estimatedConfirm: "Est. posting",
+      skipReason: "Reason",
+      hiddenExecutions: (count: number) => `Showing latest 8 records. ${count} older records are collapsed.`,
+      selectHolding: "Linked Holding",
+      chooseHolding: "Choose a holding",
+      allHoldingsPlanned: "All holdings already have DCA plans. Each holding supports one plan.",
+      holdingLocked: "Linked holding cannot be changed",
+      amountPerPeriod: "Amount",
+      currency: "Currency",
+      autoCurrency: "Auto",
+      frequency: "Frequency",
+      weekday: "Weekday",
+      nonTradingPostpone: "If it is not a trading day, execution is postponed to the next trading day",
+      dayOfMonth: "Monthly Day (1-28)",
+      day: "day",
+      startDate: "Start Date",
+      records: "Posted / Pending Records",
+      savePlan: "Save Plan",
+      deleteTitle: "Delete DCA plan?",
+      deleteDesc: "This cannot be undone. Historical execution records will also be removed.",
+      noHoldingFirst: "Add a holding before creating a DCA plan.",
+      validateHolding: "Choose a linked holding",
+      validateDuplicate: "This holding already has a DCA plan",
+      validateAmount: "Enter a valid amount",
+      dateCheckerTitle: "Trading Day Check",
+      isTradingDay: "Trading day ✓",
+      isClosed: "Closed",
+    },
+    settings: {
+      title: "Settings",
+      display: "Display",
+      currency: "Base Currency",
+      language: "Language",
+      languageDesc: "Switch the extension display language",
+      privacy: "Privacy Mode",
+      privacyDesc: "Hide or show sensitive data by default when opening the extension",
+      theme: "Theme",
+      themePreview: "Theme preview",
+      themeLight: "Light",
+      themeSystem: "System",
+      themeDark: "Dark",
+      pnlColor: "Gain/Loss Color",
+      pnlColorDesc: "Switch red-up/green-down or green-up/red-down",
+      redUp: "Red Up",
+      greenUp: "Green Up",
+      dca: "Auto DCA",
+      dcaManage: "DCA Plan Management",
+      dcaEmpty: "No DCA plan yet. Tap to create one",
+      dcaSummary: (enabled: number, total: number) => `${enabled} enabled · ${total} plans`,
+      refresh: "Refresh",
+      autoRefresh: "Auto Refresh",
+      autoRefreshDesc: "Fetch latest data periodically",
+      tradeTimeOnly: "Trading Hours Only",
+      tradeTimeOnlyDesc: "Refresh based on market open hours",
+      calendar: "Trading Calendar",
+      calendarUpdate: "Update",
+      calendarFallback: "Using built-in calendar; auto-updates when online",
+      calendarUpdated: (date: string, years: string) => `${date} updated${years}`,
+      calendarOk: "Trading calendar updated",
+      calendarFail: "Calendar update failed; using built-in calendar",
+      data: "Data",
+      exportData: "Export Data",
+      exportDesc: "Export holdings, groups, DCA plans, and settings as JSON",
+      exportAction: "Export",
+      exportOk: "Data exported",
+      importData: "Import Data",
+      importDesc: "Restore holdings and settings from a JSON file",
+      importAction: "Import",
+      importOk: "Data imported",
+      importFail: "Import failed",
+      reset: "Reset Local Data",
+      resetDesc: "Clear local holdings and settings",
+      clear: "Clear",
+      clearTitle: "Clear Cached Data",
+      clearDesc: "This will clear local holdings, groups, DCA plans, and settings.",
+      cancel: "Cancel",
+      confirmClear: "Clear",
+      clearOk: "Local data cleared",
+      privacyNotice: "All data is stored only in your local browser. Nothing is uploaded. The extension does not read passwords or verification codes and never trades automatically.",
+      refreshOptions: ["Off", "1 min", "5 min", "15 min", "30 min", "1 hour"],
+    },
+    routeError: {
+      title: "Page failed to load",
+      desc: "Go back home or reload the extension and try again.",
+      action: "Back Home",
+    },
+  },
+} as const;
+
+export type AppCopy = (typeof appText)[Language];
+
+export function t(language: Language): AppCopy {
+  return appText[language];
+}
+
+const defaultGroupNames: Record<string, Record<Language, string>> = {
+  group_oversea: { zh: "海外资产", en: "Overseas Assets" },
+  group_astock: { zh: "A股资产", en: "China A Assets" },
+  group_crypto: { zh: "加密资产", en: "Crypto Assets" },
+  group_conservative: { zh: "稳健资产", en: "Conservative Assets" },
+};
+
+export function groupName(id: string | undefined, name: string | undefined, language: Language) {
+  if (!id) return appText[language].common.notGrouped;
+  return defaultGroupNames[id]?.[language] ?? name ?? appText[language].common.notGrouped;
+}
+
+export function frequencyLabel(freq: DCAFrequency, language: Language) {
+  const labels: Record<DCAFrequency, Record<Language, string>> = {
+    daily: { zh: "每交易日", en: "Every trading day" },
+    weekly: { zh: "每周", en: "Weekly" },
+    monthly: { zh: "每月", en: "Monthly" },
+  };
+  return labels[freq][language];
+}
+
+export function weekdayLabel(day: number, language: Language) {
+  const zh = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+  const en = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  return (language === "en" ? en : zh)[day] ?? String(day);
+}
+
+export function monthDayLabel(date: string, language: Language) {
+  if (!date) return "—";
+  const [, month = "", day = ""] = date.split("-");
+  return language === "en" ? `${month}/${day}` : `${month}月${day}日`;
+}
+
+export function marketLabel(market: string | null | undefined, language: Language) {
+  const labels: Record<string, Record<Language, string>> = {
+    US: { zh: "美股", en: "US" },
+    HK: { zh: "港股", en: "HK" },
+    A: { zh: "A股", en: "China A" },
+    JP: { zh: "日股", en: "Japan" },
+    UK: { zh: "英股", en: "UK" },
+    DE: { zh: "德股", en: "Germany" },
+    IN: { zh: "印度", en: "India" },
+    VN: { zh: "越南", en: "Vietnam" },
+    CRYPTO: { zh: "加密", en: "Crypto" },
+    FUND: { zh: "基金", en: "Fund" },
+    BOND: { zh: "债券", en: "Bond" },
+    GOLD: { zh: "黄金", en: "Gold" },
+    INDEX: { zh: "指数", en: "Index" },
+    FX: { zh: "汇率", en: "FX" },
+    COMMODITY: { zh: "大宗", en: "Commodity" },
+  };
+  return labels[market ?? ""]?.[language] ?? (language === "en" ? "Other" : "其他");
+}
+
+export function assetTypeLabel(assetType: string | null | undefined, language: Language) {
+  const labels: Record<string, Record<Language, string>> = {
+    stock: { zh: "股票", en: "Stock" },
+    etf: { zh: "ETF", en: "ETF" },
+    fund: { zh: "基金", en: "Fund" },
+    crypto: { zh: "加密货币", en: "Crypto" },
+    bond: { zh: "债券", en: "Bond" },
+    commodity: { zh: "商品", en: "Commodity" },
+    index: { zh: "指数", en: "Index" },
+  };
+  return labels[assetType ?? ""]?.[language] ?? (language === "en" ? "Other" : "其他");
+}
+
+export function translateTradeText(text: string | undefined | null, language: Language) {
+  if (language === "zh" || !text) return text ?? "";
+  return text
+    .replaceAll("自动", "Auto")
+    .replaceAll("手动", "Manual")
+    .replaceAll("东方财富", "EastMoney")
+    .replaceAll("腾讯行情", "Tencent Quotes")
+    .replaceAll("停牌/暂停交易", "Suspended")
+    .replaceAll("停牌", "Suspended")
+    .replaceAll("基金限购", "Fund limited")
+    .replaceAll("限购", "Limited")
+    .replaceAll("当前不可买入", "Not buyable")
+    .replaceAll("正常可买", "Buyable")
+    .replaceAll("可执行", "Ready")
+    .replaceAll("不可买", "Not buyable")
+    .replaceAll("基金当前不可买入", "Fund is not buyable")
+    .replaceAll("东方财富基金交易状态显示可买", "EastMoney fund status is buyable")
+    .replaceAll("自动行情源显示可正常交易", "Quote source shows normal trading")
+    .replaceAll("报价显示停牌或暂停交易", "Quote source shows suspended trading");
+}
+
+export function translateDcaReason(reason: string | undefined | null, language: Language) {
+  if (language === "zh" || !reason) return reason ?? "";
+  return reason
+    .replaceAll("等待正式净值确认后入账", "Waiting for official NAV confirmation")
+    .replaceAll("关联持仓不存在", "Linked holding does not exist")
+    .replaceAll("待入账记录已不再关联基金持仓", "Pending record is no longer linked to a fund holding")
+    .replaceAll("确认份额计算失败", "Confirmed quantity calculation failed")
+    .replaceAll("买入份额计算失败", "Buy quantity calculation failed")
+    .replaceAll("暂无有效报价", "No valid quote")
+    .replaceAll("报价未刷新，跳过自动定投", "Quote is stale, DCA skipped")
+    .replaceAll("正式净值", "official NAV")
+    .replaceAll("未获取到", "Could not get")
+    .replaceAll("已跳过", "skipped")
+    .replaceAll("超出自动净值缓存窗口，未能匹配", "Outside NAV cache window; could not match")
+    .replaceAll("对应", "matching")
+    .replaceAll("暂不入账", "not posted yet")
+    .replaceAll("超过", "Over")
+    .replaceAll("个确认交易日仍", "confirmation trading days and still")
+    .replaceAll("修复：", "Repair: ")
+    .replaceAll("非交易日", "non-trading day")
+    .replaceAll("不可执行", "not executable")
+    .replaceAll("限购额度内执行", "Executed within purchase limit")
+    .replaceAll("基金限购", "Fund limited")
+    .replaceAll("限购", "Limited")
+    .replaceAll("暂停申购", "Subscription suspended")
+    .replaceAll("不可买", "Not buyable");
+}
+
+export function translateClosureReason(reason: string | null | undefined, language: Language) {
+  if (language === "zh" || !reason) return reason ?? "";
+  return reason
+    .replaceAll("周六休市", "Saturday closure")
+    .replaceAll("周日休市", "Sunday closure")
+    .replaceAll("公众假日", "Public holiday")
+    .replaceAll("春节假期", "Lunar New Year holiday")
+    .replaceAll("清明假期", "Qingming holiday")
+    .replaceAll("劳动节假期", "Labor Day holiday")
+    .replaceAll("端午假期", "Dragon Boat holiday")
+    .replaceAll("中秋假期", "Mid-Autumn holiday")
+    .replaceAll("国庆假期", "National Day holiday")
+    .replaceAll("美国", "US ")
+    .replaceAll("香港", "Hong Kong ")
+    .replaceAll("英国", "UK ")
+    .replaceAll("德国", "Germany ")
+    .replaceAll("日本", "Japan ")
+    .replaceAll("印度", "India ")
+    .replaceAll("越南", "Vietnam ")
+    .replaceAll("圣诞节", "Christmas")
+    .replaceAll("感恩节", "Thanksgiving")
+    .replaceAll("独立日", "Independence Day")
+    .replaceAll("总统日", "Presidents Day")
+    .replaceAll("马丁路德金日", "MLK Day")
+    .replaceAll("耶稣受难日", "Good Friday");
+}
+
+export function categoryLabel(category: string, language: Language) {
+  return appText[language].market.categories[category as keyof typeof appText.zh.market.categories] ?? category;
+}
+
+export function dcaMarketForLabel(market: MarketType, language: Language) {
+  return marketLabel(market, language);
+}

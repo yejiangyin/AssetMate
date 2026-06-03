@@ -1,0 +1,17 @@
+node_modules/
+.pnpm-store/
+.claude/
+
+dist/
+release/
+
+.DS_Store
+*.log
+*.local
+
+.env
+.env.*
+!.env.example
+
+coverage/
+.vite/

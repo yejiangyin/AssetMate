@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "资产助手",
+  "version": "0.0.3",
+  "description": "个人资产与多市场行情查看插件。",
+  "icons": {
+    "16":  "icons/icon-16.png",
+    "32":  "icons/icon-32.png",
+    "48":  "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "资产助手",
+    "default_popup": "index.html",
+    "default_icon": {
+      "16":  "icons/icon-16.png",
+      "32":  "icons/icon-32.png",
+      "48":  "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "host_permissions": [
+    "https://query1.finance.yahoo.com/v8/finance/*",
+    "https://api.nasdaq.com/api/quote/*",
+    "https://api.robinhood.com/marketdata/*",
+    "https://api.coingecko.com/api/v3/*",
+    "https://searchapi.eastmoney.com/*",
+    "https://push2delay.eastmoney.com/api/*",
+    "https://push2his.eastmoney.com/api/*",
+    "https://fundsuggest.eastmoney.com/FundSearch/*",
+    "https://fundf10.eastmoney.com/*",
+    "https://api.fund.eastmoney.com/f10/*",
+    "https://fund.eastmoney.com/pingzhongdata/*",
+    "https://fundgz.1234567.com.cn/js/*",
+    "https://datacenter-web.eastmoney.com/api/*",
+    "https://qt.gtimg.cn/*",
+    "https://web.ifzq.gtimg.cn/appstock/*",
+    "https://open.er-api.com/v6/*",
+    "https://api.binance.com/api/v3/*",
+    "https://www.okx.com/api/v5/*"
+  ]
+}
