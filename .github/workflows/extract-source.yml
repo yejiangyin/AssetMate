@@ -1,0 +1,31 @@
+name: Extract uploaded source
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    if: contains(github.event.head_commit.message, 'Prepare source extraction')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract source archive
+        run: |
+          unzip -o AssetMate-source.zip
+          rm -f AssetMate-source.zip
+          rm -f .github/workflows/extract-source.yml
+      - name: Commit extracted source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Extract source files" || exit 0
+          git push
