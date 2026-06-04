@@ -3,7 +3,8 @@ import { groups as initialGroups, holdings as initialHoldings, Group, Holding } 
 import { FX, refreshPrices, toCNY } from "../services/priceRefresher";
 import { MarketType, DCAFrequency, isMarketOpenNow, refreshTradingCalendar } from "../services/tradingCalendar";
 import type { ChartPoint } from "../services/quoteApi";
-import { normalizeHolding, buildHolding, applyHoldingAdjustment } from "../utils/holdingHelpers";
+import { fetchCorporateActions } from "../services/corporateActions";
+import { normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction } from "../utils/holdingHelpers";
 import { dedupeDCAExecutions, hydratePlans, repairDCAData, settleDueDCAPlans, syncPlanWithHolding, computeNextExec } from "../utils/dcaEngine";
 
 /* ─── types ──────────────────────────────────────────── */
@@ -14,6 +15,7 @@ type RefreshInterval = 0 | 1 | 5 | 15 | 30 | 60;
 export type Language = "zh" | "en";
 export type HoldingTradeStatus = "normal" | "suspended" | "fund_limit" | "buy_disabled";
 export type HoldingAdjustmentType = "buy" | "sell";
+export type HoldingCorporateActionType = "cash_dividend" | "share_dividend" | "split";
 
 const COLOR_SCHEMES = new Set<ColorScheme>(["red-up", "green-up"]);
 const THEMES = new Set<Theme>(["dark", "light", "system"]);
@@ -40,12 +42,25 @@ export type HoldingInput = {
   autoTradeStatus?: HoldingTradeStatus | null;
   autoTradeStatusNote?: string;
   autoTradeStatusSource?: string | null;
+  dividendReinvest?: boolean | null;
 };
 
 export type HoldingAdjustmentInput = {
   type: HoldingAdjustmentType;
   quantity: number;
   price: number;
+};
+
+export type HoldingCorporateActionInput = {
+  id?: string;
+  type: HoldingCorporateActionType;
+  date: string;
+  amount?: number;
+  shares?: number;
+  ratio?: number;
+  price?: number;
+  source?: string;
+  note?: string;
 };
 
 export type DetailTarget = {
@@ -208,7 +223,7 @@ const initialDCAPlans: DCAPlan[] = [];
 function computeStats(holdings: Holding[]): PortfolioStats {
   const totalMV    = holdings.reduce((s, h) => s + toCNY(h.quantity * h.currentPrice, h.currency), 0);
   const todayPnl   = holdings.reduce((s, h) => s + toCNY(h.todayPnl,    h.currency), 0);
-  const totalPnl   = holdings.reduce((s, h) => s + toCNY(h.quantity * (h.currentPrice - h.costPrice), h.currency), 0);
+  const totalPnl   = holdings.reduce((s, h) => s + toCNY(h.quantity * (h.currentPrice - h.costPrice) + (h.cashDividendTotal ?? 0), h.currency), 0);
   const costBasis  = holdings.reduce((s, h) => s + toCNY(h.quantity * h.costPrice, h.currency), 0);
   const prevMV     = totalMV - todayPnl;
   return {
@@ -236,6 +251,7 @@ interface AppState {
   language:        Language;
   refreshInterval: RefreshInterval;
   tradeTimeOnly:   boolean;
+  dividendReinvest:boolean;
   isRefreshing:    boolean;
   lastRefreshed:   string;
   lastRefreshAt:   number;
@@ -258,6 +274,7 @@ interface AppContextType extends AppState {
   setLanguage:        (v: Language) => void;
   setRefreshInterval: (v: RefreshInterval) => void;
   setTradeTimeOnly:   (v: boolean) => void;
+  setDividendReinvest: (v: boolean) => void;
   refresh:            () => Promise<void>;
   exportPortfolio:    () => string;
   importPortfolio:    (raw: string) => { ok: boolean; error?: string };
@@ -268,6 +285,7 @@ interface AppContextType extends AppState {
   addHolding:         (h: HoldingInput) => void;
   updateHolding:      (id: string, h: HoldingInput) => void;
   adjustHolding:      (id: string, input: HoldingAdjustmentInput) => void;
+  applyCorporateAction: (id: string, input: HoldingCorporateActionInput) => void;
   removeHolding:      (id: string) => void;
   openDetail:         (t: DetailTarget) => void;
   closeDetail:        () => void;
@@ -301,6 +319,7 @@ type PersistedState = Partial<Pick<
   | "language"
   | "refreshInterval"
   | "tradeTimeOnly"
+  | "dividendReinvest"
   | "dcaPlans"
   | "dcaExecutions"
   | "assetSnapshots"
@@ -391,6 +410,77 @@ function hasFundNavRefreshWindow(holdings: Holding[], now = new Date()) {
   );
 }
 
+async function fetchCorporateActionMap(holdings: Holding[]) {
+  const entries = await Promise.all(
+    holdings.map(async (holding) => [holding.id, await fetchCorporateActions(holding)] as const),
+  );
+  return new Map(entries);
+}
+
+function actionAlreadyApplied(holding: Holding, actionId: string) {
+  return (holding.corporateActions ?? []).some((action) => action.id === actionId);
+}
+
+function applyAutomaticCorporateActions(
+  holdings: Holding[],
+  actionMap: Map<string, Awaited<ReturnType<typeof fetchCorporateActions>>>,
+  dividendReinvest: boolean,
+  today = todayLocalYMD(),
+) {
+  let changed = false;
+  const nextHoldings = holdings.map((holding) => {
+    const since = holding.autoCorporateActionSince || today;
+    const actions = actionMap.get(holding.id) ?? [];
+    let next: Holding = holding.autoCorporateActionSince ? holding : { ...holding, autoCorporateActionSince: since };
+    if (!holding.autoCorporateActionSince) changed = true;
+
+    for (const action of actions) {
+      if (action.date < since || actionAlreadyApplied(next, action.id)) continue;
+      if (action.type === "split" && action.ratio && action.ratio > 0) {
+        next = applyHoldingCorporateAction(next, {
+          id: action.id,
+          type: "split",
+          date: action.date,
+          ratio: action.ratio,
+          source: action.source,
+          note: "auto",
+        });
+        changed = true;
+      }
+      if (action.type === "cash_dividend" && action.amount && action.amount > 0) {
+        const totalAmount = action.amount * next.quantity;
+        if (!(totalAmount > 0)) continue;
+        const shouldReinvest = next.dividendReinvest ?? dividendReinvest;
+        if (shouldReinvest && next.currentPrice > 0) {
+          next = applyHoldingCorporateAction(next, {
+            id: action.id,
+            type: "share_dividend",
+            date: action.date,
+            amount: totalAmount,
+            shares: totalAmount / next.currentPrice,
+            price: next.currentPrice,
+            source: action.source,
+            note: "auto dividend reinvest",
+          });
+        } else {
+          next = applyHoldingCorporateAction(next, {
+            id: action.id,
+            type: "cash_dividend",
+            date: action.date,
+            amount: totalAmount,
+            source: action.source,
+            note: "auto",
+          });
+        }
+        changed = true;
+      }
+    }
+    return next;
+  });
+
+  return { holdings: nextHoldings, changed };
+}
+
 function defaultState(): AppState {
   return {
     groups:          initialGroups,
@@ -403,6 +493,7 @@ function defaultState(): AppState {
     language:        "zh",
     refreshInterval: 1,
     tradeTimeOnly:   false,
+    dividendReinvest:false,
     isRefreshing:    false,
     lastRefreshed:   "—",
     lastRefreshAt:   0,
@@ -461,6 +552,7 @@ export function loadInitialState(): AppState {
       language: enumOr(saved.language, LANGUAGES, base.language),
       refreshInterval: enumOr(saved.refreshInterval, REFRESH_INTERVALS, base.refreshInterval),
       tradeTimeOnly: typeof saved.tradeTimeOnly === "boolean" ? saved.tradeTimeOnly : base.tradeTimeOnly,
+      dividendReinvest: typeof saved.dividendReinvest === "boolean" ? saved.dividendReinvest : base.dividendReinvest,
       isRefreshing: false,
       lastRefreshAt: 0,
       detailTarget: null,
@@ -516,9 +608,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const doRefresh = useCallback(async (currentHoldings: Holding[]) => {
     setState((s) => ({ ...s, isRefreshing: true }));
     try {
-      const priceMap = await refreshPrices(
-        currentHoldings.map((h) => ({ id: h.id, symbol: h.symbol, market: h.market }))
-      );
+      const [priceMap, corporateActionMap] = await Promise.all([
+        refreshPrices(
+          currentHoldings.map((h) => ({ id: h.id, symbol: h.symbol, market: h.market }))
+        ),
+        fetchCorporateActionMap(currentHoldings),
+      ]);
       setState((s) => {
         const updated = s.holdings.map((h) => {
           const liveUpdate = priceMap[h.id];
@@ -536,7 +631,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
           const marketValue = h.quantity * lp.price;
           const costBasis   = h.quantity * h.costPrice;
-          const totalPnl    = marketValue - costBasis;
+          const totalPnl    = marketValue - costBasis + (h.cashDividendTotal ?? 0);
           const todayPnl    = Number.isFinite(lp.change) ? h.quantity * lp.change : 0;
           return {
             ...h,
@@ -553,12 +648,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             fundNavHistory: lp.fundNavHistory ?? h.fundNavHistory,
             estimatedNav: lp.estimatedNav,
             estimatedChangePercent: lp.estimatedChangePercent,
+            cashDividendTotal: h.cashDividendTotal ?? 0,
+            dividendReinvest: h.dividendReinvest ?? null,
+            autoCorporateActionSince: h.autoCorporateActionSince ?? "",
+            corporateActions: h.corporateActions ?? [],
             updatedAt:    new Date().toISOString(),
           };
         });
         const now = new Date();
         const t   = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}:${String(now.getSeconds()).padStart(2,"0")}`;
-        const dcaState = applyDCAState(updated, s.dcaPlans, s.dcaExecutions, true);
+        const corporateState = applyAutomaticCorporateActions(updated, corporateActionMap, s.dividendReinvest, todayLocalYMD(now));
+        const dcaState = applyDCAState(corporateState.holdings, s.dcaPlans, s.dcaExecutions, true);
         return {
           ...s,
           holdings: dcaState.holdings,
@@ -604,6 +704,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       language: state.language,
       refreshInterval: state.refreshInterval,
       tradeTimeOnly: state.tradeTimeOnly,
+      dividendReinvest: state.dividendReinvest,
       dcaPlans: state.dcaPlans,
       dcaExecutions: pruneDCAExecutions(state.dcaExecutions),
       assetSnapshots: state.assetSnapshots,
@@ -623,6 +724,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     state.language,
     state.refreshInterval,
     state.tradeTimeOnly,
+    state.dividendReinvest,
     state.dcaPlans,
     state.dcaExecutions,
     state.assetSnapshots,
@@ -654,6 +756,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const setLanguage    = useCallback((v: Language)        => setState((s) => ({ ...s, language: v })), []);
   const setRefreshInterval = useCallback((v: RefreshInterval) => setState((s) => ({ ...s, refreshInterval: v })), []);
   const setTradeTimeOnly = useCallback((v: boolean) => setState((s) => ({ ...s, tradeTimeOnly: v })), []);
+  const setDividendReinvest = useCallback((v: boolean) => setState((s) => ({ ...s, dividendReinvest: v })), []);
 
   const exportPortfolio = useCallback(() => JSON.stringify({
     exportedAt: new Date().toISOString(),
@@ -673,6 +776,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         language: state.language,
         refreshInterval: state.refreshInterval,
         tradeTimeOnly: state.tradeTimeOnly,
+        dividendReinvest: state.dividendReinvest,
       },
     },
   }, null, 2), [state]);
@@ -711,6 +815,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           language: enumOr(settings.language, LANGUAGES, s.language),
           refreshInterval: enumOr(settings.refreshInterval, REFRESH_INTERVALS, s.refreshInterval),
           tradeTimeOnly: typeof settings.tradeTimeOnly === "boolean" ? settings.tradeTimeOnly : s.tradeTimeOnly,
+          dividendReinvest: typeof settings.dividendReinvest === "boolean" ? settings.dividendReinvest : s.dividendReinvest,
         };
       });
       return { ok: true };
@@ -783,6 +888,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           fundNavHistory: previous.fundNavHistory,
           estimatedNav: previous.estimatedNav,
           estimatedChangePercent: previous.estimatedChangePercent,
+          cashDividendTotal: previous.cashDividendTotal ?? 0,
+          dividendReinvest: rebuilt.dividendReinvest ?? null,
+          corporateActions: previous.corporateActions ?? [],
         }
         : rebuilt;
       const updatedHoldings = s.holdings.map((x) => (x.id === id ? h : x));
@@ -812,6 +920,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         ? s.dcaExecutions
         : s.dcaExecutions.filter((item) => item.holdingId !== id);
       const dcaState = applyDCAState(updatedHoldings, updatedPlans, updatedExecutions);
+      return {
+        ...s,
+        holdings: dcaState.holdings,
+        dcaPlans: dcaState.dcaPlans,
+        dcaExecutions: dcaState.dcaExecutions,
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings),
+      };
+    });
+  }, [applyDCAState]);
+  const applyCorporateAction = useCallback((id: string, input: HoldingCorporateActionInput) => {
+    setState((s) => {
+      const target = s.holdings.find((item) => item.id === id);
+      if (!target) return s;
+      const adjusted = applyHoldingCorporateAction(target, input);
+      const updatedHoldings = s.holdings.map((item) => item.id === id ? adjusted : item);
+      const updatedPlans = s.dcaPlans.map((plan) => (plan.holdingId === id ? syncPlanWithHolding(plan, adjusted) : plan));
+      const dcaState = applyDCAState(updatedHoldings, updatedPlans, s.dcaExecutions);
       return {
         ...s,
         holdings: dcaState.holdings,
@@ -944,10 +1069,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     <AppContext.Provider value={{
       ...state, stats, tc,
       togglePrivacy, setDefaultPrivacyMode, setColorScheme, setTheme, setCurrency, setLanguage, setRefreshInterval,
-      setTradeTimeOnly, refresh,
+      setTradeTimeOnly, setDividendReinvest, refresh,
       exportPortfolio, importPortfolio, clearLocalData,
       addGroup, updateGroup, removeGroup,
-      addHolding, updateHolding, adjustHolding, removeHolding,
+      addHolding, updateHolding, adjustHolding, applyCorporateAction, removeHolding,
       openDetail, closeDetail,
       profitColor,
       addDCAPlan, updateDCAPlan, removeDCAPlan, toggleDCAPlan,

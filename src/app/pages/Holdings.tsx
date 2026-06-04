@@ -53,6 +53,7 @@ const blankForm = (): HoldingInput => ({
   quantity: 0, costPrice: 0, currentPrice: 0, currency: "",
   tradeStatus: "normal",
   tradeStatusNote: "",
+  dividendReinvest: null,
 });
 
 function normalizeHoldingForm(input: HoldingInput): HoldingInput {
@@ -64,6 +65,7 @@ function normalizeHoldingForm(input: HoldingInput): HoldingInput {
     assetType: normalizedType.assetType,
     tradeStatus: "normal",
     tradeStatusNote: "",
+    dividendReinvest: input.dividendReinvest ?? null,
   };
 }
 
@@ -92,7 +94,7 @@ function holdingMarketValue(h: Holding) {
 }
 
 function holdingTotalPnl(h: Holding) {
-  return h.quantity * (h.currentPrice - h.costPrice);
+  return h.quantity * (h.currentPrice - h.costPrice) + (h.cashDividendTotal ?? 0);
 }
 
 function holdingTotalPnlRate(h: Holding) {
@@ -348,6 +350,12 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
     { value: "", label: text.holdings.noGroup },
     ...groups.map((g) => ({ value: g.id, label: groupName(g.id, g.name, language) })),
   ];
+  const dividendMode = form.dividendReinvest == null ? "inherit" : form.dividendReinvest ? "reinvest" : "cash";
+  const dividendModeOptions = [
+    { value: "inherit", label: text.holdings.dividendInherit },
+    { value: "cash", label: text.holdings.dividendCash },
+    { value: "reinvest", label: text.holdings.dividendReinvest },
+  ];
 
   const handleSelect = (r: LiveResult) => {
     const normalizedType = normalizeHoldingType(r.symbol, r.name, r.market, r.assetType);
@@ -456,6 +464,14 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
 
           <Field label={text.holdings.group}>
             <Sel value={form.groupId} onChange={(v) => set("groupId", v)} options={groupOpts} />
+          </Field>
+
+          <Field label={text.holdings.dividendMode}>
+            <Sel
+              value={dividendMode}
+              onChange={(v) => set("dividendReinvest", v === "inherit" ? null : v === "reinvest")}
+              options={dividendModeOptions}
+            />
           </Field>
 
           <p style={{ color: "#4F9CF9", fontSize: 11, fontWeight: 600, marginTop: 2 }}>{text.holdings.holdingInfo}</p>
@@ -748,6 +764,22 @@ function HoldingCard({
                 {tradeStatusText}
               </span>
             </div>
+            {(h.cashDividendTotal ?? 0) > 0 && (
+              <div className="mt-0.5">
+                <span style={{ color: "#31D08B", fontSize: 10, fontWeight: 600 }}>
+                  {language === "en" ? "Dividend" : "分红"} {fmtMoney(h.cashDividendTotal ?? 0)}
+                </span>
+              </div>
+            )}
+            {typeof h.dividendReinvest === "boolean" && (
+              <div className="mt-0.5">
+                <span style={{ color: "var(--text-micro)", fontSize: 9 }}>
+                  {h.dividendReinvest
+                    ? (language === "en" ? "Dividend: Reinvest" : "分红：再投")
+                    : (language === "en" ? "Dividend: Cash" : "分红：现金")}
+                </span>
+              </div>
+            )}
           </div>
           <div className="text-right shrink-0">
             <p style={{ color: "var(--text-primary)", fontSize: 13, fontWeight: 600 }}>
@@ -1535,7 +1567,8 @@ export function Holdings() {
                     tradeStatusNote: editTarget.tradeStatusNote ?? "",
                     autoTradeStatus: editTarget.autoTradeStatus,
                     autoTradeStatusNote: editTarget.autoTradeStatusNote,
-                    autoTradeStatusSource: editTarget.autoTradeStatusSource }
+                    autoTradeStatusSource: editTarget.autoTradeStatusSource,
+                    dividendReinvest: editTarget.dividendReinvest ?? null }
                 : blankForm()
             }
             groups={groups}

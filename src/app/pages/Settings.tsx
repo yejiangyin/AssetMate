@@ -206,6 +206,7 @@ export function Settings() {
     language, setLanguage,
     refreshInterval, setRefreshInterval,
     tradeTimeOnly, setTradeTimeOnly,
+    dividendReinvest, setDividendReinvest,
     exportPortfolio, importPortfolio, clearLocalData,
     tc, dcaPlans, openDCAPanel,
   } = useApp();
@@ -403,6 +404,9 @@ export function Settings() {
           </SettingRow>
           <SettingRow icon={RefreshCw} label={text.tradeTimeOnly} description={text.tradeTimeOnlyDesc} iconColor="#14B8A6" tc={tc}>
             <ToggleSwitch value={tradeTimeOnly} onChange={setTradeTimeOnly} />
+          </SettingRow>
+          <SettingRow icon={DollarSign} label={text.dividendReinvest} description={text.dividendReinvestDesc} iconColor="#31D08B" tc={tc}>
+            <ToggleSwitch value={dividendReinvest} onChange={setDividendReinvest} />
           </SettingRow>
           <SettingRow
             icon={CalendarClock}

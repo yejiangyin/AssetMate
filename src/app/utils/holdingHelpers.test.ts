@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { Holding } from "../data/mockData";
-import { normalizeHolding } from "./holdingHelpers";
+import { applyCorporateAction, normalizeHolding } from "./holdingHelpers";
 
 function holding(patch: Partial<Holding> = {}): Holding {
   return {
@@ -45,5 +45,33 @@ describe("normalizeHolding", () => {
     ]);
     assert.equal(normalized.marketValue, 20);
     assert.equal(normalized.totalPnl, 10);
+  });
+});
+
+describe("applyCorporateAction", () => {
+  test("adds cash dividends to cumulative P/L without changing quantity or cost", () => {
+    const adjusted = applyCorporateAction(holding(), {
+      type: "cash_dividend",
+      date: "2026-06-04",
+      amount: 3,
+    });
+
+    assert.equal(adjusted.quantity, 10);
+    assert.equal(adjusted.costPrice, 1);
+    assert.equal(adjusted.cashDividendTotal, 3);
+    assert.equal(adjusted.totalPnl, 13);
+    assert.equal(adjusted.corporateActions?.length, 1);
+  });
+
+  test("dilutes average cost for bonus shares while preserving invested cost", () => {
+    const adjusted = applyCorporateAction(holding(), {
+      type: "share_dividend",
+      date: "2026-06-04",
+      shares: 2,
+    });
+
+    assert.equal(adjusted.quantity, 12);
+    assert.equal(adjusted.costPrice, 10 / 12);
+    assert.equal(adjusted.quantity * adjusted.costPrice, 10);
   });
 });

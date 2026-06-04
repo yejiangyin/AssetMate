@@ -23,6 +23,20 @@ export type Holding = {
   todayPnlRate: number;
   totalPnl:     number;
   totalPnlRate: number;
+  cashDividendTotal?: number;
+  dividendReinvest?: boolean | null;
+  autoCorporateActionSince?: string;
+  corporateActions?: Array<{
+    id: string;
+    type: "cash_dividend" | "share_dividend" | "split";
+    date: string;
+    amount?: number;
+    shares?: number;
+    ratio?: number;
+    price?: number;
+    source?: string;
+    note?: string;
+  }>;
   tradeStatus:  "normal" | "suspended" | "fund_limit" | "buy_disabled";
   tradeStatusNote?: string;
   autoTradeStatus?: "normal" | "suspended" | "fund_limit" | "buy_disabled" | null;

@@ -1261,14 +1261,14 @@ export function StockDetail() {
     : range === "fs"
     ? (q ?? syncedFsDisplayQuote ?? fallbackDisplayQuote)
     : (pickPreferredDisplayQuote(range, q, syncedFsDisplayQuote, fallbackDisplayQuote) ?? q ?? syncedFsDisplayQuote ?? fallbackDisplayQuote ?? null);
-  // For US session views, show session-specific price when available
+  // Keep session-specific quotes for the chart fallback only; the hero quote should stay on the live primary quote.
   const sessionAwareQuote = useMemo(() => {
     if (!displayQuote || market !== "US" || range !== "fs" || !effectiveUsSession) return null;
     return sessionQuoteFromDisplayQuote(displayQuote, effectiveUsSession);
   }, [displayQuote, market, range, effectiveUsSession]);
-  const heroPrice = sessionAwareQuote?.price ?? displayQuote?.price;
-  const heroChange = sessionAwareQuote?.change ?? displayQuote?.change ?? 0;
-  const heroChangePct = sessionAwareQuote?.changePercent ?? displayQuote?.changePercent ?? 0;
+  const heroPrice = displayQuote?.price;
+  const heroChange = displayQuote?.change ?? 0;
+  const heroChangePct = displayQuote?.changePercent ?? 0;
   const isUp = heroChange >= 0;
   const lineColor = isUp ? upColor : dnColor;
   const prevClose = displayQuote?.prevClose ?? q?.prevClose ?? 0;
