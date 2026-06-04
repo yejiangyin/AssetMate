@@ -479,7 +479,7 @@ export function Settings() {
       {/* Version */}
       <div className="mt-4 flex items-center justify-center gap-1">
         <BrandMark size={12} />
-        <span style={{ color: tc.textMicro, fontSize: 10 }}>{t(language).appName} v1.0.0</span>
+        <span style={{ color: tc.textMicro, fontSize: 10 }}>{t(language).appName} v1.0.2</span>
       </div>
       </div>
 
