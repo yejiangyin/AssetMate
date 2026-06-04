@@ -4,7 +4,7 @@
  */
 
 import type { Holding } from "../data/mockData";
-import type { HoldingInput, HoldingAdjustmentInput } from "../context/AppContext";
+import type { HoldingInput, HoldingAdjustmentInput, HoldingCorporateActionInput } from "../context/AppContext";
 
 /* ─── normalize helpers ─────────────────────────────── */
 
@@ -33,13 +33,19 @@ export function normalizeHolding(h: Holding): Holding {
   const normalizedSymbol = normalizeHoldingSymbol(h.symbol, normalizedType.market);
   const marketValue = h.quantity * h.currentPrice;
   const costBasis = h.quantity * h.costPrice;
-  const totalPnl = marketValue - costBasis;
+  const cashDividendTotal = Number.isFinite(h.cashDividendTotal) ? Math.max(0, h.cashDividendTotal ?? 0) : 0;
+  const totalPnl = marketValue - costBasis + cashDividendTotal;
   const fundNavHistory = Array.isArray(h.fundNavHistory)
     ? h.fundNavHistory
       .filter((row) => row.date && Number.isFinite(row.nav) && row.nav > 0)
       .sort((a, b) => b.date.localeCompare(a.date))
       .slice(0, 20)
     : undefined;
+  const corporateActions = Array.isArray(h.corporateActions)
+    ? h.corporateActions
+      .filter((action) => typeof action?.id === "string" && typeof action?.type === "string" && typeof action?.date === "string")
+      .slice(-60)
+    : [];
   return {
     ...h,
     symbol: normalizedSymbol,
@@ -52,6 +58,10 @@ export function normalizeHolding(h: Holding): Holding {
     autoTradeStatusSource: h.autoTradeStatusSource ?? null,
     priceDate: h.priceDate ?? "",
     fundNavHistory,
+    cashDividendTotal,
+    dividendReinvest: typeof h.dividendReinvest === "boolean" ? h.dividendReinvest : null,
+    autoCorporateActionSince: h.autoCorporateActionSince ?? "",
+    corporateActions,
     marketValue,
     totalPnl,
     totalPnlRate: costBasis > 0 ? totalPnl / costBasis : 0,
@@ -68,9 +78,11 @@ export function recomputeHoldingMetrics(
   const next = { ...holding, ...patch };
   const marketValue = next.quantity * next.currentPrice;
   const costBasis = next.quantity * next.costPrice;
-  const totalPnl = marketValue - costBasis;
+  const cashDividendTotal = Number.isFinite(next.cashDividendTotal) ? Math.max(0, next.cashDividendTotal ?? 0) : 0;
+  const totalPnl = marketValue - costBasis + cashDividendTotal;
   return {
     ...next,
+    cashDividendTotal,
     marketValue,
     totalPnl,
     totalPnlRate: costBasis > 0 ? totalPnl / costBasis : 0,
@@ -104,6 +116,9 @@ export function buildHolding(input: HoldingInput, id: string): Holding {
     todayPnlRate: 0,
     totalPnl,
     totalPnlRate: costBasis > 0 ? totalPnl / costBasis : 0,
+    cashDividendTotal: 0,
+    dividendReinvest: typeof input.dividendReinvest === "boolean" ? input.dividendReinvest : null,
+    corporateActions: [],
     tradeStatus:  input.tradeStatus ?? "normal",
     tradeStatusNote: input.tradeStatusNote?.trim() || "",
     autoTradeStatus: input.autoTradeStatus ?? null,
@@ -111,6 +126,62 @@ export function buildHolding(input: HoldingInput, id: string): Holding {
     autoTradeStatusSource: input.autoTradeStatusSource ?? null,
     updatedAt:    new Date().toISOString(),
   };
+}
+
+export function applyCorporateAction(current: Holding, input: HoldingCorporateActionInput): Holding {
+  const currentCostBasis = current.quantity * current.costPrice;
+  const baseAction = {
+    id: input.id || `corp_${crypto.randomUUID()}`,
+    type: input.type,
+    date: input.date || new Date().toISOString().slice(0, 10),
+    source: input.source,
+    note: input.note?.trim() || "",
+  };
+
+  if (input.type === "cash_dividend") {
+    const amount = Number(input.amount);
+    if (!(amount > 0)) return current;
+    return recomputeHoldingMetrics(current, {
+      cashDividendTotal: (current.cashDividendTotal ?? 0) + amount,
+      corporateActions: [
+        ...(current.corporateActions ?? []),
+        { ...baseAction, amount },
+      ].slice(-60),
+    });
+  }
+
+  if (input.type === "share_dividend") {
+    const shares = Number(input.shares);
+    if (!(shares > 0)) return current;
+    const nextQuantity = current.quantity + shares;
+    const nextCostPrice = nextQuantity > 0 ? currentCostBasis / nextQuantity : current.costPrice;
+    return recomputeHoldingMetrics(current, {
+      quantity: nextQuantity,
+      costPrice: nextCostPrice,
+      corporateActions: [
+        ...(current.corporateActions ?? []),
+        {
+          ...baseAction,
+          shares,
+          amount: Number.isFinite(input.amount) && (input.amount ?? 0) > 0 ? input.amount : undefined,
+          price: Number.isFinite(input.price) && (input.price ?? 0) > 0 ? input.price : undefined,
+        },
+      ].slice(-60),
+    });
+  }
+
+  const ratio = Number(input.ratio);
+  if (!(ratio > 0)) return current;
+  const nextQuantity = current.quantity * ratio;
+  const nextCostPrice = nextQuantity > 0 ? currentCostBasis / nextQuantity : current.costPrice;
+  return recomputeHoldingMetrics(current, {
+    quantity: nextQuantity,
+    costPrice: nextCostPrice,
+    corporateActions: [
+      ...(current.corporateActions ?? []),
+      { ...baseAction, ratio },
+    ].slice(-60),
+  });
 }
 
 export function applyHoldingAdjustment(current: Holding, input: HoldingAdjustmentInput): Holding | null {
