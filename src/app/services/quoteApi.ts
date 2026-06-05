@@ -1433,9 +1433,25 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
 /* ═══════════════════════════════════════════════════════
    Number formatters
 ══════════════════════════════════════════════════════════ */
-export function fmtLarge(n: number | undefined): string {
-  if (n == null) return "—";
-  return formatExactNumber(n);
+function trimCompactNumber(value: number, decimals: number) {
+  return value.toLocaleString("en-US", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: decimals,
+  });
+}
+
+export function fmtLarge(n: number | undefined, language: "zh" | "en" = "zh"): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  const abs = Math.abs(n);
+  if (language === "en") {
+    if (abs >= 1_000_000_000) return `${trimCompactNumber(n / 1_000_000_000, 2)}B`;
+    if (abs >= 1_000_000) return `${trimCompactNumber(n / 1_000_000, 2)}M`;
+    if (abs >= 1_000) return `${trimCompactNumber(n / 1_000, 2)}K`;
+    return formatExactNumber(n, 0);
+  }
+  if (abs >= 100_000_000) return `${trimCompactNumber(n / 100_000_000, 2)}亿`;
+  if (abs >= 10_000) return `${trimCompactNumber(n / 10_000, 2)}万`;
+  return formatExactNumber(n, 0);
 }
 
 export function fmtPrice(n: number | undefined | null, currency = "USD"): string {

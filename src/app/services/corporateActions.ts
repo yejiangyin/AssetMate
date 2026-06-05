@@ -3,11 +3,16 @@ import { toYahooSymbol } from "./quoteApi";
 
 export type CorporateActionEvent = {
   id: string;
-  source: "yahoo" | "eastmoney-fund";
+  source: "yahoo" | "eastmoney-fund" | "eastmoney-stock";
   type: "cash_dividend" | "split";
   date: string;
   amount?: number;
   ratio?: number;
+  recordDate?: string;
+  exDate?: string;
+  payDate?: string;
+  announcementDate?: string;
+  description?: string;
 };
 
 const cache = new Map<string, { ts: number; data: CorporateActionEvent[] }>();
@@ -59,6 +64,11 @@ function parsePositiveNumber(raw: string) {
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
+function normalizeYMD(raw: unknown) {
+  const match = String(raw ?? "").match(/\d{4}-\d{2}-\d{2}/);
+  return match?.[0] ?? "";
+}
+
 async function fetchEastMoneyFundCorporateActions(symbol: string): Promise<CorporateActionEvent[]> {
   const code = normalizeFundCode(symbol);
   if (!/^\d{6}$/.test(code)) return [];
@@ -83,7 +93,10 @@ async function fetchEastMoneyFundCorporateActions(symbol: string): Promise<Corpo
       const dividendRows = parseHtmlTableRows(html, "cfxq");
       const splitRows = parseHtmlTableRows(html, "fhxq");
       const dividends = dividendRows.map((row) => {
-        const date = row[2] || row[1] || "";
+        const recordDate = normalizeYMD(row[1]);
+        const exDate = normalizeYMD(row[2]);
+        const payDate = normalizeYMD(row[4]);
+        const date = exDate || recordDate || payDate;
         const amount = parsePositiveNumber(row[3] ?? "");
         if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !(amount > 0)) return null;
         return {
@@ -92,10 +105,15 @@ async function fetchEastMoneyFundCorporateActions(symbol: string): Promise<Corpo
           type: "cash_dividend" as const,
           date,
           amount,
+          recordDate,
+          exDate,
+          payDate,
+          description: row.join(" "),
         };
       });
       const splits = splitRows.map((row) => {
-        const date = row[1] || "";
+        const exDate = normalizeYMD(row[1]);
+        const date = exDate;
         const ratio = parsePositiveNumber(row[3] ?? "");
         if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !(ratio > 0) || Math.abs(ratio - 1) < 1e-8) return null;
         return {
@@ -104,11 +122,108 @@ async function fetchEastMoneyFundCorporateActions(symbol: string): Promise<Corpo
           type: "split" as const,
           date,
           ratio,
+          exDate,
+          description: row.join(" "),
         };
       });
       const data = [...dividends, ...splits].filter(Boolean).sort((a, b) => a!.date.localeCompare(b!.date)) as CorporateActionEvent[];
       cache.set(key, { ts: Date.now(), data });
       return data;
+    } catch {
+      clearTimeout(tid);
+      return [];
+    } finally {
+      inflight.delete(key);
+    }
+  })();
+
+  inflight.set(key, task);
+  return task;
+}
+
+function normalizeAStockCode(symbol: string) {
+  return symbol.replace(/\.(SH|SS|SZ)$/i, "").trim();
+}
+
+async function fetchEastMoneyStockCorporateActions(symbol: string): Promise<CorporateActionEvent[]> {
+  const code = normalizeAStockCode(symbol);
+  if (!/^\d{6}$/.test(code)) return [];
+  const key = `eastmoney-stock-actions:${code}`;
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.ts < CACHE_TTL) return hit.data;
+  const running = inflight.get(key);
+  if (running) return running;
+
+  const task = (async () => {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const params = new URLSearchParams({
+        reportName: "RPT_SHAREBONUS_DET",
+        columns: "ALL",
+        source: "WEB",
+        client: "WEB",
+        pageSize: "50",
+        pageNumber: "1",
+        sortColumns: "EX_DIVIDEND_DATE",
+        sortTypes: "-1",
+        filter: `(SECURITY_CODE="${code}")`,
+      });
+      const res = await fetch(`https://datacenter-web.eastmoney.com/api/data/v1/get?${params.toString()}`, {
+        signal: ctrl.signal,
+        cache: "no-store",
+        headers: { Accept: "application/json,*/*", Referer: "https://data.eastmoney.com/yjfp/" },
+      });
+      clearTimeout(tid);
+      if (!res.ok) throw new Error(`EastMoney stock actions HTTP ${res.status}`);
+      const json = await res.json();
+      const rows = Array.isArray(json?.result?.data) ? json.result.data : [];
+      const actions = rows.flatMap((row: any) => {
+        const exDate = normalizeYMD(row?.EX_DIVIDEND_DATE);
+        const recordDate = normalizeYMD(row?.EQUITY_RECORD_DATE);
+        const announcementDate = normalizeYMD(row?.NOTICE_DATE || row?.PLAN_NOTICE_DATE || row?.PUBLISH_DATE);
+        const date = exDate || recordDate || announcementDate;
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return [];
+        const description = String(row?.IMPL_PLAN_PROFILE ?? row?.ASSIGN_PROGRESS ?? "").trim();
+        const result: CorporateActionEvent[] = [];
+
+        const cashPerTen = Number(row?.PRETAX_BONUS_RMB);
+        const amount = Number.isFinite(cashPerTen) && cashPerTen > 0 ? cashPerTen / 10 : 0;
+        if (amount > 0) {
+          result.push({
+            id: `eastmoney-stock:cash_dividend:${code}:${date}:${amount}`,
+            source: "eastmoney-stock",
+            type: "cash_dividend",
+            date,
+            amount,
+            recordDate,
+            exDate,
+            announcementDate,
+            description,
+          });
+        }
+
+        const bonus = Number(row?.BONUS_RATIO);
+        const transfer = Number(row?.IT_RATIO);
+        const totalBonusPerTen = (Number.isFinite(bonus) && bonus > 0 ? bonus : 0) + (Number.isFinite(transfer) && transfer > 0 ? transfer : 0);
+        const ratio = totalBonusPerTen > 0 ? 1 + totalBonusPerTen / 10 : 0;
+        if (ratio > 0 && Math.abs(ratio - 1) > 1e-8) {
+          result.push({
+            id: `eastmoney-stock:split:${code}:${date}:${ratio}`,
+            source: "eastmoney-stock",
+            type: "split",
+            date,
+            ratio,
+            recordDate,
+            exDate,
+            announcementDate,
+            description,
+          });
+        }
+        return result;
+      }).sort((a: CorporateActionEvent, b: CorporateActionEvent) => a.date.localeCompare(b.date));
+      cache.set(key, { ts: Date.now(), data: actions });
+      return actions;
     } catch {
       clearTimeout(tid);
       return [];
@@ -192,10 +307,13 @@ async function fetchYahooCorporateActions(yahooSymbol: string, days = 45): Promi
   return task;
 }
 
-export async function fetchCorporateActions(holding: Holding): Promise<CorporateActionEvent[]> {
+export async function fetchCorporateActions(holding: Holding, days = 45): Promise<CorporateActionEvent[]> {
   if (holding.market === "FUND" && holding.assetType === "fund") {
     return fetchEastMoneyFundCorporateActions(holding.symbol);
   }
+  if (holding.market === "A") {
+    return fetchEastMoneyStockCorporateActions(holding.symbol);
+  }
   if (!canUseYahooActions(holding)) return [];
-  return fetchYahooCorporateActions(toYahooSymbol(holding.symbol, holding.market));
+  return fetchYahooCorporateActions(toYahooSymbol(holding.symbol, holding.market), days);
 }

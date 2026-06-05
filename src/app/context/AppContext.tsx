@@ -59,8 +59,13 @@ export type HoldingCorporateActionInput = {
   shares?: number;
   ratio?: number;
   price?: number;
+  recordDate?: string;
+  exDate?: string;
+  payDate?: string;
+  announcementDate?: string;
   source?: string;
   note?: string;
+  description?: string;
 };
 
 export type DetailTarget = {
@@ -223,7 +228,7 @@ const initialDCAPlans: DCAPlan[] = [];
 function computeStats(holdings: Holding[]): PortfolioStats {
   const totalMV    = holdings.reduce((s, h) => s + toCNY(h.quantity * h.currentPrice, h.currency), 0);
   const todayPnl   = holdings.reduce((s, h) => s + toCNY(h.todayPnl,    h.currency), 0);
-  const totalPnl   = holdings.reduce((s, h) => s + toCNY(h.quantity * (h.currentPrice - h.costPrice) + (h.cashDividendTotal ?? 0), h.currency), 0);
+  const totalPnl   = holdings.reduce((s, h) => s + toCNY(h.quantity * (h.currentPrice - h.costPrice), h.currency), 0);
   const costBasis  = holdings.reduce((s, h) => s + toCNY(h.quantity * h.costPrice, h.currency), 0);
   const prevMV     = totalMV - todayPnl;
   return {
@@ -334,6 +339,11 @@ function todayLocalYMD(date = new Date()) {
   return `${year}-${month}-${day}`;
 }
 
+function ymdFromIsoLike(value: string | undefined) {
+  const match = String(value ?? "").match(/^\d{4}-\d{2}-\d{2}/);
+  return match?.[0] ?? "";
+}
+
 function todayShanghaiYMD(date = new Date()) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Shanghai",
@@ -421,6 +431,10 @@ function actionAlreadyApplied(holding: Holding, actionId: string) {
   return (holding.corporateActions ?? []).some((action) => action.id === actionId);
 }
 
+function canAutoReinvestDividend(holding: Holding) {
+  return holding.market === "FUND" || holding.assetType === "fund";
+}
+
 function applyAutomaticCorporateActions(
   holdings: Holding[],
   actionMap: Map<string, Awaited<ReturnType<typeof fetchCorporateActions>>>,
@@ -429,7 +443,7 @@ function applyAutomaticCorporateActions(
 ) {
   let changed = false;
   const nextHoldings = holdings.map((holding) => {
-    const since = holding.autoCorporateActionSince || today;
+    const since = holding.autoCorporateActionSince || ymdFromIsoLike(holding.updatedAt) || today;
     const actions = actionMap.get(holding.id) ?? [];
     let next: Holding = holding.autoCorporateActionSince ? holding : { ...holding, autoCorporateActionSince: since };
     if (!holding.autoCorporateActionSince) changed = true;
@@ -442,7 +456,12 @@ function applyAutomaticCorporateActions(
           type: "split",
           date: action.date,
           ratio: action.ratio,
+          recordDate: action.recordDate,
+          exDate: action.exDate,
+          payDate: action.payDate,
+          announcementDate: action.announcementDate,
           source: action.source,
+          description: action.description,
           note: "auto",
         });
         changed = true;
@@ -450,7 +469,7 @@ function applyAutomaticCorporateActions(
       if (action.type === "cash_dividend" && action.amount && action.amount > 0) {
         const totalAmount = action.amount * next.quantity;
         if (!(totalAmount > 0)) continue;
-        const shouldReinvest = next.dividendReinvest ?? dividendReinvest;
+        const shouldReinvest = canAutoReinvestDividend(next) && (next.dividendReinvest ?? dividendReinvest);
         if (shouldReinvest && next.currentPrice > 0) {
           next = applyHoldingCorporateAction(next, {
             id: action.id,
@@ -459,7 +478,12 @@ function applyAutomaticCorporateActions(
             amount: totalAmount,
             shares: totalAmount / next.currentPrice,
             price: next.currentPrice,
+            recordDate: action.recordDate,
+            exDate: action.exDate,
+            payDate: action.payDate,
+            announcementDate: action.announcementDate,
             source: action.source,
+            description: action.description,
             note: "auto dividend reinvest",
           });
         } else {
@@ -468,7 +492,12 @@ function applyAutomaticCorporateActions(
             type: "cash_dividend",
             date: action.date,
             amount: totalAmount,
+            recordDate: action.recordDate,
+            exDate: action.exDate,
+            payDate: action.payDate,
+            announcementDate: action.announcementDate,
             source: action.source,
+            description: action.description,
             note: "auto",
           });
         }
@@ -631,7 +660,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
           const marketValue = h.quantity * lp.price;
           const costBasis   = h.quantity * h.costPrice;
-          const totalPnl    = marketValue - costBasis + (h.cashDividendTotal ?? 0);
+          const totalPnl    = marketValue - costBasis;
           const todayPnl    = Number.isFinite(lp.change) ? h.quantity * lp.change : 0;
           return {
             ...h,

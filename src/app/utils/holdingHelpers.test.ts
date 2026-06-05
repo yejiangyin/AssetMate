@@ -46,10 +46,21 @@ describe("normalizeHolding", () => {
     assert.equal(normalized.marketValue, 20);
     assert.equal(normalized.totalPnl, 10);
   });
+
+  test("keeps dividend reinvest preference only for fund holdings", () => {
+    assert.equal(normalizeHolding(holding({ dividendReinvest: true })).dividendReinvest, true);
+    assert.equal(normalizeHolding(holding({
+      symbol: "AAPL",
+      name: "Apple Inc.",
+      market: "US",
+      assetType: "stock",
+      dividendReinvest: true,
+    })).dividendReinvest, null);
+  });
 });
 
 describe("applyCorporateAction", () => {
-  test("adds cash dividends to cumulative P/L without changing quantity or cost", () => {
+  test("records cash dividends without changing holding P/L, quantity, or cost", () => {
     const adjusted = applyCorporateAction(holding(), {
       type: "cash_dividend",
       date: "2026-06-04",
@@ -59,7 +70,7 @@ describe("applyCorporateAction", () => {
     assert.equal(adjusted.quantity, 10);
     assert.equal(adjusted.costPrice, 1);
     assert.equal(adjusted.cashDividendTotal, 3);
-    assert.equal(adjusted.totalPnl, 13);
+    assert.equal(adjusted.totalPnl, 10);
     assert.equal(adjusted.corporateActions?.length, 1);
   });
 

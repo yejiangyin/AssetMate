@@ -1,11 +1,11 @@
-import { useState, useEffect, useId, useCallback, useRef, useMemo, type PointerEvent as ReactPointerEvent } from "react";
+import { useState, useEffect, useId, useCallback, useRef, useMemo, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import {
   ArrowLeft, RefreshCw, Wifi, WifiOff,
 } from "lucide-react";
 import {
   AreaChart, Area, BarChart, Bar,
   XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine,
-  CartesianGrid,
+  CartesianGrid, ReferenceDot,
 } from "recharts";
 import { motion } from "motion/react";
 import { useApp, type DetailTarget } from "../context/AppContext";
@@ -15,9 +15,11 @@ import {
 } from "../services/quoteApi";
 import { emitQuoteSync, getLatestSyncedQuote, isSameQuoteTarget, subscribeQuoteSync } from "../services/quoteSync";
 import { buildIntradayViewportPoints, US_SESSION_LABELS, usSessionHasData, pickDefaultUsSession, type UsSessionType } from "../utils/intradayViewport";
-import { formatExactMoney, formatExactNumber, formatFixedNumber, formatPercent } from "../utils/numberFormat";
+import { currencySymbol, formatExactMoney, formatExactNumber, formatFixedNumber, formatPercent } from "../utils/numberFormat";
 import { getMarketBadgeWithBg } from "../utils/marketBadge";
 import type { Language } from "../context/AppContext";
+import type { Holding } from "../data/mockData";
+import { fetchCorporateActions, type CorporateActionEvent } from "../services/corporateActions";
 import { t } from "../i18n";
 
 const EMPTY_DETAIL_TARGET: DetailTarget = {
@@ -37,20 +39,6 @@ function getDetailBadge(market: string, assetType: string | undefined, language:
     return { label: language === "en" ? "Listed Fund" : "场内基金", color: "#31D08B", bg: "rgba(49,208,139,0.15)" };
   }
   return getMarketBadgeWithBg(market, 0.15, language);
-}
-
-/* ─── stat row ───────────────────────────────────────── */
-function StatRow({ items }: { items: { label: string; value: string; color?: string }[] }) {
-  return (
-    <div className="grid grid-cols-2 gap-px" style={{ background: "var(--bg-card)" }}>
-      {items.map((it) => (
-        <div key={it.label} className="px-3 py-2.5" style={{ background: "var(--bg)" }}>
-          <p style={{ color: "var(--text-muted)", fontSize: 10, marginBottom: 2 }}>{it.label}</p>
-          <p style={{ color: it.color ?? "var(--text-primary)", fontSize: 13, fontWeight: 600 }}>{it.value}</p>
-        </div>
-      ))}
-    </div>
-  );
 }
 
 /* ─── skeleton ───────────────────────────────────────── */
@@ -130,9 +118,333 @@ function formatTooltipTimeLabelI18n(point: any, language: Language) {
   return formatTooltipTimeLabel(point);
 }
 
+function formatMetricTimeLabel(point: ChartPointWithActions, range: TimeRange, language: Language) {
+  if (range === "fs" && typeof point.time === "string") {
+    const match = point.time.match(/\d{1,2}:\d{2}/);
+    if (match) return match[0];
+  }
+  return formatTooltipTimeLabelI18n(point, language);
+}
+
+type ChartActionMarker = {
+  id: string;
+  date: string;
+  label: string;
+  title: string;
+  color: string;
+  details: string[];
+};
+
+type MetricItem = { label: string; value: string; color?: string; subValue?: string };
+
+type ChartPointWithActions = ChartPoint & {
+  displayPrice?: number;
+  displayVolume?: number;
+  chartActions?: ChartActionMarker[];
+};
+
+function pointDateKey(point: Pick<ChartPoint, "timestamp" | "dateLabel" | "time">) {
+  if (typeof point.timestamp === "number" && Number.isFinite(point.timestamp)) {
+    const d = new Date(point.timestamp);
+    if (!Number.isNaN(d.getTime())) {
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    }
+  }
+  const text = `${point.dateLabel ?? ""} ${point.time ?? ""}`;
+  const ymd = text.match(/\d{4}-\d{1,2}-\d{1,2}/)?.[0];
+  if (ymd) {
+    const [y, m, d] = ymd.split("-").map(Number);
+    if (y && m && d) return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  }
+  return "";
+}
+
+function ymdToLocalMs(date: string) {
+  const match = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return NaN;
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])).getTime();
+}
+
+function periodKeyFromYMD(date: string, range: TimeRange) {
+  const match = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return "";
+  const year = match[1];
+  const month = Number(match[2]);
+  if (range === "1y") return year;
+  if (range === "3mo") return `${year}-Q${Math.floor((month - 1) / 3) + 1}`;
+  if (range === "1mo" || range === "max") return `${year}-${String(month).padStart(2, "0")}`;
+  return "";
+}
+
+function corporateActionHistoryDays(range: TimeRange) {
+  switch (range) {
+    case "fs": return 0;
+    case "1d": return 460;
+    case "5d": return 1200;
+    case "1mo":
+    case "3mo": return 4200;
+    case "1y":
+    case "max":
+    case "f10y":
+    case "fmax": return 15000;
+    case "f1mo": return 90;
+    case "f3mo": return 180;
+    case "f6mo": return 300;
+    case "f1y": return 460;
+    case "f3y": return 1200;
+    case "f5y": return 2200;
+    default: return 15000;
+  }
+}
+
+function buildDetailActionHolding(target: DetailTarget): Holding | null {
+  if (["CRYPTO", "GOLD", "INDEX", "FX"].includes(target.market)) return null;
+  const market = target.market as Holding["market"];
+  if (!["US", "HK", "A", "JP", "FUND", "CRYPTO", "BOND", "GOLD"].includes(market)) return null;
+  const assetType = ["stock", "etf", "fund", "crypto", "cash", "bond"].includes(target.assetType)
+    ? target.assetType as Holding["assetType"]
+    : market === "FUND" ? "fund" : "stock";
+  return {
+    id: `detail-${target.market}-${target.displaySymbol}`,
+    groupId: "",
+    symbol: target.displaySymbol || target.yahooSymbol,
+    name: target.name,
+    market,
+    assetType,
+    quantity: 0,
+    costPrice: 0,
+    currentPrice: 0,
+    currency: target.fallbackQuote?.currency ?? "",
+    marketValue: 0,
+    todayPnl: 0,
+    todayPnlRate: 0,
+    totalPnl: 0,
+    totalPnlRate: 0,
+    tradeStatus: "normal",
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function actionMarkerFromEvent(event: CorporateActionEvent, language: Language, currency: string): ChartActionMarker {
+  const isDividend = event.type === "cash_dividend";
+  const label = isDividend
+    ? language === "en" ? "D" : "分"
+    : language === "en" ? "S" : "权";
+  const title = isDividend
+    ? language === "en" ? "Dividend" : "现金分红"
+    : language === "en" ? "Split / Ex-rights" : "拆分/除权";
+  const details: string[] = [];
+  if (event.recordDate) details.push(`${language === "en" ? "Record" : "登记"} ${event.recordDate}`);
+  if (event.exDate) details.push(`${language === "en" ? "Ex-date" : "除息/除权"} ${event.exDate}`);
+  if (event.payDate) details.push(`${language === "en" ? "Pay" : "发放"} ${event.payDate}`);
+  if (event.amount && event.amount > 0) {
+    const value = currency ? formatExactMoney(event.amount, currency, 4) : formatFixedNumber(event.amount, 4);
+    details.push(language === "en" ? `Amount ${value}` : `每股/每份 ${value}`);
+  }
+  if (event.ratio && event.ratio > 0) {
+    details.push(language === "en" ? `Ratio ${formatFixedNumber(event.ratio, 4)}` : `比例 ${formatFixedNumber(event.ratio, 4)}`);
+  }
+  if (event.description) {
+    const compactPlan = compactCorporateActionDescription(event.description, language);
+    if (compactPlan) details.push(compactPlan);
+  }
+  return {
+    id: event.id,
+    date: event.date,
+    label,
+    title,
+    color: isDividend ? "#F59E0B" : "#8B5CF6",
+    details,
+  };
+}
+
+function compactCorporateActionDescription(description: string, language: Language) {
+  const text = description.replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  const fundCash = text.match(/每份派现金[\d.]+元/);
+  if (fundCash) return `${language === "en" ? "Plan" : "方案"} ${fundCash[0]}`;
+  const cnPlan = text.match(/(?:10|每10)[^，,；;\s]+/);
+  if (cnPlan) return `${language === "en" ? "Plan" : "方案"} ${cnPlan[0]}`;
+  if (text.length > 48 || (text.match(/\d{4}-\d{2}-\d{2}/g)?.length ?? 0) >= 2) return "";
+  return `${language === "en" ? "Plan" : "方案"} ${text}`;
+}
+
+function attachCorporateActionMarkers<T extends ChartPointWithActions>(
+  points: T[],
+  events: CorporateActionEvent[],
+  range: TimeRange,
+  language: Language,
+  currency: string,
+) {
+  if (range === "fs" || points.length === 0 || events.length === 0) return points;
+  const pointDates = points.map((point) => {
+    const date = pointDateKey(point);
+    return { point, date, ms: ymdToLocalMs(date), periodKey: periodKeyFromYMD(date, range) };
+  });
+  const periodIndex = new Map<string, number>();
+  pointDates.forEach((entry, index) => {
+    if (entry.periodKey) periodIndex.set(entry.periodKey, index);
+  });
+  const byIndex = new Map<number, ChartActionMarker[]>();
+  const maxDistanceMs = ["1mo", "3mo", "1y", "max", "f3y", "f5y", "f10y", "fmax"].includes(range)
+    ? 48 * 86400000
+    : ["5d"].includes(range)
+      ? 14 * 86400000
+      : 7 * 86400000;
+
+  for (const event of events) {
+    const eventDate = event.exDate || event.date || event.recordDate || event.payDate;
+    if (!eventDate) continue;
+    const eventPeriodKey = periodKeyFromYMD(eventDate, range);
+    const periodMatchedIndex = eventPeriodKey ? periodIndex.get(eventPeriodKey) : undefined;
+    if (typeof periodMatchedIndex === "number") {
+      const marker = actionMarkerFromEvent(event, language, currency);
+      const current = byIndex.get(periodMatchedIndex) ?? [];
+      current.push(marker);
+      byIndex.set(periodMatchedIndex, current);
+      continue;
+    }
+    const eventMs = ymdToLocalMs(eventDate);
+    if (!Number.isFinite(eventMs)) continue;
+    let bestIndex = -1;
+    let bestDistance = Infinity;
+    pointDates.forEach((entry, index) => {
+      if (!Number.isFinite(entry.ms)) return;
+      const distance = Math.abs(entry.ms - eventMs);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    });
+    if (bestIndex < 0 || bestDistance > maxDistanceMs) continue;
+    const marker = actionMarkerFromEvent(event, language, currency);
+    const current = byIndex.get(bestIndex) ?? [];
+    current.push(marker);
+    byIndex.set(bestIndex, current);
+  }
+
+  if (!byIndex.size) return points;
+  return points.map((point, index) => {
+    const actions = byIndex.get(index);
+    if (!actions?.length) return point;
+    const unique = actions.filter((action, actionIndex, list) => list.findIndex((candidate) => candidate.id === action.id) === actionIndex);
+    return { ...point, chartActions: unique };
+  });
+}
+
+function mergedActionLabel(actions: ChartActionMarker[], language: Language) {
+  const labels = actions.map((action) => action.label);
+  const unique = [...new Set(labels)];
+  if (unique.length === 1 && actions.length > 1) return `${unique[0]}${actions.length}`;
+  if (language === "en") return unique.join("/");
+  return unique.join("");
+}
+
+function ChartActionInlineDetails({ actions }: { actions?: ChartActionMarker[] }) {
+  if (!actions?.length) return null;
+  return (
+    <div style={{ marginTop: 5, paddingTop: 5, borderTop: "1px solid var(--border)" }}>
+      {actions.map((action) => (
+        <div key={action.id} style={{ marginTop: 3 }}>
+          <div style={{ color: action.color, fontSize: 10, fontWeight: 800 }}>
+            {action.title}
+          </div>
+          {action.details.map((detail, index) => (
+            <div
+              key={`${action.id}-${index}`}
+              style={{
+                color: "var(--text-muted)",
+                fontSize: 9.5,
+                marginTop: 1,
+                lineHeight: 1.35,
+                whiteSpace: "normal",
+                wordBreak: "break-word",
+              }}
+            >
+              {detail}
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CompactMetricGrid({ items }: { items: MetricItem[] }) {
+  const visibleItems = items.filter((item) => item.label || item.value).slice(0, 6);
+  return (
+    <div
+      className="grid grid-cols-3 mt-3 overflow-hidden"
+      style={{
+        borderRadius: 12,
+        background: "rgba(255,255,255,0.42)",
+        border: "1px solid rgba(148,163,184,0.22)",
+        boxShadow: "inset 0 1px 0 rgba(255,255,255,0.45)",
+      }}
+    >
+      {visibleItems.map((item, index) => (
+        <div
+          key={`${item.label}-${index}`}
+          style={{
+            minWidth: 0,
+            minHeight: 44,
+            padding: "8px 10px",
+            borderRight: (index + 1) % 3 === 0 ? "none" : "1px solid rgba(148,163,184,0.18)",
+            borderTop: index < 3 ? "none" : "1px solid rgba(148,163,184,0.18)",
+            background: "rgba(255,255,255,0.12)",
+          }}
+        >
+          <div style={{ color: "var(--text-muted)", fontSize: 9.5, fontWeight: 700, lineHeight: 1 }}>
+            {item.label}
+          </div>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 5,
+              marginTop: 5,
+              minWidth: 0,
+            }}
+          >
+            <span
+              style={{
+                color: item.color ?? "var(--text-primary)",
+                fontSize: item.subValue ? 11.5 : 12.5,
+                fontWeight: 800,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                minWidth: 0,
+              }}
+            >
+              {item.value}
+            </span>
+            {item.subValue && (
+              <span
+                style={{
+                  color: item.color ?? "var(--text-secondary)",
+                  background: `${item.color ?? "rgba(100,116,139,1)"}14`,
+                  borderRadius: 5,
+                  padding: "1px 4px",
+                  fontSize: 9.5,
+                  fontWeight: 800,
+                  whiteSpace: "nowrap",
+                  flex: "0 0 auto",
+                }}
+              >
+                {item.subValue}
+              </span>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function ChartTooltip({ active, payload, currency, prefix, decimals = 3, prevClose = 0, regularClose = 0, market = "", upColor, downColor, language = "zh" }: any) {
   if (!active || !payload?.length) return null;
-  const d = payload[0]?.payload;
+  const d = payload[0]?.payload as ChartPointWithActions | undefined;
   const value = typeof d?.price === "number" && Number.isFinite(d.price) ? d.price : null;
   const title = formatTooltipTimeLabelI18n(d, language);
   const hoverTime = typeof d?.time === "string" ? d.time : "";
@@ -145,7 +457,17 @@ function ChartTooltip({ active, payload, currency, prefix, decimals = 3, prevClo
   return (
     <div style={{
       background: "var(--bg-overlay)", border: "1px solid var(--border)",
-      borderRadius: 8, padding: "6px 10px", fontSize: 11, color: "var(--text-primary)", minWidth: 80,
+      borderRadius: 8,
+      padding: "6px 10px",
+      fontSize: 11,
+      color: "var(--text-primary)",
+      minWidth: 120,
+      maxWidth: 260,
+      boxShadow: "0 8px 24px rgba(15,23,42,0.12)",
+      maxHeight: 180,
+      overflowY: "auto",
+      overflowX: "hidden",
+      scrollbarWidth: "none",
     }}>
       <div style={{ color: "var(--text-muted)", marginBottom: 2 }}>{title}</div>
       <div style={{ fontWeight: 700 }}>{value == null ? "—" : currency ? formatExactMoney(value, currency, decimals) : `${prefix ?? ""}${formatFixedNumber(value, decimals)}`}</div>
@@ -155,6 +477,7 @@ function ChartTooltip({ active, payload, currency, prefix, decimals = 3, prevClo
           <span style={{ marginLeft: 4 }}>{formatPercent(changePct)}</span>
         </div>
       )}
+      <ChartActionInlineDetails actions={d?.chartActions} />
     </div>
   );
 }
@@ -238,8 +561,9 @@ function CandlestickChart({
   downColor,
   currency,
   prefix,
+  onPointHover,
 }: {
-  points: ChartPoint[];
+  points: ChartPointWithActions[];
   height: number;
   prevClose: number;
   currentPrice: number;
@@ -248,11 +572,18 @@ function CandlestickChart({
   downColor: string;
   currency: string;
   prefix: string;
+  onPointHover?: (point?: ChartPointWithActions) => void;
 }) {
   const { language } = useApp();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [width, setWidth] = useState(0);
   const [hovered, setHovered] = useState<{ index: number; x: number; y: number } | null>(null);
+  const updateHover = useCallback((index: number, event: ReactMouseEvent<SVGRectElement>) => {
+    const rect = rootRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setHovered({ index, x: event.clientX - rect.left, y: event.clientY - rect.top });
+    onPointHover?.(points[index]);
+  }, [onPointHover, points]);
 
   useEffect(() => {
     const el = rootRef.current;
@@ -267,7 +598,11 @@ function CandlestickChart({
   const padTop = 10;
   const padBottom = 20;
   const padLeft = 12;
-  const padRight = 84;
+  const currentPriceText = currentPrice > 0
+    ? (currency ? formatExactMoney(currentPrice, currency, decimals) : `${prefix ?? ""}${formatFixedNumber(currentPrice, decimals)}`)
+    : "";
+  const currentPriceLabelWidth = Math.max(34, currentPriceText.length * 6.1 + 10);
+  const padRight = Math.max(56, Math.min(76, currentPriceLabelWidth + 12));
   const innerWidth = Math.max(1, width - padLeft - padRight);
   const innerHeight = Math.max(1, height - padTop - padBottom);
   const priceCandidates = points.flatMap((point) => [
@@ -298,32 +633,38 @@ function CandlestickChart({
 
   const hoveredIndex = hovered?.index ?? null;
   const hoveredPoint = hoveredIndex == null ? null : points[hoveredIndex] ?? null;
-  const formatValue = (value: number | undefined) => {
-    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "—";
-    return currency ? formatExactMoney(value, currency, decimals) : `${prefix ?? ""}${formatFixedNumber(value, decimals)}`;
-  };
-  const currentPriceText = currentPrice > 0
-    ? (currency ? formatExactMoney(currentPrice, currency, decimals) : `${prefix ?? ""}${formatFixedNumber(currentPrice, decimals)}`)
-    : "";
-  const currentPriceLabelWidth = Math.max(34, currentPriceText.length * 6.1 + 10);
   const currentPriceY = Math.min(
     padTop + innerHeight - 6,
     Math.max(padTop + 10, mapY(currentPrice)),
   );
   const currentPriceLabelX = Math.max(padLeft + innerWidth + 6, width - currentPriceLabelWidth - 2);
-  const tooltipWidth = 186;
+  const tooltipWidth = Math.min(252, Math.max(218, width - 24));
+  const actionDetailLines = hoveredPoint?.chartActions?.reduce((sum, action) => sum + action.details.length + 1, 0) ?? 0;
+  const tooltipHeightEstimate = hoveredPoint?.chartActions?.length
+    ? Math.min(height - 16, 40 + actionDetailLines * 15)
+    : 84;
+  const tooltipMaxHeight = Math.max(130, height - 16);
   const tooltipLeft = hovered
     ? hovered.x > width * 0.58
       ? Math.max(8, hovered.x - tooltipWidth - 14)
       : Math.max(8, Math.min(width - tooltipWidth - 8, hovered.x + 14))
     : 8;
   const tooltipTop = hovered
-    ? Math.max(8, Math.min(height - 84, hovered.y < 68 ? hovered.y + 12 : hovered.y - 78))
+    ? Math.max(8, Math.min(height - tooltipHeightEstimate - 8, hovered.y < 68 ? hovered.y + 12 : hovered.y - tooltipHeightEstimate + 12))
     : 8;
+  const hoveredY = hovered ? Math.max(padTop, Math.min(padTop + innerHeight, hovered.y)) : null;
+  const hoveredYValue = hoveredY == null
+    ? null
+    : yMax - ((hoveredY - padTop) / Math.max(innerHeight, 1)) * (yMax - yMin);
+  const hoveredYText = hoveredYValue != null && Number.isFinite(hoveredYValue)
+    ? (currency ? formatExactMoney(hoveredYValue, currency, decimals) : `${prefix ?? ""}${formatFixedNumber(hoveredYValue, decimals)}`)
+    : "";
+  const hoveredYLabelWidth = Math.max(38, hoveredYText.length * 6.1 + 10);
+  const hoveredYLabelX = Math.max(padLeft + innerWidth + 6, width - hoveredYLabelWidth - 2);
 
   return (
     <div ref={rootRef} style={{ width: "100%", height, position: "relative" }}>
-      {hoveredPoint && (
+      {hoveredPoint?.chartActions?.length ? (
         <div
           style={{
             position: "absolute",
@@ -337,20 +678,19 @@ function CandlestickChart({
             fontSize: 11,
             color: "var(--text-primary)",
             minWidth: tooltipWidth,
+            maxWidth: tooltipWidth,
+            maxHeight: tooltipMaxHeight,
+            overflowY: "auto",
+            overflowX: "hidden",
             pointerEvents: "none",
             boxShadow: "0 8px 24px rgba(15,23,42,0.12)",
+            scrollbarWidth: "none",
           }}
         >
           <div style={{ color: "var(--text-muted)", marginBottom: 4 }}>{formatTooltipTimeLabelI18n(hoveredPoint, language)}</div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "2px 8px" }}>
-            <span>{language === "en" ? "Open" : "开"} {formatValue(hoveredPoint.open)}</span>
-            <span>{language === "en" ? "Close" : "收"} {formatValue(hoveredPoint.close ?? hoveredPoint.price)}</span>
-            <span>{language === "en" ? "High" : "高"} {formatValue(hoveredPoint.high)}</span>
-            <span>{language === "en" ? "Low" : "低"} {formatValue(hoveredPoint.low)}</span>
-            <span style={{ gridColumn: "1 / -1" }}>{language === "en" ? "Volume" : "量"} {fmtLarge(hoveredPoint.volume)}</span>
-          </div>
+          <ChartActionInlineDetails actions={hoveredPoint.chartActions} />
         </div>
-      )}
+      ) : null}
       {width > 0 && (
         <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img" aria-label={language === "en" ? "Candlestick chart" : "K线图"}>
           {yTicks.map((tick) => {
@@ -421,12 +761,35 @@ function CandlestickChart({
               <line
                 x1={padLeft}
                 x2={padLeft + innerWidth}
-                y1={mapY(hoveredPoint.close ?? hoveredPoint.price)}
-                y2={mapY(hoveredPoint.close ?? hoveredPoint.price)}
+                y1={hoveredY ?? mapY(hoveredPoint.close ?? hoveredPoint.price)}
+                y2={hoveredY ?? mapY(hoveredPoint.close ?? hoveredPoint.price)}
                 stroke="rgba(148,163,184,0.65)"
                 strokeWidth="1"
                 strokeDasharray="3 3"
               />
+              {hoveredY != null && hoveredYText && (
+                <g>
+                  <rect
+                    x={hoveredYLabelX}
+                    y={Math.max(padTop, Math.min(padTop + innerHeight - 15, hoveredY - 8))}
+                    width={hoveredYLabelWidth}
+                    height={15}
+                    rx="4"
+                    fill="rgba(255,255,255,0.98)"
+                    stroke="rgba(148,163,184,0.55)"
+                    strokeWidth="1"
+                  />
+                  <text
+                    x={hoveredYLabelX + 5}
+                    y={Math.max(padTop, Math.min(padTop + innerHeight - 15, hoveredY - 8)) + 11}
+                    fill="var(--text-secondary)"
+                    fontSize="8.5"
+                    fontWeight="800"
+                  >
+                    {hoveredYText}
+                  </text>
+                </g>
+              )}
             </g>
           )}
 
@@ -460,18 +823,58 @@ function CandlestickChart({
                   width={Math.max(stepX, candleWidth)}
                   height={innerHeight}
                   fill="transparent"
-                  onMouseEnter={(event) => {
-                    const rect = rootRef.current?.getBoundingClientRect();
-                    if (!rect) return;
-                    setHovered({ index, x: event.clientX - rect.left, y: event.clientY - rect.top });
+                  onMouseEnter={(event) => updateHover(index, event)}
+                  onMouseMove={(event) => updateHover(index, event)}
+                  onMouseLeave={() => {
+                    setHovered((current) => (current?.index === index ? null : current));
+                    onPointHover?.(undefined);
                   }}
-                  onMouseMove={(event) => {
-                    const rect = rootRef.current?.getBoundingClientRect();
-                    if (!rect) return;
-                    setHovered({ index, x: event.clientX - rect.left, y: event.clientY - rect.top });
-                  }}
-                  onMouseLeave={() => setHovered((current) => (current?.index === index ? null : current))}
                 />
+              </g>
+            );
+          })}
+
+          {points.map((point, index) => {
+            const actions = point.chartActions;
+            if (!actions?.length) return null;
+            const x = padLeft + index * stepX + stepX / 2;
+            const label = mergedActionLabel(actions, language);
+            const badgeWidth = Math.max(16, label.length * 10 + 8);
+            const y = padTop + innerHeight - 18;
+            const color = actions.some((action) => action.label === (language === "en" ? "S" : "权")) ? "#8B5CF6" : "#F59E0B";
+            const badgeX = Math.max(padLeft, Math.min(width - padRight - badgeWidth, x - badgeWidth / 2));
+            return (
+              <g key={`action-${point.time}-${index}`} pointerEvents="none">
+                <line
+                  x1={x}
+                  x2={x}
+                  y1={padTop}
+                  y2={padTop + innerHeight}
+                  stroke={color}
+                  strokeWidth="1"
+                  strokeDasharray="3 3"
+                  opacity="0.34"
+                />
+                <rect
+                  x={badgeX}
+                  y={y}
+                  width={badgeWidth}
+                  height={16}
+                  rx="5"
+                  fill={`${color}18`}
+                  stroke={color}
+                  strokeWidth="1"
+                />
+                <text
+                  x={badgeX + badgeWidth / 2}
+                  y={y + 11.5}
+                  textAnchor="middle"
+                  fill={color}
+                  fontSize="9"
+                  fontWeight="800"
+                >
+                  {label}
+                </text>
               </g>
             );
           })}
@@ -923,11 +1326,18 @@ export function StockDetail() {
   const [refreshing, setRefreshing] = useState(false);
   const [spinning, setSpinning] = useState(false);
   const [chartWindow, setChartWindow] = useState<{ startIndex: number; endIndex: number } | null>(null);
+  const [detailActionEvents, setDetailActionEvents] = useState<CorporateActionEvent[]>([]);
+  const [activeChartPoint, setActiveChartPoint] = useState<ChartPointWithActions | undefined>(undefined);
   const lastSyncedRefreshRef = useRef<number>(0);
   const requestSeqRef = useRef(0);
+  const actionRequestSeqRef = useRef(0);
   const windowContextRef = useRef<string>("");
+  const initializedTargetKeyRef = useRef("");
   const dataRef = useRef<ChartData | null>(null);
   const dataRangeRef = useRef<TimeRange | null>(null);
+  const detailTargetKey = detailTarget
+    ? `${detailTarget.market}:${detailTarget.yahooSymbol}:${detailTarget.displaySymbol}`
+    : "";
 
   useEffect(() => {
     dataRef.current = data;
@@ -1083,13 +1493,19 @@ export function StockDetail() {
   }, [detailTarget, language]);
 
   useEffect(() => {
-    if (!detailTarget) return;
+    if (!detailTarget) {
+      initializedTargetKeyRef.current = "";
+      return;
+    }
+    if (initializedTargetKeyRef.current === detailTargetKey) return;
+    initializedTargetKeyRef.current = detailTargetKey;
     const defaultRange: TimeRange = detailTarget.market === "FUND" ? "f1y" : "fs";
     setRange(defaultRange);
     setChartWindow(null);
     windowContextRef.current = "";
     setData(null);
     setDataRange(null);
+    setActiveChartPoint(undefined);
     setRefreshing(false);
     setLoading(true);
     lastSyncedRefreshRef.current = lastRefreshAt;
@@ -1101,7 +1517,30 @@ export function StockDetail() {
       void fetchDetailChart(symbol, market, "1d").catch(() => null);
     }, 250);
     return () => window.clearTimeout(tid);
-  }, [detailTarget, lastRefreshAt, load]);
+  }, [detailTarget, detailTargetKey, lastRefreshAt, load]);
+
+  useEffect(() => {
+    if (!detailTarget || range === "fs") {
+      actionRequestSeqRef.current += 1;
+      setDetailActionEvents([]);
+      return;
+    }
+    const holding = buildDetailActionHolding(detailTarget);
+    if (!holding) {
+      actionRequestSeqRef.current += 1;
+      setDetailActionEvents([]);
+      return;
+    }
+    const requestSeq = ++actionRequestSeqRef.current;
+    const days = corporateActionHistoryDays(range);
+    void fetchCorporateActions(holding, days)
+      .then((events) => {
+        if (requestSeq === actionRequestSeqRef.current) setDetailActionEvents(events);
+      })
+      .catch(() => {
+        if (requestSeq === actionRequestSeqRef.current) setDetailActionEvents([]);
+      });
+  }, [detailTarget, range]);
 
   useEffect(() => {
     if (!detailTarget || !lastRefreshAt) return;
@@ -1142,6 +1581,7 @@ export function StockDetail() {
     setRange(r);
     setUsSession(null);
     setChartWindow(null);
+    setActiveChartPoint(undefined);
     windowContextRef.current = "";
     void load(r);
   };
@@ -1242,6 +1682,15 @@ export function StockDetail() {
   const displayPrefix = !currencyCode && showCurrency ? rawCurrency : "";
   const currency  = showCurrency ? currencyCode : "";
   const unitLabel = displayTarget.unit || rawCurrency;
+  const actionCurrency = currencyCode || (showCurrency ? rawCurrency : "");
+  const visiblePointsWithActions = useMemo(
+    () => attachCorporateActionMarkers(visiblePoints as ChartPointWithActions[], detailActionEvents, range, language, actionCurrency),
+    [actionCurrency, detailActionEvents, language, range, visiblePoints],
+  );
+  const areaChartDataWithActions = useMemo(
+    () => attachCorporateActionMarkers(areaChartData as ChartPointWithActions[], detailActionEvents, range, language, actionCurrency),
+    [actionCurrency, areaChartData, detailActionEvents, language, range],
+  );
   const resolvedNames = [name, q?.name ?? ""]
     .map((item) => item.trim())
     .filter(Boolean)
@@ -1277,6 +1726,7 @@ export function StockDetail() {
   const hasSessionVolume = sessionHasChart && areaChartData.some((point) => isPositiveFiniteNumber(point.displayVolume));
   const isRangeLoading = !isRangeReady && (loading || refreshing);
   const showSkeleton = loading && !data;
+  const mainChartHeight = isNavFund ? 240 : range === "fs" ? 220 : 200;
   const hasQuoteValue = (n: number | undefined | null) => typeof n === "number" && Number.isFinite(n) && n > 0;
   const formatQuoteValue = (n: number | undefined | null) => (
     showCurrency && currencyCode ? formatExactMoney(n, currencyCode, decimals)
@@ -1284,6 +1734,11 @@ export function StockDetail() {
     : formatFixedNumber(n, decimals)
   );
   const formatMaybeQuoteValue = (n: number | undefined | null) => hasQuoteValue(n) ? formatQuoteValue(n) : "—";
+  const formatLargeMoneyValue = (n: number | undefined | null) => {
+    if (!hasQuoteValue(n)) return "—";
+    if (!currencyCode) return fmtLarge(n ?? undefined, language);
+    return `${currencySymbol(currencyCode)}${fmtLarge(n ?? undefined, language)}`;
+  };
   const fundRangePrices = isNavFund
     ? chartPoints
       .map((point) => point.price)
@@ -1301,23 +1756,61 @@ export function StockDetail() {
       { label: language === "en" ? "Range High" : "区间高",   value: statQuote ? formatMaybeQuoteValue(fundRangeHigh) : "—", color: upColor },
       { label: language === "en" ? "Range Low" : "区间低",   value: statQuote ? formatMaybeQuoteValue(fundRangeLow) : "—",  color: dnColor },
       { label: language === "en" ? "Source" : "数据源",   value: statQuote?.exchange || "—" },
-      { label: "",        value: "" },
+      { label: language === "en" ? "Currency" : "货币", value: unitLabel || currencyCode || "—" },
     ]
     : [
       { label: language === "en" ? "Open" : "今开",    value: statQuote ? formatMaybeQuoteValue(statQuote.open) : "—" },
       { label: language === "en" ? "Prev Close" : "昨收",    value: statQuote ? formatMaybeQuoteValue(statQuote.prevClose) : "—" },
       { label: language === "en" ? "High" : "最高",    value: statQuote ? formatMaybeQuoteValue(statQuote.high) : "—",  color: upColor },
       { label: language === "en" ? "Low" : "最低",    value: statQuote ? formatMaybeQuoteValue(statQuote.low) : "—",   color: dnColor },
-      { label: language === "en" ? "Volume" : "成交量",  value: statQuote ? fmtLarge(statQuote.volume) : "—" },
+      { label: language === "en" ? "Volume" : "成交量",  value: statQuote ? fmtLarge(statQuote.volume, language) : "—" },
+      ...(statQuote?.marketCap  != null && currencyCode ? [{ label: language === "en" ? "Market Cap" : "市值",   value: formatLargeMoneyValue(statQuote.marketCap) }] : []),
+      ...(statQuote?.pe         != null ? [{ label: language === "en" ? "P/E" : "市盈率", value: formatExactNumber(statQuote.pe) }] : []),
       { label: language === "en" ? "Exchange" : "交易所",  value: statQuote?.exchange || "—" },
       ...(statQuote?.week52High != null ? [{ label: language === "en" ? "52W High" : "52W高", value: formatQuoteValue(statQuote.week52High), color: upColor }] : []),
       ...(statQuote?.week52Low  != null ? [{ label: language === "en" ? "52W Low" : "52W低", value: formatQuoteValue(statQuote.week52Low),  color: dnColor }] : []),
-      ...(statQuote?.marketCap  != null && currencyCode ? [{ label: language === "en" ? "Market Cap" : "市值",   value: formatExactMoney(statQuote.marketCap, currencyCode, 2) }] : []),
-      ...(statQuote?.pe         != null ? [{ label: language === "en" ? "P/E" : "市盈率", value: formatExactNumber(statQuote.pe) }] : []),
     ];
 
   // Make items even
   if (statItems.length % 2 !== 0) statItems.push({ label: "", value: "" });
+  const formatHoveredValue = (value: number | undefined) => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "—";
+    return formatQuoteValue(value);
+  };
+  const activeChartPointIndex = activeChartPoint
+    ? areaChartDataWithActions.findIndex((point) => point === activeChartPoint || (point.timestamp === activeChartPoint.timestamp && point.time === activeChartPoint.time))
+    : -1;
+  const activePrevPoint = activeChartPointIndex > 0 ? areaChartDataWithActions[activeChartPointIndex - 1] : null;
+  const activePrevPrice = activePrevPoint?.price ?? activePrevPoint?.displayPrice ?? 0;
+  const activeFundChange = activeChartPoint && activePrevPrice > 0 ? activeChartPoint.price - activePrevPrice : null;
+  const activeFundChangePct = activeFundChange != null && activePrevPrice > 0 ? activeFundChange / activePrevPrice : null;
+  const activeFundChangeColor = activeFundChange == null ? undefined : activeFundChange >= 0 ? upColor : dnColor;
+  const hoverMetricItems = activeChartPoint
+    ? isNavFund
+      ? [
+        { label: language === "en" ? "Time" : "时间", value: formatMetricTimeLabel(activeChartPoint, range, language) },
+        { label: language === "en" ? "NAV" : "净值", value: formatHoveredValue(activeChartPoint.price) },
+        {
+          label: language === "en" ? "Change" : "涨跌",
+          value: activeFundChange != null ? `${activeFundChange >= 0 ? "+" : ""}${formatQuoteValue(activeFundChange)}` : "—",
+          color: activeFundChangeColor,
+        },
+        { label: language === "en" ? "Change %" : "涨跌%", value: activeFundChangePct != null ? formatPercent(activeFundChangePct) : "—", color: activeFundChangeColor },
+        { label: language === "en" ? "Prev NAV" : "上一净值", value: activePrevPrice > 0 ? formatQuoteValue(activePrevPrice) : "—" },
+        {
+          label: activeChartPoint.chartActions?.length ? (language === "en" ? "Event" : "事件") : (language === "en" ? "Source" : "数据源"),
+          value: activeChartPoint.chartActions?.length ? activeChartPoint.chartActions.map((action) => action.title).join(" / ") : (statQuote?.exchange || "—"),
+        },
+      ]
+      : [
+      { label: language === "en" ? "Time" : "时间", value: formatMetricTimeLabel(activeChartPoint, range, language) },
+      { label: language === "en" ? "Open" : "开", value: formatHoveredValue(activeChartPoint.open) },
+      { label: language === "en" ? "Close" : "收", value: formatHoveredValue(activeChartPoint.close ?? activeChartPoint.price) },
+      { label: language === "en" ? "High" : "高", value: formatHoveredValue(activeChartPoint.high), color: upColor },
+      { label: language === "en" ? "Low" : "低", value: formatHoveredValue(activeChartPoint.low), color: dnColor },
+      { label: language === "en" ? "Volume" : "量", value: fmtLarge(activeChartPoint.volume, language) },
+      ]
+    : statItems;
 
   return (
     <motion.div
@@ -1425,6 +1918,7 @@ export function StockDetail() {
                   {unitLabel && <p style={{ color: "var(--text-micro)", fontSize: 10 }}>{unitLabel}</p>}
                 </div>
               </div>
+              <CompactMetricGrid items={hoverMetricItems} />
 
               {/* ── Extended Hours (US stocks) ── */}
               {market === "US" && (() => {
@@ -1550,12 +2044,12 @@ export function StockDetail() {
             )}
 
             {/* ── Price Chart ── */}
-            <div style={{ height: 170, position: "relative" }}>
+            <div style={{ height: mainChartHeight, position: "relative" }}>
               {hasRealChart && sessionHasChart ? (
                 hasCandleData ? (
                   <CandlestickChart
-                    points={visiblePoints}
-                    height={170}
+                    points={visiblePointsWithActions}
+                    height={mainChartHeight}
                     prevClose={prevClose}
                     currentPrice={displayQuote?.price ?? q?.price ?? 0}
                     decimals={decimals}
@@ -1563,10 +2057,21 @@ export function StockDetail() {
                     downColor={dnColor}
                     currency={currency}
                     prefix={displayPrefix}
+                    onPointHover={setActiveChartPoint}
                   />
                 ) : (
-                  <ResponsiveContainer width="100%" height={170}>
-                    <AreaChart data={areaChartData} margin={{ top: 8, right: 8, left: 8, bottom: 2 }}>
+                  <ResponsiveContainer width="100%" height={mainChartHeight}>
+                    <AreaChart
+                      data={areaChartDataWithActions}
+                      margin={{ top: 8, right: 8, left: 8, bottom: 2 }}
+                      onMouseMove={(state: any) => {
+                        const payload = state?.activePayload?.[0]?.payload as ChartPointWithActions | undefined;
+                        setActiveChartPoint(payload);
+                      }}
+                      onMouseLeave={() => {
+                        setActiveChartPoint(undefined);
+                      }}
+                    >
                       <defs>
                         <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
                           <stop offset="0%"   stopColor={lineColor} stopOpacity={0.25} />
@@ -1618,6 +2123,33 @@ export function StockDetail() {
                           />
                         }
                       />
+                      {areaChartDataWithActions.map((point, index) => {
+                        const actions = point.chartActions;
+                        const y = point.displayPrice ?? point.price;
+                        const x = useTimeXAxis ? point.timestamp : point.time;
+                        if (!actions?.length || typeof y !== "number" || !Number.isFinite(y) || y <= 0 || x == null) return null;
+                        const label = mergedActionLabel(actions, language);
+                        const color = actions.some((action) => action.label === (language === "en" ? "S" : "权")) ? "#8B5CF6" : "#F59E0B";
+                        return (
+                          <ReferenceDot
+                            key={`action-dot-${point.time}-${index}`}
+                            x={x}
+                            y={y}
+                            r={3.8}
+                            fill={color}
+                            stroke="#fff"
+                            strokeWidth={1.5}
+                            ifOverflow="visible"
+                            label={{
+                              value: label,
+                              position: "top",
+                              fill: color,
+                              fontSize: 9,
+                              fontWeight: 800,
+                            }}
+                          />
+                        );
+                      })}
                       <Area
                         type="monotone"
                         dataKey="displayPrice"
@@ -1683,7 +2215,6 @@ export function StockDetail() {
                 </div>
               )}
             </div>
-
             {hasRealChart && sessionHasChart && canUseNavigator && effectiveChartWindow && (
               <div
                 className="px-1"
@@ -1722,17 +2253,6 @@ export function StockDetail() {
 
             {/* ── Divider ── */}
             <div style={{ height: 8, background: "var(--bg-surface2)", margin: "8px 0" }} />
-
-            {/* ── Stats Grid ── */}
-            <div className="mx-0 overflow-hidden" style={{ borderRadius: 0 }}>
-              <div className="px-4 py-2 flex items-center justify-between">
-                <span style={{ color: "#4F9CF9", fontSize: 11, fontWeight: 600, letterSpacing: "0.5px" }}>{language === "en" ? "Market Data" : "行情数据"}</span>
-                {!q?.isLive && (q?.price ?? 0) > 0 && (
-                  <span style={{ color: "var(--text-micro)", fontSize: 10 }}>{language === "en" ? "Showing latest valid quote" : "当前展示最近一次有效报价"}</span>
-                )}
-              </div>
-              <StatRow items={statItems} />
-            </div>
 
             {/* ── Source ── */}
             <div style={{ padding: "12px 16px calc(10px + env(safe-area-inset-bottom))" }}>
