@@ -28,13 +28,17 @@ export function normalizeHoldingSymbol(symbol: string, market: string) {
   return symbol;
 }
 
+function canConfigureDividendReinvest(market: string, assetType: string) {
+  return market === "FUND" || assetType === "fund";
+}
+
 export function normalizeHolding(h: Holding): Holding {
   const normalizedType = normalizeHoldingType(h.symbol, h.name, h.market, h.assetType);
   const normalizedSymbol = normalizeHoldingSymbol(h.symbol, normalizedType.market);
   const marketValue = h.quantity * h.currentPrice;
   const costBasis = h.quantity * h.costPrice;
   const cashDividendTotal = Number.isFinite(h.cashDividendTotal) ? Math.max(0, h.cashDividendTotal ?? 0) : 0;
-  const totalPnl = marketValue - costBasis + cashDividendTotal;
+  const totalPnl = marketValue - costBasis;
   const fundNavHistory = Array.isArray(h.fundNavHistory)
     ? h.fundNavHistory
       .filter((row) => row.date && Number.isFinite(row.nav) && row.nav > 0)
@@ -59,7 +63,7 @@ export function normalizeHolding(h: Holding): Holding {
     priceDate: h.priceDate ?? "",
     fundNavHistory,
     cashDividendTotal,
-    dividendReinvest: typeof h.dividendReinvest === "boolean" ? h.dividendReinvest : null,
+    dividendReinvest: canConfigureDividendReinvest(normalizedType.market, normalizedType.assetType) && typeof h.dividendReinvest === "boolean" ? h.dividendReinvest : null,
     autoCorporateActionSince: h.autoCorporateActionSince ?? "",
     corporateActions,
     marketValue,
@@ -79,7 +83,7 @@ export function recomputeHoldingMetrics(
   const marketValue = next.quantity * next.currentPrice;
   const costBasis = next.quantity * next.costPrice;
   const cashDividendTotal = Number.isFinite(next.cashDividendTotal) ? Math.max(0, next.cashDividendTotal ?? 0) : 0;
-  const totalPnl = marketValue - costBasis + cashDividendTotal;
+  const totalPnl = marketValue - costBasis;
   return {
     ...next,
     cashDividendTotal,
@@ -117,7 +121,7 @@ export function buildHolding(input: HoldingInput, id: string): Holding {
     totalPnl,
     totalPnlRate: costBasis > 0 ? totalPnl / costBasis : 0,
     cashDividendTotal: 0,
-    dividendReinvest: typeof input.dividendReinvest === "boolean" ? input.dividendReinvest : null,
+    dividendReinvest: canConfigureDividendReinvest(normalizedType.market, normalizedType.assetType) && typeof input.dividendReinvest === "boolean" ? input.dividendReinvest : null,
     corporateActions: [],
     tradeStatus:  input.tradeStatus ?? "normal",
     tradeStatusNote: input.tradeStatusNote?.trim() || "",
@@ -134,8 +138,13 @@ export function applyCorporateAction(current: Holding, input: HoldingCorporateAc
     id: input.id || `corp_${crypto.randomUUID()}`,
     type: input.type,
     date: input.date || new Date().toISOString().slice(0, 10),
+    recordDate: input.recordDate,
+    exDate: input.exDate,
+    payDate: input.payDate,
+    announcementDate: input.announcementDate,
     source: input.source,
     note: input.note?.trim() || "",
+    description: input.description,
   };
 
   if (input.type === "cash_dividend") {

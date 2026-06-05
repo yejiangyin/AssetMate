@@ -58,6 +58,7 @@ const blankForm = (): HoldingInput => ({
 
 function normalizeHoldingForm(input: HoldingInput): HoldingInput {
   const normalizedType = normalizeHoldingType(input.symbol, input.name, input.market, input.assetType);
+  const isFund = normalizedType.market === "FUND" || normalizedType.assetType === "fund";
   return {
     ...input,
     symbol: normalizeHoldingSymbol(input.symbol, normalizedType.market),
@@ -65,8 +66,12 @@ function normalizeHoldingForm(input: HoldingInput): HoldingInput {
     assetType: normalizedType.assetType,
     tradeStatus: "normal",
     tradeStatusNote: "",
-    dividendReinvest: input.dividendReinvest ?? null,
+    dividendReinvest: isFund ? input.dividendReinvest ?? null : null,
   };
+}
+
+function isFundLike(input: Pick<HoldingInput, "market" | "assetType"> | Pick<Holding, "market" | "assetType">) {
+  return input.market === "FUND" || input.assetType === "fund";
 }
 
 function assetTypeSelectLabel(market: string, assetType: string, fallback: string, language: Language) {
@@ -94,12 +99,26 @@ function holdingMarketValue(h: Holding) {
 }
 
 function holdingTotalPnl(h: Holding) {
-  return h.quantity * (h.currentPrice - h.costPrice) + (h.cashDividendTotal ?? 0);
+  return h.quantity * (h.currentPrice - h.costPrice);
 }
 
 function holdingTotalPnlRate(h: Holding) {
   const cost = h.quantity * h.costPrice;
   return cost > 0 ? holdingTotalPnl(h) / cost : 0;
+}
+
+function todayLocalYMD() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function todayCashDividendAmount(h: Holding, today = todayLocalYMD()) {
+  return (h.corporateActions ?? [])
+    .filter((action) => action.type === "cash_dividend" && action.date === today)
+    .reduce((sum, action) => sum + (Number.isFinite(action.amount) ? Math.max(0, action.amount ?? 0) : 0), 0);
 }
 
 function holdingTodayPnlRate(h: Holding) {
@@ -350,6 +369,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
     { value: "", label: text.holdings.noGroup },
     ...groups.map((g) => ({ value: g.id, label: groupName(g.id, g.name, language) })),
   ];
+  const showDividendMode = isFundLike(form);
   const dividendMode = form.dividendReinvest == null ? "inherit" : form.dividendReinvest ? "reinvest" : "cash";
   const dividendModeOptions = [
     { value: "inherit", label: text.holdings.dividendInherit },
@@ -369,6 +389,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
       assetType: normalizedType.assetType,
       currency: r.currency,
       currentPrice: r.price > 0 ? r.price : f.currentPrice,
+      dividendReinvest: isFundLike(normalizedType) ? f.dividendReinvest : null,
       autoTradeStatus: null,
       autoTradeStatusNote: "",
       autoTradeStatusSource: null,
@@ -450,7 +471,11 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
 
           <div className="grid grid-cols-2 gap-2">
             <Field label={text.holdings.assetType}>
-              <Sel value={form.assetType as AssetType} onChange={(v) => set("assetType", v)}
+              <Sel value={form.assetType as AssetType} onChange={(v) => setForm((f) => ({
+                ...f,
+                assetType: v,
+                dividendReinvest: isFundLike({ ...f, assetType: v }) ? f.dividendReinvest : null,
+              }))}
                 options={assetTypeSelectOptions} />
             </Field>
             <Field label={text.holdings.currency}>
@@ -466,13 +491,15 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
             <Sel value={form.groupId} onChange={(v) => set("groupId", v)} options={groupOpts} />
           </Field>
 
-          <Field label={text.holdings.dividendMode}>
-            <Sel
-              value={dividendMode}
-              onChange={(v) => set("dividendReinvest", v === "inherit" ? null : v === "reinvest")}
-              options={dividendModeOptions}
-            />
-          </Field>
+          {showDividendMode && (
+            <Field label={text.holdings.dividendMode}>
+              <Sel
+                value={dividendMode}
+                onChange={(v) => set("dividendReinvest", v === "inherit" ? null : v === "reinvest")}
+                options={dividendModeOptions}
+              />
+            </Field>
+          )}
 
           <p style={{ color: "#4F9CF9", fontSize: 11, fontWeight: 600, marginTop: 2 }}>{text.holdings.holdingInfo}</p>
 
@@ -674,6 +701,7 @@ function HoldingCard({
   const todayC    = profitColor(h.todayPnl);
   const totalPnl  = holdingTotalPnl(h);
   const totalRate = holdingTotalPnlRate(h);
+  const todayDividend = todayCashDividendAmount(h);
   const totalC    = profitColor(totalPnl);
   const badge     = getSecurityBadge(h.market, h.assetType, language);
   const group     = groups.find((g) => g.id === h.groupId);
@@ -764,14 +792,14 @@ function HoldingCard({
                 {tradeStatusText}
               </span>
             </div>
-            {(h.cashDividendTotal ?? 0) > 0 && (
+            {todayDividend > 0 && (
               <div className="mt-0.5">
                 <span style={{ color: "#31D08B", fontSize: 10, fontWeight: 600 }}>
-                  {language === "en" ? "Dividend" : "分红"} {fmtMoney(h.cashDividendTotal ?? 0)}
+                  {language === "en" ? "Dividend" : "分红"} {fmtMoney(todayDividend)}
                 </span>
               </div>
             )}
-            {typeof h.dividendReinvest === "boolean" && (
+            {isFundLike(h) && typeof h.dividendReinvest === "boolean" && (
               <div className="mt-0.5">
                 <span style={{ color: "var(--text-micro)", fontSize: 9 }}>
                   {h.dividendReinvest
@@ -889,26 +917,40 @@ function GroupsView({ groups, holdings, dcaPlans, baseCurrency, selectedId, onSe
     todayPnl: gHoldings.reduce((s, h) => s + convertAmount(h.todayPnl, h.currency, baseCurrency), 0),
     pct:      totalAll > 0 ? gHoldings.reduce((s, h) => s + convertAmount(holdingMarketValue(h), h.currency, baseCurrency), 0) / totalAll * 100 : 0,
   });
+  const allocationGroups = [
+    ...groups.map((group) => ({
+      id: group.id,
+      name: groupName(group.id, group.name, language),
+      color: group.color,
+      holdings: grouped[group.id] ?? [],
+    })),
+    {
+      id: "__ungrouped",
+      name: t(language).common.notGrouped,
+      color: "var(--text-micro)",
+      holdings: grouped[""] ?? [],
+    },
+  ].filter((group) => group.holdings.length > 0 && groupStats(group.holdings).total > 0);
 
   return (
     <div className="flex flex-col gap-2 px-3">
       {/* Total allocation bar */}
-      {groups.length > 0 && (
+      {allocationGroups.length > 0 && (
         <div className="rounded-xl p-3 mb-1" style={{ background: "var(--bg-card)", border: "1px solid var(--border)" }}>
           <p style={{ color: "var(--text-muted)", fontSize: 10, marginBottom: 6 }}>{text.groupAssetRatio}</p>
           <div className="flex rounded-full overflow-hidden gap-px" style={{ height: 6 }}>
-            {groups.map((g) => {
-              const pct = groupStats(grouped[g.id] ?? []).pct;
+            {allocationGroups.map((g) => {
+              const pct = groupStats(g.holdings).pct;
               return pct > 0 ? <div key={g.id} style={{ width: `${pct}%`, background: g.color, borderRadius: 99 }} /> : null;
             })}
           </div>
           <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2">
-            {groups.filter((g) => (grouped[g.id]?.length ?? 0) > 0).map((g) => {
-              const { pct } = groupStats(grouped[g.id] ?? []);
+            {allocationGroups.map((g) => {
+              const { pct } = groupStats(g.holdings);
               return (
                 <div key={g.id} className="flex items-center gap-1">
                   <div className="rounded-full" style={{ width: 6, height: 6, background: g.color }} />
-                  <span style={{ color: "var(--text-muted)", fontSize: 10 }}>{groupName(g.id, g.name, language)}</span>
+                  <span style={{ color: "var(--text-muted)", fontSize: 10 }}>{g.name}</span>
                   <span style={{ color: "var(--text-secondary)", fontSize: 10 }}>{formatPercent(pct / 100)}</span>
                 </div>
               );

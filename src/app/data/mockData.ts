@@ -34,8 +34,13 @@ export type Holding = {
     shares?: number;
     ratio?: number;
     price?: number;
+    recordDate?: string;
+    exDate?: string;
+    payDate?: string;
+    announcementDate?: string;
     source?: string;
     note?: string;
+    description?: string;
   }>;
   tradeStatus:  "normal" | "suspended" | "fund_limit" | "buy_disabled";
   tradeStatusNote?: string;
