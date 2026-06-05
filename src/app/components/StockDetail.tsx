@@ -170,9 +170,8 @@ function periodKeyFromYMD(date: string, range: TimeRange) {
   if (!match) return "";
   const year = match[1];
   const month = Number(match[2]);
-  if (range === "1y") return year;
   if (range === "3mo") return `${year}-Q${Math.floor((month - 1) / 3) + 1}`;
-  if (range === "1mo" || range === "max") return `${year}-${String(month).padStart(2, "0")}`;
+  if (range === "1y" || range === "1mo" || range === "max") return `${year}-${String(month).padStart(2, "0")}`;
   return "";
 }
 
