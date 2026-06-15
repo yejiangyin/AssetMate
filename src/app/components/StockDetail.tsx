@@ -1925,60 +1925,6 @@ export function StockDetail() {
               </div>
               <CompactMetricGrid items={hoverMetricItems} />
 
-              {/* ── Extended Hours (US stocks) ── */}
-              {market === "US" && (() => {
-                const cards = [
-                  {
-                    label: language === "en" ? "Pre" : "盘前",
-                    price: displayQuote?.preMarketPrice,
-                    change: displayQuote?.preMarketChange,
-                    changePct: displayQuote?.preMarketChangePercent,
-                  },
-                  {
-                    label: language === "en" ? "Post" : "盘后",
-                    price: displayQuote?.postMarketPrice,
-                    change: displayQuote?.postMarketChange,
-                    changePct: displayQuote?.postMarketChangePercent,
-                  },
-                  {
-                    label: language === "en" ? "Overnight" : "夜盘",
-                    price: displayQuote?.overnightPrice,
-                    change: displayQuote?.overnightChange,
-                    changePct: displayQuote?.overnightChangePercent,
-                  },
-                ];
-                const visibleCards = cards.filter((card) => card.price && card.price > 0);
-                if (!visibleCards.length) return null;
-
-                return (
-                  <div className={`grid gap-2 mt-3 ${visibleCards.length === 1 ? "grid-cols-1" : visibleCards.length === 2 ? "grid-cols-2" : "grid-cols-3"}`}>
-                    {visibleCards.map((card) => {
-                      const cardIsUp = (card.change ?? 0) >= 0;
-                      const cardColor = cardIsUp ? upColor : dnColor;
-                      return (
-                        <div
-                          key={card.label}
-                          className="rounded-lg px-2 py-1.5"
-                          style={{ background: "var(--bg-card)", border: "1px solid var(--border)" }}
-                        >
-                          <p style={{ color: "var(--text-muted)", fontSize: 9, fontWeight: 700 }}>{card.label}</p>
-                          <p
-                            className="truncate"
-                            style={{ color: "var(--text-primary)", fontSize: 12, fontWeight: 800 }}
-                          >
-                            {formatQuoteValue(card.price!)}
-                          </p>
-                          {card.changePct != null && (
-                            <p style={{ color: cardColor, fontSize: 9, fontWeight: 700 }}>
-                              {formatPercent(card.changePct)}
-                            </p>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                );
-              })()}
             </div>
 
             {/* ── Time Range Tabs ── */}
