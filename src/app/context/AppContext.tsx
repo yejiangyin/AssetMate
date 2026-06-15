@@ -22,6 +22,8 @@ const THEMES = new Set<Theme>(["dark", "light", "system"]);
 const CURRENCIES = new Set<Currency>(["CNY", "USD", "HKD"]);
 const REFRESH_INTERVALS = new Set<RefreshInterval>([0, 1, 5, 15, 30, 60]);
 const LANGUAGES = new Set<Language>(["zh", "en"]);
+const CORPORATE_ACTION_CHECK_TTL = 24 * 60 * 60 * 1000;
+const corporateActionCheckedAt = new Map<string, number>();
 
 function enumOr<T extends string | number>(value: unknown, allowed: Set<T>, fallback: T): T {
   return allowed.has(value as T) ? value as T : fallback;
@@ -42,6 +44,7 @@ export type HoldingInput = {
   autoTradeStatus?: HoldingTradeStatus | null;
   autoTradeStatusNote?: string;
   autoTradeStatusSource?: string | null;
+  fundBuyConfirmDays?: number;
   dividendReinvest?: boolean | null;
 };
 
@@ -125,6 +128,7 @@ export interface DCAPlan {
   totalInvested:number;
   execCount:    number;
   note?:        string;
+  fundBuyConfirmDays?: number;
 }
 
 export type DCAExecutionStatus = "pending" | "executed" | "skipped";
@@ -420,9 +424,23 @@ function hasFundNavRefreshWindow(holdings: Holding[], now = new Date()) {
   );
 }
 
-async function fetchCorporateActionMap(holdings: Holding[]) {
+function corporateActionTargetKey(holding: Holding) {
+  return `${holding.market}:${holding.symbol}`;
+}
+
+async function fetchCorporateActionMap(holdings: Holding[], force = false) {
+  const now = Date.now();
   const entries = await Promise.all(
-    holdings.map(async (holding) => [holding.id, await fetchCorporateActions(holding)] as const),
+    holdings.map(async (holding) => {
+      const key = corporateActionTargetKey(holding);
+      const checkedAt = corporateActionCheckedAt.get(key) ?? 0;
+      if (!force && checkedAt && now - checkedAt < CORPORATE_ACTION_CHECK_TTL) {
+        return [holding.id, [] as Awaited<ReturnType<typeof fetchCorporateActions>>] as const;
+      }
+      const actions = await fetchCorporateActions(holding);
+      corporateActionCheckedAt.set(key, Date.now());
+      return [holding.id, actions] as const;
+    }),
   );
   return new Map(entries);
 }
@@ -597,6 +615,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AppState>(() => loadInitialState());
   const stateRef = useRef(state);
   const refreshPromiseRef = useRef<Promise<void> | null>(null);
+  const corporateActionRefreshPromiseRef = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     stateRef.current = state;
@@ -633,16 +652,50 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
+  const applyCorporateActionsToLatestState = useCallback((
+    corporateActionMap: Awaited<ReturnType<typeof fetchCorporateActionMap>>,
+  ) => {
+    if (!corporateActionMap.size) return;
+    const now = new Date();
+    setState((s) => {
+      const corporateState = applyAutomaticCorporateActions(
+        s.holdings,
+        corporateActionMap,
+        s.dividendReinvest,
+        todayLocalYMD(now),
+      );
+      const dcaState = applyDCAState(corporateState.holdings, s.dcaPlans, s.dcaExecutions, false);
+      return {
+        ...s,
+        holdings: dcaState.holdings,
+        dcaPlans: dcaState.dcaPlans,
+        dcaExecutions: dcaState.dcaExecutions,
+      };
+    });
+  }, [applyDCAState]);
+
+  const runCorporateActionRefresh = useCallback((currentHoldings: Holding[], force = false) => {
+    if (!currentHoldings.length) return Promise.resolve();
+    if (corporateActionRefreshPromiseRef.current) return corporateActionRefreshPromiseRef.current;
+
+    const task = fetchCorporateActionMap(currentHoldings, force)
+      .then(applyCorporateActionsToLatestState)
+      .catch(() => undefined)
+      .finally(() => {
+        corporateActionRefreshPromiseRef.current = null;
+      });
+
+    corporateActionRefreshPromiseRef.current = task;
+    return task;
+  }, [applyCorporateActionsToLatestState]);
+
   /* live price refresh */
-  const doRefresh = useCallback(async (currentHoldings: Holding[]) => {
+  const doRefresh = useCallback(async (currentHoldings: Holding[], options: { forceCorporateActions?: boolean } = {}) => {
     setState((s) => ({ ...s, isRefreshing: true }));
     try {
-      const [priceMap, corporateActionMap] = await Promise.all([
-        refreshPrices(
-          currentHoldings.map((h) => ({ id: h.id, symbol: h.symbol, market: h.market }))
-        ),
-        fetchCorporateActionMap(currentHoldings),
-      ]);
+      const priceMap = await refreshPrices(
+        currentHoldings.map((h) => ({ id: h.id, symbol: h.symbol, market: h.market }))
+      );
       setState((s) => {
         const updated = s.holdings.map((h) => {
           const liveUpdate = priceMap[h.id];
@@ -654,6 +707,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             autoTradeStatus: liveUpdate.autoTradeStatus ?? null,
             autoTradeStatusNote: liveUpdate.autoTradeStatusNote ?? "",
             autoTradeStatusSource: liveUpdate.autoTradeStatusSource ?? null,
+            fundBuyConfirmDays: liveUpdate.fundBuyConfirmDays ?? h.fundBuyConfirmDays,
             priceDate: h.priceDate ?? "",
             fundNavHistory: h.fundNavHistory,
           };
@@ -673,6 +727,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             autoTradeStatus: liveUpdate.autoTradeStatus ?? null,
             autoTradeStatusNote: liveUpdate.autoTradeStatusNote ?? "",
             autoTradeStatusSource: liveUpdate.autoTradeStatusSource ?? null,
+            fundBuyConfirmDays: liveUpdate.fundBuyConfirmDays ?? h.fundBuyConfirmDays,
             priceDate: lp.priceDate ?? h.priceDate ?? "",
             fundNavHistory: lp.fundNavHistory ?? h.fundNavHistory,
             estimatedNav: lp.estimatedNav,
@@ -686,8 +741,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         });
         const now = new Date();
         const t   = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}:${String(now.getSeconds()).padStart(2,"0")}`;
-        const corporateState = applyAutomaticCorporateActions(updated, corporateActionMap, s.dividendReinvest, todayLocalYMD(now));
-        const dcaState = applyDCAState(corporateState.holdings, s.dcaPlans, s.dcaExecutions, true);
+        const dcaState = applyDCAState(updated, s.dcaPlans, s.dcaExecutions, true);
         return {
           ...s,
           holdings: dcaState.holdings,
@@ -699,15 +753,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           lastRefreshAt: now.getTime(),
         };
       });
+      void runCorporateActionRefresh(currentHoldings, options.forceCorporateActions);
     } catch {
       setState((s) => ({ ...s, isRefreshing: false }));
     }
-  }, [applyDCAState]);
+  }, [applyDCAState, runCorporateActionRefresh]);
 
-  const runRefresh = useCallback((currentHoldings: Holding[]) => {
+  const runRefresh = useCallback((currentHoldings: Holding[], options: { forceCorporateActions?: boolean } = {}) => {
     if (refreshPromiseRef.current) return refreshPromiseRef.current;
 
-    const task = doRefresh(currentHoldings)
+    const task = doRefresh(currentHoldings, options)
       .finally(() => {
         refreshPromiseRef.current = null;
       });
@@ -773,7 +828,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [state.refreshInterval, runRefresh]);
 
   const refresh = useCallback(() => {
-    return runRefresh(stateRef.current.holdings);
+    return runRefresh(stateRef.current.holdings, { forceCorporateActions: true });
   }, [runRefresh]);
 
   /* settings */

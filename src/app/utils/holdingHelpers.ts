@@ -50,6 +50,9 @@ export function normalizeHolding(h: Holding): Holding {
       .filter((action) => typeof action?.id === "string" && typeof action?.type === "string" && typeof action?.date === "string")
       .slice(-60)
     : [];
+  const fundBuyConfirmDays = Number.isInteger(h.fundBuyConfirmDays) && h.fundBuyConfirmDays! >= 0 && h.fundBuyConfirmDays! <= 30
+    ? h.fundBuyConfirmDays
+    : undefined;
   return {
     ...h,
     symbol: normalizedSymbol,
@@ -60,6 +63,7 @@ export function normalizeHolding(h: Holding): Holding {
     autoTradeStatus: h.autoTradeStatus ?? null,
     autoTradeStatusNote: h.autoTradeStatusNote ?? "",
     autoTradeStatusSource: h.autoTradeStatusSource ?? null,
+    fundBuyConfirmDays,
     priceDate: h.priceDate ?? "",
     fundNavHistory,
     cashDividendTotal,
@@ -128,6 +132,9 @@ export function buildHolding(input: HoldingInput, id: string): Holding {
     autoTradeStatus: input.autoTradeStatus ?? null,
     autoTradeStatusNote: input.autoTradeStatusNote ?? "",
     autoTradeStatusSource: input.autoTradeStatusSource ?? null,
+    fundBuyConfirmDays: Number.isInteger(input.fundBuyConfirmDays) && input.fundBuyConfirmDays! >= 0 && input.fundBuyConfirmDays! <= 30
+      ? input.fundBuyConfirmDays
+      : undefined,
     updatedAt:    new Date().toISOString(),
   };
 }

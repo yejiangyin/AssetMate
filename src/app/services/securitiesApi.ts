@@ -164,9 +164,17 @@ export async function fetchCnFundEstimate(code: string): Promise<FundEstimateSna
   }
 }
 
+export function parseFundBuyConfirmDays(text: string): number | undefined {
+  const raw = text.match(/买入确认日\s*T\s*\+\s*(\d{1,2})/)?.[1];
+  if (raw === undefined) return undefined;
+  const days = Number(raw);
+  return Number.isInteger(days) && days >= 0 && days <= 30 ? days : undefined;
+}
+
 export async function fetchCnFundTradeStatus(code: string): Promise<{
   status: "normal" | "fund_limit" | "buy_disabled";
   note: string;
+  buyConfirmDays?: number;
 } | null> {
   const [signal, clear] = mkAbort(6000);
   try {
@@ -189,21 +197,35 @@ export async function fetchCnFundTradeStatus(code: string): Promise<{
     const purchase = text.match(/申购状态\s*(暂停申购|开放申购|限制大额申购|限大额|暂停|开放|不支持)/)?.[1] ?? "";
     const dca = text.match(/定投状态\s*(不支持|暂停|开放|支持)/)?.[1] ?? "";
     const limit = text.match(/(?:单日累计购买上限|日累计申购限额)\s*([0-9.]+[万千百十]?元|---|不限|无限额)/)?.[1] ?? "";
+    const buyConfirmDays = parseFundBuyConfirmDays(text);
+    const confirmPatch = buyConfirmDays !== undefined ? { buyConfirmDays } : {};
 
-    if (/暂停|不支持/.test(purchase) || (!purchase && /不支持|暂停/.test(dca))) {
+    if (/不支持|暂停/.test(dca)) {
+      const parts = [
+        purchase ? `申购状态：${purchase}` : "",
+        `定投状态：${dca}`,
+      ].filter(Boolean);
+      return { status: "buy_disabled", note: parts.join("，") || "基金当前不可定投", ...confirmPatch };
+    }
+
+    if (/暂停|不支持/.test(purchase)) {
       const parts = [
         purchase ? `申购状态：${purchase}` : "",
         dca ? `定投状态：${dca}` : "",
       ].filter(Boolean);
-      return { status: "buy_disabled", note: parts.join("，") || "基金当前不可买入" };
+      return { status: "buy_disabled", note: parts.join("，") || "基金当前不可买入", ...confirmPatch };
     }
 
     if (/限制|限大额/.test(purchase) || (limit && !/不限|无限额|---/.test(limit))) {
-      return { status: "fund_limit", note: limit ? `基金限购，${limit}` : "基金限购" };
+      return { status: "fund_limit", note: limit ? `基金限购，${limit}` : "基金限购", ...confirmPatch };
     }
 
     if (/开放|支持/.test(purchase) || /开放|支持/.test(dca)) {
-      return { status: "normal", note: "东方财富基金交易状态显示可买" };
+      return { status: "normal", note: "东方财富基金交易状态显示可买", ...confirmPatch };
+    }
+
+    if (buyConfirmDays !== undefined) {
+      return { status: "normal", note: "已获取基金买入确认规则，交易状态未识别", buyConfirmDays };
     }
 
     return null;

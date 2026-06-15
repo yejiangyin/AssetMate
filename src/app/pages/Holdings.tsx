@@ -412,7 +412,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
       void fetchCnFundTradeStatus(sym).then((status) => {
         if (!status) return;
         setForm((f) => f.symbol === sym && f.market === market
-          ? { ...f, autoTradeStatus: status.status, autoTradeStatusNote: status.note, autoTradeStatusSource: "eastmoney" }
+          ? { ...f, autoTradeStatus: status.status, autoTradeStatusNote: status.note, autoTradeStatusSource: "eastmoney", fundBuyConfirmDays: status.buyConfirmDays }
           : f);
       }).catch(() => null);
     } else if (market === "A" || market === "HK") {
@@ -1610,6 +1610,7 @@ export function Holdings() {
                     autoTradeStatus: editTarget.autoTradeStatus,
                     autoTradeStatusNote: editTarget.autoTradeStatusNote,
                     autoTradeStatusSource: editTarget.autoTradeStatusSource,
+                    fundBuyConfirmDays: editTarget.fundBuyConfirmDays,
                     dividendReinvest: editTarget.dividendReinvest ?? null }
                 : blankForm()
             }

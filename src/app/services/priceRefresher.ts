@@ -31,6 +31,7 @@ export interface HoldingLiveUpdate {
   autoTradeStatus?: TradeStatusValue | null;
   autoTradeStatusNote?: string;
   autoTradeStatusSource?: LivePrice["source"] | null;
+  fundBuyConfirmDays?: number;
 }
 
 export type PriceMap = Record<string, HoldingLiveUpdate>;
@@ -684,6 +685,7 @@ async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSi
             autoTradeStatus: fundStatus.status,
             autoTradeStatusNote: fundStatus.note,
             autoTradeStatusSource: "eastmoney",
+            fundBuyConfirmDays: fundStatus.buyConfirmDays,
           };
         } else if (price) {
           update = normalTradeStatusFromSource(price.source);

@@ -247,11 +247,78 @@ const CATS: { key: Category; label: string; color: string }[] = [
   { key: "汇率", label: "汇率",   color: "var(--text-secondary)" },
 ];
 
-let marketPageCache: {
+type MarketPageCache = {
   indices: IndexEntry[];
   lastRefreshed: string;
   syncedAt: number;
-} | null = null;
+  savedAt: number;
+};
+
+let marketPageCache: MarketPageCache | null = null;
+
+const MARKET_PAGE_CACHE_KEY = "asset-helper:market-page-cache:v1";
+const FALLBACK_MARKET_PAGE_CACHE_TTL = 5 * 60 * 1000;
+
+function isValidCachedIndexEntry(entry: unknown): entry is IndexEntry {
+  const item = entry as Partial<IndexEntry>;
+  return Boolean(
+    item
+    && typeof item.id === "string"
+    && typeof item.name === "string"
+    && typeof item.category === "string"
+    && typeof item.yahooSymbol === "string"
+    && typeof item.displaySymbol === "string",
+  );
+}
+
+function mergeWithStaticIndexEntries(cached: IndexEntry[]) {
+  const byId = new Map(cached.filter(isValidCachedIndexEntry).map((entry) => [entry.id, entry]));
+  return INDICES.map((entry) => ({ ...entry, ...(byId.get(entry.id) ?? {}) }));
+}
+
+function readMarketPageCache() {
+  if (marketPageCache) return marketPageCache;
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(MARKET_PAGE_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<MarketPageCache> | null;
+    if (!parsed || !Array.isArray(parsed.indices) || typeof parsed.savedAt !== "number") return null;
+    marketPageCache = {
+      indices: mergeWithStaticIndexEntries(parsed.indices),
+      lastRefreshed: parsed.lastRefreshed || "",
+      syncedAt: Number(parsed.syncedAt) || 0,
+      savedAt: parsed.savedAt,
+    };
+    return marketPageCache;
+  } catch {
+    return null;
+  }
+}
+
+function writeMarketPageCache(cache: MarketPageCache) {
+  marketPageCache = cache;
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(MARKET_PAGE_CACHE_KEY, JSON.stringify(cache));
+  } catch {
+    // Cache write failures should not affect market data rendering.
+  }
+}
+
+function marketCacheTtl(refreshInterval: number) {
+  return refreshInterval > 0
+    ? refreshInterval * 60 * 1000
+    : FALLBACK_MARKET_PAGE_CACHE_TTL;
+}
+
+function isFreshMarketPageCache(cache: typeof marketPageCache, refreshInterval: number) {
+  return Boolean(
+    cache
+    && Date.now() - cache.savedAt < marketCacheTtl(refreshInterval)
+    && cache.indices.some((entry) => typeof entry.currentValue === "number" && entry.currentValue > 0),
+  );
+}
 
 /* ─── helpers ────────────────────────────────────────── */
 function showCurrencyForEntry(entry: IndexEntry) {
@@ -399,19 +466,22 @@ export function Market() {
     isRefreshing: globalIsRefreshing,
     profitColor,
     language,
+    refreshInterval,
   } = useApp();
   const text = t(language);
-  const [indices, setIndices] = useState<IndexEntry[]>(() => marketPageCache?.indices ?? []);
+  const initialMarketCache = readMarketPageCache();
+  const [indices, setIndices] = useState<IndexEntry[]>(() => initialMarketCache?.indices ?? INDICES);
   const [activeTab, setActiveTab] = useState<Category>("全部");
   const [refreshing, setRefreshing] = useState(false);
   const [manualRefreshing, setManualRefreshing] = useState(false);
-  const [bootstrapped, setBootstrapped] = useState(() => Boolean(marketPageCache));
-  const lastSyncedRefreshRef = useRef<number>(marketPageCache?.syncedAt ?? 0);
+  const lastSyncedRefreshRef = useRef<number>(initialMarketCache?.syncedAt ?? 0);
+  const bootstrappedFromFreshCacheRef = useRef(isFreshMarketPageCache(initialMarketCache, refreshInterval));
   const indicesRef = useRef(indices);
   useEffect(() => { indicesRef.current = indices; }, [indices]);
 
   // Display global refresh time when available, otherwise show local cache time
-  const lastRefreshed = globalLastRefreshed || marketPageCache?.lastRefreshed || text.common.loading;
+  const currentMarketCache = readMarketPageCache();
+  const lastRefreshed = globalLastRefreshed || currentMarketCache?.lastRefreshed || text.common.loading;
 
   const doRefresh = useCallback(async (
     current: IndexEntry[],
@@ -447,7 +517,7 @@ export function Market() {
             refreshedAt: Date.now(),
           });
           const hasChart = hasSparklinePoints(chart.points);
-          return {
+          const nextEntry = {
             ...entry,
             currentValue: nextValue,
             changeAmount: normalizedChange,
@@ -458,6 +528,17 @@ export function Market() {
             detailPoints: hasChart ? chart.points : entry.detailPoints,
             chartAvailable: hasChart,
           };
+          setIndices((currentItems) => {
+            const nextItems = currentItems.map((item) => item.id === entry.id ? nextEntry : item);
+            writeMarketPageCache({
+              indices: nextItems,
+              lastRefreshed: timeLabel(),
+              syncedAt,
+              savedAt: Date.now(),
+            });
+            return nextItems;
+          });
+          return nextEntry;
         } catch {
           return {
             ...entry,
@@ -471,21 +552,21 @@ export function Market() {
         }
       });
       setIndices(updated);
-      marketPageCache = {
+      writeMarketPageCache({
         indices: updated,
         lastRefreshed: timeLabel(),
         syncedAt,
-      };
+        savedAt: Date.now(),
+      });
     } finally {
       if (showSpinner) setRefreshing(false);
-      setBootstrapped(true);
     }
   }, []);
 
   const handleRefresh = useCallback(() => {
     if (refreshing || manualRefreshing || globalIsRefreshing) return;
     setManualRefreshing(true);
-    const source = indicesRef.current.length ? indicesRef.current : (marketPageCache?.indices ?? INDICES);
+    const source = indicesRef.current.length ? indicesRef.current : (readMarketPageCache()?.indices ?? INDICES);
     void doRefresh(source, true, Date.now(), true);
   }, [doRefresh, refreshing, manualRefreshing, globalIsRefreshing]);
 
@@ -495,14 +576,26 @@ export function Market() {
     }
   }, [refreshing]);
 
+  useEffect(() => {
+    const cached = readMarketPageCache();
+    if (isFreshMarketPageCache(cached, refreshInterval)) return;
+    if (globalIsRefreshing) return;
+    const source = indicesRef.current.length ? indicesRef.current : (cached?.indices ?? INDICES);
+    void doRefresh(source, false, Date.now(), true);
+  }, [doRefresh, globalIsRefreshing, refreshInterval]);
+
   // Follow the global holdings refresh cycle so settings-based auto refresh
   // also keeps the market page in sync. Uses cache (force=false) to avoid
   // redundant network requests if data was recently fetched.
   useEffect(() => {
     if (!globalLastRefreshAt) return;
+    if (bootstrappedFromFreshCacheRef.current) {
+      bootstrappedFromFreshCacheRef.current = false;
+      return;
+    }
     if (lastSyncedRefreshRef.current === globalLastRefreshAt) return;
     lastSyncedRefreshRef.current = globalLastRefreshAt;
-    const source = indicesRef.current.length ? indicesRef.current : (marketPageCache?.indices ?? INDICES);
+    const source = indicesRef.current.length ? indicesRef.current : (readMarketPageCache()?.indices ?? INDICES);
     void doRefresh(source, false, globalLastRefreshAt, false);
   }, [doRefresh, globalLastRefreshAt]);
 
@@ -542,11 +635,12 @@ export function Market() {
         };
       });
       if (!changed) return current;
-      marketPageCache = {
+      writeMarketPageCache({
         indices: next,
         lastRefreshed: timeLabel(),
-        syncedAt: marketPageCache?.syncedAt ?? lastSyncedRefreshRef.current,
-      };
+        syncedAt: readMarketPageCache()?.syncedAt ?? lastSyncedRefreshRef.current,
+        savedAt: Date.now(),
+      });
       return next;
     });
   }), []);
@@ -681,19 +775,7 @@ export function Market() {
         style={{ scrollbarWidth: "none", overscrollBehaviorY: "contain", WebkitOverflowScrolling: "touch", paddingBottom: 12 }}
       >
       <div className="flex flex-col gap-4 px-3 pt-1">
-        {!bootstrapped && (
-          <div className="flex flex-col gap-1.5">
-            {[0, 1, 2, 3].map((n) => (
-              <div
-                key={n}
-                className="rounded-xl"
-                style={{ height: 72, background: "var(--bg-card)", animation: "pulse 1.5s ease-in-out infinite" }}
-              />
-            ))}
-          </div>
-        )}
         <AnimatePresence mode="wait">
-          {bootstrapped && (
           <motion.div
             key={activeTab}
             initial={{ opacity: 0, y: 8 }}
@@ -740,7 +822,6 @@ export function Market() {
               );
             })}
           </motion.div>
-          )}
         </AnimatePresence>
       </div>
       </div>

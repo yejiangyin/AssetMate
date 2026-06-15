@@ -1,5 +1,11 @@
 import type { Holding } from "../data/mockData";
 import { toYahooSymbol } from "./quoteApi";
+import {
+  readPersistentEntry,
+  shouldFullRefresh,
+  shouldUseFreshCache,
+  writePersistentEntry,
+} from "./persistentDataCache";
 
 export type CorporateActionEvent = {
   id: string;
@@ -18,6 +24,39 @@ export type CorporateActionEvent = {
 const cache = new Map<string, { ts: number; data: CorporateActionEvent[] }>();
 const inflight = new Map<string, Promise<CorporateActionEvent[]>>();
 const CACHE_TTL = 30 * 60 * 1000;
+const PERSISTENT_ACTION_STORAGE_KEY = "asset-helper:corporate-actions-cache:v1";
+const PERSISTENT_ACTION_MAX_ITEMS = 120;
+const PERSISTENT_ACTION_TTL = 24 * 60 * 60 * 1000;
+const ACTION_FULL_REFRESH_TTL = 7 * 24 * 60 * 60 * 1000;
+
+function mergeCorporateActions(base: CorporateActionEvent[], incoming: CorporateActionEvent[]) {
+  const map = new Map<string, CorporateActionEvent>();
+  for (const item of base) map.set(item.id, item);
+  for (const item of incoming) map.set(item.id, item);
+  return [...map.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function readPersistentActions(key: string) {
+  const entry = readPersistentEntry<CorporateActionEvent[]>(PERSISTENT_ACTION_STORAGE_KEY, key);
+  return entry && Array.isArray(entry.data) ? entry : null;
+}
+
+function getFreshPersistentActions(key: string) {
+  const entry = readPersistentActions(key);
+  return shouldUseFreshCache(entry, PERSISTENT_ACTION_TTL) ? entry?.data ?? null : null;
+}
+
+function writePersistentActions(
+  key: string,
+  data: CorporateActionEvent[],
+  options: { fullRefresh: boolean; previousFullRefreshAt?: number },
+) {
+  writePersistentEntry(PERSISTENT_ACTION_STORAGE_KEY, key, data, {
+    maxEntries: PERSISTENT_ACTION_MAX_ITEMS,
+    fullRefresh: options.fullRefresh,
+    previousFullRefreshAt: options.previousFullRefreshAt,
+  });
+}
 
 function ymdFromUnix(seconds: number) {
   return new Date(seconds * 1000).toISOString().slice(0, 10);
@@ -75,10 +114,17 @@ async function fetchEastMoneyFundCorporateActions(symbol: string): Promise<Corpo
   const key = `eastmoney-fund-actions:${code}`;
   const hit = cache.get(key);
   if (hit && Date.now() - hit.ts < CACHE_TTL) return hit.data;
+  const persistentHit = getFreshPersistentActions(key);
+  if (persistentHit) {
+    cache.set(key, { ts: Date.now(), data: persistentHit });
+    return persistentHit;
+  }
   const running = inflight.get(key);
   if (running) return running;
 
   const task = (async () => {
+    const persistent = readPersistentActions(key);
+    const fullRefresh = shouldFullRefresh(persistent, ACTION_FULL_REFRESH_TTL);
     const ctrl = new AbortController();
     const tid = setTimeout(() => ctrl.abort(), 8000);
     try {
@@ -127,11 +173,13 @@ async function fetchEastMoneyFundCorporateActions(symbol: string): Promise<Corpo
         };
       });
       const data = [...dividends, ...splits].filter(Boolean).sort((a, b) => a!.date.localeCompare(b!.date)) as CorporateActionEvent[];
-      cache.set(key, { ts: Date.now(), data });
-      return data;
+      const merged = fullRefresh ? data : mergeCorporateActions(persistent?.data ?? [], data);
+      cache.set(key, { ts: Date.now(), data: merged });
+      writePersistentActions(key, merged, { fullRefresh, previousFullRefreshAt: persistent?.lastFullRefreshAt });
+      return merged;
     } catch {
       clearTimeout(tid);
-      return [];
+      return persistent?.data ?? [];
     } finally {
       inflight.delete(key);
     }
@@ -151,10 +199,17 @@ async function fetchEastMoneyStockCorporateActions(symbol: string): Promise<Corp
   const key = `eastmoney-stock-actions:${code}`;
   const hit = cache.get(key);
   if (hit && Date.now() - hit.ts < CACHE_TTL) return hit.data;
+  const persistentHit = getFreshPersistentActions(key);
+  if (persistentHit) {
+    cache.set(key, { ts: Date.now(), data: persistentHit });
+    return persistentHit;
+  }
   const running = inflight.get(key);
   if (running) return running;
 
   const task = (async () => {
+    const persistent = readPersistentActions(key);
+    const fullRefresh = shouldFullRefresh(persistent, ACTION_FULL_REFRESH_TTL);
     const ctrl = new AbortController();
     const tid = setTimeout(() => ctrl.abort(), 8000);
     try {
@@ -222,11 +277,13 @@ async function fetchEastMoneyStockCorporateActions(symbol: string): Promise<Corp
         }
         return result;
       }).sort((a: CorporateActionEvent, b: CorporateActionEvent) => a.date.localeCompare(b.date));
-      cache.set(key, { ts: Date.now(), data: actions });
-      return actions;
+      const merged = fullRefresh ? actions : mergeCorporateActions(persistent?.data ?? [], actions);
+      cache.set(key, { ts: Date.now(), data: merged });
+      writePersistentActions(key, merged, { fullRefresh, previousFullRefreshAt: persistent?.lastFullRefreshAt });
+      return merged;
     } catch {
       clearTimeout(tid);
-      return [];
+      return persistent?.data ?? [];
     } finally {
       inflight.delete(key);
     }
@@ -240,12 +297,20 @@ async function fetchYahooCorporateActions(yahooSymbol: string, days = 45): Promi
   const key = `yahoo-actions:${yahooSymbol}:${days}`;
   const hit = cache.get(key);
   if (hit && Date.now() - hit.ts < CACHE_TTL) return hit.data;
+  const persistentHit = getFreshPersistentActions(key);
+  if (persistentHit) {
+    cache.set(key, { ts: Date.now(), data: persistentHit });
+    return persistentHit;
+  }
   const running = inflight.get(key);
   if (running) return running;
 
   const task = (async () => {
+    const persistent = readPersistentActions(key);
+    const fullRefresh = shouldFullRefresh(persistent, ACTION_FULL_REFRESH_TTL);
+    const windowDays = fullRefresh ? Math.max(days, 3650) : days;
     const period2 = Math.floor(Date.now() / 1000) + 86400;
-    const period1 = period2 - days * 86400;
+    const period1 = period2 - windowDays * 86400;
     const ctrl = new AbortController();
     const tid = setTimeout(() => ctrl.abort(), 7000);
     try {
@@ -293,11 +358,13 @@ async function fetchYahooCorporateActions(yahooSymbol: string, days = 45): Promi
         }),
       ].filter(Boolean) as CorporateActionEvent[];
       const sorted = data.sort((a, b) => a.date.localeCompare(b.date));
-      cache.set(key, { ts: Date.now(), data: sorted });
-      return sorted;
+      const merged = fullRefresh ? sorted : mergeCorporateActions(persistent?.data ?? [], sorted);
+      cache.set(key, { ts: Date.now(), data: merged });
+      writePersistentActions(key, merged, { fullRefresh, previousFullRefreshAt: persistent?.lastFullRefreshAt });
+      return merged;
     } catch {
       clearTimeout(tid);
-      return [];
+      return persistent?.data ?? [];
     } finally {
       inflight.delete(key);
     }

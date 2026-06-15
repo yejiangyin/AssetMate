@@ -14,7 +14,7 @@ import {
 import { formatFixedNumber } from "../utils/numberFormat";
 import { resolveHoldingTradeStatus, cleanTradeSource, cleanTradeNote } from "../utils/tradeStatus";
 import { getMarketBadge } from "../utils/marketBadge";
-import { computeFundConfirmationDate, fundSettlementDays } from "../utils/dcaEngine";
+import { computeFundConfirmationDate, fundSettlementDays, parseChineseMoneyLimit } from "../utils/dcaEngine";
 import type { Language } from "../context/AppContext";
 import {
   dcaMarketForLabel,
@@ -55,6 +55,18 @@ function planStatusMeta(holding: Holding | undefined, language: Language) {
   return { label: text.executable, color: "#31D08B", source: resolved.source };
 }
 
+function dcaBlockedStatus(holding: Holding | undefined, amountText: string, language: Language) {
+  if (!holding) return null;
+  const resolved = resolveHoldingTradeStatus(holding);
+  if (resolved.status === "normal") return null;
+  if (resolved.status === "fund_limit") {
+    const amount = Number(amountText);
+    const limit = parseChineseMoneyLimit(resolved.note ?? "");
+    if (Number.isFinite(amount) && limit != null && amount <= limit + 1e-8) return null;
+  }
+  return planStatusMeta(holding, language);
+}
+
 function executionStatusMeta(execution: DCAExecution, language: Language) {
   const text = t(language).dca;
   if (execution.status === "executed") {
@@ -64,6 +76,19 @@ function executionStatusMeta(execution: DCAExecution, language: Language) {
     return { label: text.pendingStatus, color: "#4F9CF9", bg: "rgba(79,156,249,0.12)" };
   }
   return { label: text.skippedStatus, color: "#F59E0B", bg: "rgba(245,158,11,0.12)" };
+}
+
+function skippedSummary(reason: string | undefined, language: Language) {
+  const text = t(language).dca;
+  const raw = reason ?? "";
+  const prefix = text.skippedStatus;
+  if (/限购|limited/i.test(raw)) return `${prefix} · ${text.limited}`;
+  if (/暂停申购|不可买|不支持|buy|disabled/i.test(raw)) return `${prefix} · ${text.notBuyable}`;
+  if (/停牌|suspended/i.test(raw)) return `${prefix} · ${text.suspended}`;
+  if (/非交易日|休市|closed|holiday/i.test(raw)) return `${prefix} · ${language === "en" ? "Closed" : "休市"}`;
+  if (/报价|quote|价格|price/i.test(raw)) return `${prefix} · ${language === "en" ? "No quote" : "无报价"}`;
+  if (/净值|NAV|缓存|未获取/i.test(raw)) return `${prefix} · ${language === "en" ? "NAV missing" : "缺净值"}`;
+  return prefix;
 }
 
 /* ─── NextDateBadge ──────────────────────────────────── */
@@ -105,7 +130,7 @@ function PlanCard({
       ? text.latestConfirmed(dateLabel(latestExecution.confirmedDate || latestExecution.actualDate, language))
       : latestExecution.status === "pending"
         ? text.pending(dateLabel(latestExecution.actualDate, language))
-      : text.skipped(translateDcaReason(latestExecution.reason ?? "已跳过", language))
+      : skippedSummary(latestExecution.reason, language)
     : text.noExecutions;
 
   return (
@@ -159,7 +184,11 @@ function PlanCard({
           </div>
           <div>
             <p style={{ color: tc.textMicro, fontSize: 9 }}>{text.status}</p>
-            <p style={{ color: latestExecution?.status === "skipped" ? "#F59E0B" : "#4F9CF9", fontSize: 11, fontWeight: 600 }}>
+            <p
+              className="truncate"
+              title={latestExecution?.reason ? translateDcaReason(latestExecution.reason, language) : undefined}
+              style={{ color: latestExecution?.status === "skipped" ? "#F59E0B" : "#4F9CF9", fontSize: 11, fontWeight: 600, maxWidth: 150 }}
+            >
               {latestText}
             </p>
           </div>
@@ -179,10 +208,12 @@ function PlanCard({
 
 /* ─── SchedulePreview ────────────────────────────────── */
 function SchedulePreview({
-  market, name, frequency, dayOfWeek, dayOfMonth, startDate, tc, language,
+  market, name, frequency, dayOfWeek, dayOfMonth, startDate, blockedStatus, tc, language,
 }: {
   market: MarketType; name?: string; frequency: DCAFrequency;
-  dayOfWeek: number; dayOfMonth: number; startDate: string; tc: any; language: Language;
+  dayOfWeek: number; dayOfMonth: number; startDate: string;
+  blockedStatus?: { label: string; color: string } | null;
+  tc: any; language: Language;
 }) {
   const text = t(language).dca;
   const effectiveMarket = effectiveDcaMarket(market, name);
@@ -205,6 +236,9 @@ function SchedulePreview({
         <span style={{ color: "#4F9CF9", fontSize: 11, fontWeight: 600 }}>{text.futurePreview}</span>
         <span style={{ color: tc.textMicro, fontSize: 9 }}>{text.byTradingDays(dcaMarketForLabel(effectiveMarket, language))}</span>
       </div>
+      <p style={{ color: tc.textMicro, fontSize: 9, marginBottom: 6 }}>
+        {text.previewStatusNote}
+      </p>
       {previewState.error && (
         <p style={{ color: "#F59E0B", fontSize: 10 }}>{previewState.error}</p>
       )}
@@ -212,7 +246,9 @@ function SchedulePreview({
         {preview.map((row) => (
           <div key={row.actual} className="flex items-center justify-between">
             <div className="flex items-center gap-1.5">
-              {row.adjusted
+              {blockedStatus
+                ? <AlertCircle size={10} color={blockedStatus.color} />
+                : row.adjusted
                 ? <AlertCircle size={10} color="#F59E0B" />
                 : <CheckCircle2 size={10} color="#31D08B" />}
               <span style={{ color: tc.textSecondary, fontSize: 11 }}>{row.actual}</span>
@@ -222,12 +258,16 @@ function SchedulePreview({
                 </span>
               )}
             </div>
-            {row.adjusted && (
+            {blockedStatus ? (
+              <span className="rounded px-1 py-0.5" style={{ fontSize: 9, color: blockedStatus.color, background: `${blockedStatus.color}18` }}>
+                {blockedStatus.label}
+              </span>
+            ) : row.adjusted && (
               <span className="rounded px-1 py-0.5" style={{ fontSize: 9, color: "#F59E0B", background: "rgba(245,158,11,0.1)" }}>
                 {text.postponed}
               </span>
             )}
-            {!row.adjusted && (
+            {!blockedStatus && !row.adjusted && (
               <span className="rounded px-1 py-0.5" style={{ fontSize: 9, color: "#31D08B", background: "rgba(49,208,139,0.1)" }}>
                 {text.tradingDay}
               </span>
@@ -250,7 +290,7 @@ function ExecutionHistory({
 }: {
   executions: DCAExecution[];
   holding?: Holding;
-  planForSettlement?: Pick<DCAPlan, "market" | "name" | "assetType">;
+  planForSettlement?: Pick<DCAPlan, "market" | "name" | "assetType" | "fundBuyConfirmDays">;
   planStats?: Pick<DCAPlan, "execCount" | "totalInvested" | "currency">;
   tc: any;
   title: string;
@@ -258,7 +298,17 @@ function ExecutionHistory({
 }) {
   const text = t(language).dca;
   const currentStatus = holding ? resolveHoldingTradeStatus(holding) : null;
-  const settlementPlan = planForSettlement ?? (holding ? { market: holding.market as MarketType, name: holding.name, assetType: holding.assetType } : undefined);
+  const settlementPlan = planForSettlement
+    ? {
+        ...planForSettlement,
+        fundBuyConfirmDays: planForSettlement.fundBuyConfirmDays ?? holding?.fundBuyConfirmDays,
+      }
+    : holding ? {
+      market: holding.market as MarketType,
+      name: holding.name,
+      assetType: holding.assetType,
+      fundBuyConfirmDays: holding.fundBuyConfirmDays,
+    } : undefined;
   const sortedExecutions = useMemo(() => (
     [...executions].sort((a, b) => {
       const bd = b.actualDate ?? b.confirmedDate ?? b.scheduledDate;
@@ -508,6 +558,7 @@ function PlanForm({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const selectedHolding = holdings.find((holding) => holding.id === form.holdingId);
+  const previewBlockedStatus = dcaBlockedStatus(selectedHolding, form.amount, language);
   const relevantExecutions = useMemo(() => {
     if (existingPlanId) {
       return executions.filter((item) => item.planId === existingPlanId);
@@ -677,6 +728,7 @@ function PlanForm({
           dayOfWeek={form.dayOfWeek}
           dayOfMonth={form.dayOfMonth}
           startDate={form.startDate}
+          blockedStatus={previewBlockedStatus}
           tc={tc}
           language={language}
         />
@@ -686,7 +738,12 @@ function PlanForm({
         <ExecutionHistory
           executions={relevantExecutions}
           holding={selectedHolding}
-          planForSettlement={selectedHolding ? { market: selectedHolding.market as MarketType, name: selectedHolding.name, assetType: selectedHolding.assetType } : undefined}
+          planForSettlement={selectedHolding ? {
+            market: selectedHolding.market as MarketType,
+            name: selectedHolding.name,
+            assetType: selectedHolding.assetType,
+            fundBuyConfirmDays: selectedHolding.fundBuyConfirmDays,
+          } : undefined}
           planStats={existingPlanId ? plans.find((plan) => plan.id === existingPlanId) : undefined}
           tc={tc}
           title={text.records}

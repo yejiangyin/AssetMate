@@ -192,6 +192,7 @@ export const appText = {
       status: "入账状态",
       futurePreview: "未来 5 次执行预览",
       byTradingDays: (market: string) => `按${market}交易日`,
+      previewStatusNote: "状态按当前数据提示，实际执行前会重新校验",
       originalNonTrading: (date: string) => `(原定 ${date}，非交易日)`,
       postponed: "顺延",
       tradingDay: "交易日",
@@ -483,6 +484,7 @@ export const appText = {
       status: "Status",
       futurePreview: "Next 5 Executions",
       byTradingDays: (market: string) => `By ${market} trading days`,
+      previewStatusNote: "Status uses current data and is rechecked before execution",
       originalNonTrading: (date: string) => `(Scheduled ${date}, non-trading day)`,
       postponed: "Postponed",
       tradingDay: "Trading day",
@@ -690,9 +692,11 @@ export function translateDcaReason(reason: string | undefined | null, language: 
     .replaceAll("买入份额计算失败", "Buy quantity calculation failed")
     .replaceAll("暂无有效报价", "No valid quote")
     .replaceAll("报价未刷新，跳过自动定投", "Quote is stale, DCA skipped")
+    .replaceAll("补录待确认定投", "Backfilled pending DCA")
     .replaceAll("正式净值", "official NAV")
     .replaceAll("未获取到", "Could not get")
     .replaceAll("已跳过", "skipped")
+    .replaceAll("超出自动净值缓存窗口，暂未匹配", "Outside NAV cache window; not matched yet")
     .replaceAll("超出自动净值缓存窗口，未能匹配", "Outside NAV cache window; could not match")
     .replaceAll("对应", "matching")
     .replaceAll("暂不入账", "not posted yet")

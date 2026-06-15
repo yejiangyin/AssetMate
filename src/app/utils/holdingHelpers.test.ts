@@ -57,6 +57,10 @@ describe("normalizeHolding", () => {
       dividendReinvest: true,
     })).dividendReinvest, null);
   });
+
+  test("preserves T+0 fund confirmation rules", () => {
+    assert.equal(normalizeHolding(holding({ fundBuyConfirmDays: 0 })).fundBuyConfirmDays, 0);
+  });
 });
 
 describe("applyCorporateAction", () => {
