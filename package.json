@@ -2,19 +2,18 @@
   "name": "asset-helper",
   "description": "个人资产与多市场行情查看 Chrome 扩展",
   "private": true,
-  "version": "1.0.4",
+  "version": "1.0.5",
   "license": "MIT",
   "type": "module",
   "scripts": {
     "build": "export PATH=/usr/local/bin:$PATH; node scripts/patch-rollup-native.mjs && tsc --noEmit && vite build",
     "build:extension": "export PATH=/usr/local/bin:$PATH; node scripts/patch-rollup-native.mjs && tsc --noEmit && vite build",
-    "build:store": "pnpm run build:extension && pnpm run obfuscate:dist",
+    "build:store": "export PATH=/usr/local/bin:$PATH; node scripts/patch-rollup-native.mjs && tsc --noEmit && vite build --minify false",
     "dev": "export PATH=/usr/local/bin:$PATH; node scripts/patch-rollup-native.mjs && vite",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
     "test": "tsx --test \"src/**/*.test.ts\"",
-    "postinstall": "node scripts/patch-rollup-native.mjs",
-    "obfuscate:dist": "node scripts/obfuscate-dist.mjs"
+    "postinstall": "node scripts/patch-rollup-native.mjs"
   },
   "dependencies": {
     "lucide-react": "0.487.0",
@@ -35,7 +34,6 @@
     "@vitejs/plugin-react": "4.7.0",
     "eslint": "^9.0.0",
     "eslint-plugin-react-hooks": "^5.0.0",
-    "javascript-obfuscator": "^5.4.3",
     "tailwindcss": "4.1.12",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",

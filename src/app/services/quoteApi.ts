@@ -12,6 +12,13 @@ import { fetchTencentIntraday, fetchTencentKline, fetchTencentQuote, fetchTencen
 import { fetchBinanceCryptoKline, fetchBinanceCryptoQuote, fetchOkxCryptoKline, fetchOkxCryptoQuote, type PublicQuote } from "./publicMarketApi";
 import { fetchRobinhoodExtendedQuote } from "./robinhoodApi";
 import { formatExactMoney, formatExactNumber } from "../utils/numberFormat";
+import {
+  mergePointSeries,
+  readPersistentEntry,
+  shouldFullRefresh,
+  shouldUseFreshCache,
+  writePersistentEntry,
+} from "./persistentDataCache";
 
 /* ═══════════════════════════════════════════════════════
    Types
@@ -57,6 +64,20 @@ function yahooQuerySpec(range: TimeRange) {
     case "max":
     default:
       return { rangeParam: "max", interval: "1mo" };
+  }
+}
+
+function yahooIncrementalWindowDays(range: TimeRange) {
+  switch (range) {
+    case "1d":
+      return 45;
+    case "5d":
+      return 140;
+    case "1mo":
+    case "max":
+      return 540;
+    default:
+      return 0;
   }
 }
 
@@ -292,7 +313,14 @@ function sampleFundPoints(points: ChartPoint[], maxPoints: number): ChartPoint[]
 
 async function fetchFundHistory(code: string, range: TimeRange, signal: AbortSignal): Promise<FundHistoryItem[]> {
   if (signal.aborted) throw new Error("fund history aborted");
-  const rows = await fetchCnFundOfficialHistory(code, fundHistoryPageSize(range));
+  const requiredSize = fundHistoryPageSize(range);
+  const cacheKey = `fund-history::${code}`;
+  const cached = readPersistentEntry<FundHistoryItem[]>(PERSISTENT_FUND_HISTORY_STORAGE_KEY, cacheKey);
+  const cachedPoints = Array.isArray(cached?.data) ? cached.data : [];
+  const hasEnoughCachedHistory = cachedPoints.length >= Math.min(requiredSize, 5000);
+  const needsFullRefresh = shouldFullRefresh(cached, WEEKLY_FULL_REFRESH_TTL) || !hasEnoughCachedHistory;
+  const pageSize = needsFullRefresh ? requiredSize : Math.min(INCREMENTAL_FUND_HISTORY_SIZE, Math.max(requiredSize, 2));
+  const rows = await fetchCnFundOfficialHistory(code, pageSize);
   const points = rows
     .map((row) => ({
       date: row.date,
@@ -300,8 +328,18 @@ async function fetchFundHistory(code: string, range: TimeRange, signal: AbortSig
       changePercent: row.changePercent,
     }))
     .reverse();
+  if (!points.length && cachedPoints.length) return cachedPoints.slice(-requiredSize);
   if (!points.length) throw new Error("empty fund history");
-  return points;
+
+  const merged = needsFullRefresh
+    ? points
+    : mergePointSeries(cachedPoints, points, 5000);
+  writePersistentEntry(PERSISTENT_FUND_HISTORY_STORAGE_KEY, cacheKey, merged, {
+    maxEntries: PERSISTENT_FUND_HISTORY_MAX_ITEMS,
+    fullRefresh: needsFullRefresh,
+    previousFullRefreshAt: cached?.lastFullRefreshAt,
+  });
+  return merged.slice(-requiredSize);
 }
 
 function hasRealChartPoints(points: ChartPoint[]) {
@@ -639,6 +677,14 @@ async function fetchEastMoneyGlobalFallback(symbol: string, market: string, rang
 ══════════════════════════════════════════════════════════ */
 const CACHE_TTL = 2 * 60 * 1000;
 const CACHE_MAX_ITEMS = 80;
+const PERSISTENT_CHART_STORAGE_KEY = "asset-helper:chart-cache:v1";
+const PERSISTENT_FUND_HISTORY_STORAGE_KEY = "asset-helper:fund-history-cache:v1";
+const PERSISTENT_CHART_MAX_ITEMS = 36;
+const PERSISTENT_FUND_HISTORY_MAX_ITEMS = 60;
+const PERSISTENT_CHART_TTL = 6 * 60 * 60 * 1000;
+const DAILY_FULL_REFRESH_TTL = 24 * 60 * 60 * 1000;
+const WEEKLY_FULL_REFRESH_TTL = 7 * 24 * 60 * 60 * 1000;
+const INCREMENTAL_FUND_HISTORY_SIZE = 90;
 const chartCache = new Map<string, { data: ChartData; ts: number }>();
 const inflightChartRequests = new Map<string, Promise<ChartData>>();
 const inflightDetailRequests = new Map<string, Promise<ChartData>>();
@@ -661,6 +707,22 @@ function detailCacheKey(symbol: string, market: string, range: TimeRange) {
   return `detail-chart::${market}::${symbol}::${range}`;
 }
 
+function getPersistentChart(key: string, ttlMs = PERSISTENT_CHART_TTL): ChartData | null {
+  const entry = readPersistentEntry<ChartData>(PERSISTENT_CHART_STORAGE_KEY, key);
+  if (!shouldUseFreshCache(entry, ttlMs)) return null;
+  return entry?.data && hasRealChartPoints(entry.data.points) ? entry.data : null;
+}
+
+function setPersistentChart(key: string, data: ChartData, fullRefresh: boolean) {
+  if (!hasRealChartPoints(data.points)) return;
+  const previous = readPersistentEntry<ChartData>(PERSISTENT_CHART_STORAGE_KEY, key);
+  writePersistentEntry(PERSISTENT_CHART_STORAGE_KEY, key, data, {
+    maxEntries: PERSISTENT_CHART_MAX_ITEMS,
+    fullRefresh,
+    previousFullRefreshAt: previous?.lastFullRefreshAt,
+  });
+}
+
 function reuseInflight(
   store: Map<string, Promise<ChartData>>,
   key: string,
@@ -680,9 +742,16 @@ async function fetchFundChart(code: string, range: TimeRange, force = false): Pr
   if (!force) {
     const hit = getCached(key);
     if (hit) return hit;
+    const persisted = getPersistentChart(key);
+    if (persisted) {
+      setCached(key, persisted);
+      return persisted;
+    }
     return reuseInflight(inflightChartRequests, key, async () => fetchFundChart(code, range, true));
   }
 
+  const persistedEntry = readPersistentEntry<ChartData>(PERSISTENT_CHART_STORAGE_KEY, key);
+  const fullRefresh = shouldFullRefresh(persistedEntry, DAILY_FULL_REFRESH_TTL);
   const ctrl = new AbortController();
   const timeoutMs = (range === "max" || range === "fmax" || range === "f10y" || range === "f5y") ? 20000 : 10000;
   const tid = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -732,11 +801,20 @@ async function fetchFundChart(code: string, range: TimeRange, force = false): Pr
     };
 
     setCached(key, data);
+    setPersistentChart(key, data, fullRefresh);
     return data;
   } catch {
     clearTimeout(tid);
     const fallbackQuote = await fetchFundLatestQuote(code);
-    if (fallbackQuote) return chartDataFromQuote(fallbackQuote);
+    if (fallbackQuote) {
+      if (persistedEntry?.data && hasRealChartPoints(persistedEntry.data.points)) {
+        const data = mergeQuoteIntoChart(persistedEntry.data, fallbackQuote);
+        setCached(key, data);
+        return data;
+      }
+      return chartDataFromQuote(fallbackQuote);
+    }
+    if (persistedEntry?.data && hasRealChartPoints(persistedEntry.data.points)) return persistedEntry.data;
     throw new Error(`fund chart unavailable for ${code}`);
   }
 }
@@ -749,9 +827,19 @@ export async function fetchChart(yahooSymbol: string, range: TimeRange, force = 
   if (!force) {
     const hit = getCached(key);
     if (hit) return hit;
+    const persisted = getPersistentChart(`yahoo::${key}`);
+    if (persisted) {
+      setCached(key, persisted);
+      return persisted;
+    }
     return reuseInflight(inflightChartRequests, key, async () => fetchChart(yahooSymbol, range, true, includePrePost));
   }
   const { rangeParam, interval } = yahooQuerySpec(range);
+  const persistentKey = `yahoo::${key}`;
+  const persistedEntry = readPersistentEntry<ChartData>(PERSISTENT_CHART_STORAGE_KEY, persistentKey);
+  const canIncremental = !includePrePost && yahooIncrementalWindowDays(range) > 0 && persistedEntry?.data && hasRealChartPoints(persistedEntry.data.points);
+  const fullRefresh = shouldFullRefresh(persistedEntry, DAILY_FULL_REFRESH_TTL) || !canIncremental;
+  const windowDays = fullRefresh ? 0 : yahooIncrementalWindowDays(range);
   const hosts = ["query1.finance.yahoo.com"];
   let lastError: unknown = null;
 
@@ -759,7 +847,19 @@ export async function fetchChart(yahooSymbol: string, range: TimeRange, force = 
     const ctrl = new AbortController();
     const tid = setTimeout(() => ctrl.abort(), 7000);
     try {
-      const url = `https://${host}/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=${interval}&range=${rangeParam}&includePrePost=${includePrePost}`;
+      const params = new URLSearchParams({
+        interval,
+        includePrePost: String(includePrePost),
+      });
+      if (windowDays > 0) {
+        const period2 = Math.floor(Date.now() / 1000) + 86400;
+        const period1 = period2 - windowDays * 86400;
+        params.set("period1", String(period1));
+        params.set("period2", String(period2));
+      } else {
+        params.set("range", rangeParam);
+      }
+      const url = `https://${host}/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?${params.toString()}`;
       const res = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
       clearTimeout(tid);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -872,8 +972,14 @@ export async function fetchChart(yahooSymbol: string, range: TimeRange, force = 
           : undefined,
       };
 
-      const data: ChartData = { quote, points };
+      const data: ChartData = fullRefresh || !persistedEntry?.data
+        ? { quote, points }
+        : {
+          quote,
+          points: mergePointSeries(persistedEntry.data.points, points, 6000),
+        };
       setCached(key, data);
+      setPersistentChart(persistentKey, data, fullRefresh);
       return data;
     } catch (error) {
       clearTimeout(tid);
@@ -883,6 +989,7 @@ export async function fetchChart(yahooSymbol: string, range: TimeRange, force = 
 
   const tencentFallback = quoteFromTencent(yahooSymbol, await fetchTencentQuoteFromYahooSymbol(yahooSymbol));
   if (tencentFallback) return tencentFallback;
+  if (persistedEntry?.data && hasRealChartPoints(persistedEntry.data.points)) return persistedEntry.data;
   throw lastError instanceof Error ? lastError : new Error(`chart unavailable for ${yahooSymbol}`);
 }
 
@@ -960,13 +1067,21 @@ export async function fetchRecentDailyChart(symbol: string, market: string, days
   if (!force) {
     const hit = getCached(key);
     if (hit && hasRealChartPoints(hit.points)) return hit;
+    const persisted = getPersistentChart(key);
+    if (persisted) {
+      setCached(key, persisted);
+      return persisted;
+    }
     return reuseInflight(inflightDetailRequests, key, async () => fetchRecentDailyChart(symbol, market, days, true));
   }
+  const persistedEntry = readPersistentEntry<ChartData>(PERSISTENT_CHART_STORAGE_KEY, key);
+  const fullRefresh = shouldFullRefresh(persistedEntry, DAILY_FULL_REFRESH_TTL);
 
   if (market === "FUND") {
     const fundData = await fetchFundChart(symbol, "1mo", force);
     const data = { ...fundData, points: fundData.points.slice(-days) };
     setCached(key, data);
+    setPersistentChart(key, data, fullRefresh);
     return data;
   }
 
@@ -993,9 +1108,13 @@ export async function fetchRecentDailyChart(symbol: string, market: string, days
         ? okxPoints
         : null;
     if (publicPoints?.length) {
-      const data = chartDataFromPoints(normalizedSymbol, preferredQuote?.name ?? normalizedSymbol, publicPoints, preferredQuote);
+      const mergedPoints = fullRefresh || !persistedEntry?.data
+        ? publicPoints
+        : mergePointSeries(persistedEntry.data.points, publicPoints, Math.max(days + 30, 120));
+      const data = chartDataFromPoints(normalizedSymbol, preferredQuote?.name ?? normalizedSymbol, mergedPoints.slice(-days), preferredQuote);
       if (data) {
         setCached(key, data);
+        setPersistentChart(key, data, fullRefresh);
         return data;
       }
     }
@@ -1004,23 +1123,43 @@ export async function fetchRecentDailyChart(symbol: string, market: string, days
   const yahooSymbol = detailYahooSymbol(symbol, market);
   try {
     const data = await fetchYahooRecentDailyChart(yahooSymbol, days, force);
-    setCached(key, data);
-    return data;
+    const mergedData = fullRefresh || !persistedEntry?.data
+      ? data
+      : { ...data, points: mergePointSeries(persistedEntry.data.points, data.points, Math.max(days + 30, 120)).slice(-days) };
+    setCached(key, mergedData);
+    setPersistentChart(key, mergedData, fullRefresh);
+    return mergedData;
   } catch {
-    const fallback = await fetchDetailChart(symbol, market, "1d", force);
-    const data = { ...fallback, points: fallback.points.slice(-days) };
-    setCached(key, data);
-    return data;
+    const fallback = await fetchDetailChart(symbol, market, "1d", force).catch(() => null);
+    if (fallback) {
+      const data = { ...fallback, points: fallback.points.slice(-days) };
+      setCached(key, data);
+      setPersistentChart(key, data, fullRefresh);
+      return data;
+    }
+    if (persistedEntry?.data && hasRealChartPoints(persistedEntry.data.points)) return persistedEntry.data;
+    throw new Error(`recent daily unavailable for ${market}:${symbol}`);
   }
 }
-
 export async function fetchDetailChart(symbol: string, market: string, range: TimeRange, force = false): Promise<ChartData> {
   const detailKey = `detail::${market}::${symbol}::${range}`;
   const detailChartKey = detailCacheKey(symbol, market, range);
+  const persistedDetail = readPersistentEntry<ChartData>(PERSISTENT_CHART_STORAGE_KEY, detailChartKey);
+  const detailFullRefresh = shouldFullRefresh(persistedDetail, DAILY_FULL_REFRESH_TTL);
+  const storeDetailChart = (data: ChartData, fullRefresh = detailFullRefresh) => {
+    setCached(detailChartKey, data);
+    setPersistentChart(detailChartKey, data, fullRefresh);
+    return data;
+  };
   if (!force) {
     const hit = getCached(detailChartKey);
     // Detail charts should not be blocked by a stale quote-only cache entry.
     if (hit && hasRealChartPoints(hit.points)) return hit;
+    const persisted = getPersistentChart(detailChartKey);
+    if (persisted) {
+      setCached(detailChartKey, persisted);
+      return persisted;
+    }
     return reuseInflight(inflightDetailRequests, detailKey, async () => fetchDetailChart(symbol, market, range, true));
   }
   const normalizedRange = toSourceRange(range);
@@ -1059,8 +1198,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
       if (tencentPoints?.some((point) => point.price > 0)) {
         const data = chartDataFromPoints(rawSymbol, emQuote?.name ?? rawSymbol, tencentPoints, liveQuote);
         if (data) {
-          setCached(detailChartKey, data);
-          return data;
+          return storeDetailChart(data);
         }
       }
 
@@ -1071,19 +1209,16 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
       ]);
 
       if (isHkIndex && eastMoneyResult && hasRealChartPoints(eastMoneyResult.points)) {
-        setCached(detailChartKey, eastMoneyResult);
-        return eastMoneyResult;
+        return storeDetailChart(eastMoneyResult);
       }
 
       if (yahooData && hasRealChartPoints(yahooData.points)) {
         const data = liveQuote ? mergeQuoteIntoChart(yahooData, liveQuote) : yahooData;
-        setCached(detailChartKey, data);
-        return data;
+        return storeDetailChart(data);
       }
 
       if (eastMoneyResult && hasRealChartPoints(eastMoneyResult.points)) {
-        setCached(detailChartKey, eastMoneyResult);
-        return eastMoneyResult;
+        return storeDetailChart(eastMoneyResult);
       }
     }
 
@@ -1108,14 +1243,12 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
         : null;
       if (yahooData && hasRealChartPoints(yahooData.points)) {
         const data = liveQuote ? mergeQuoteIntoChart(yahooData, liveQuote) : yahooData;
-        setCached(detailChartKey, data);
-        return data;
+        return storeDetailChart(data);
       }
       if (tencentPoints?.some((point) => point.price > 0)) {
         const data = chartDataFromPoints(rawSymbol, emQuote?.name ?? rawSymbol, tencentPoints, liveQuote);
         if (data) {
-          setCached(detailChartKey, data);
-          return data;
+          return storeDetailChart(data);
         }
       }
       // Both real HK chart sources failed; fall through to quote-only fallback.
@@ -1141,8 +1274,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
         },
         points: result.points,
       };
-      setCached(detailChartKey, data);
-      return data;
+      return storeDetailChart(data);
     } catch {
       const eastMoneyQuote = await fetchEastMoneyQuoteBySymbol(rawSymbol, market).catch(() => null);
       const tencent = await fetchTencentQuote(rawSymbol, market).catch(() => null);
@@ -1211,8 +1343,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
         });
         if (cachedDetail && hasRealChartPoints(cachedDetail.points)) {
           const merged = mergeQuoteIntoChart(cachedDetail, quoteOnly.quote);
-          setCached(detailChartKey, merged);
-          return merged;
+          return storeDetailChart(merged, false);
         }
         return quoteOnly;
       }
@@ -1235,14 +1366,13 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
         });
         if (cachedDetail && hasRealChartPoints(cachedDetail.points)) {
           const merged = mergeQuoteIntoChart(cachedDetail, quoteOnly.quote);
-          setCached(detailChartKey, merged);
-          return merged;
+          return storeDetailChart(merged, false);
         }
         return quoteOnly;
       }
 
       if (yahooData) {
-        if (hasRealChartPoints(yahooData.points)) setCached(detailChartKey, yahooData);
+        if (hasRealChartPoints(yahooData.points)) return storeDetailChart(yahooData);
         return yahooData;
       }
       if (cachedDetail && hasRealChartPoints(cachedDetail.points)) return cachedDetail;
@@ -1290,8 +1420,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     if (binancePoints?.some((point) => point.price > 0)) {
       const data = chartDataFromPoints(normalizedSymbol, preferredQuote?.name ?? normalizedSymbol, binancePoints, preferredQuote);
       if (data) {
-        setCached(detailChartKey, data);
-        return data;
+        return storeDetailChart(data);
       }
     }
 
@@ -1299,8 +1428,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     if (okxPoints?.some((point) => point.price > 0)) {
       const data = chartDataFromPoints(normalizedSymbol, preferredQuote?.name ?? normalizedSymbol, okxPoints, preferredQuote);
       if (data) {
-        setCached(detailChartKey, data);
-        return data;
+        return storeDetailChart(data);
       }
     }
 
@@ -1309,8 +1437,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
       const data = preferredQuote
         ? mergeQuoteIntoChart(yahooData, preferredQuote)
         : yahooData;
-      setCached(detailChartKey, data);
-      return data;
+      return storeDetailChart(data);
     }
 
     if (preferredQuote) return chartDataFromQuote(preferredQuote);
@@ -1326,11 +1453,11 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     const yahooOk = yahooData && (hasRealChartPoints(yahooData.points) || yahooData.quote.price > 0);
     const eastMoneyOk = eastMoneyData && (eastMoneyData.quote.price > 0 || hasRealChartPoints(eastMoneyData.points));
     if (market === "FX" || market === "COMMODITY") {
-      if (yahooOk) { setCached(detailChartKey, yahooData!); return yahooData!; }
+      if (yahooOk) return storeDetailChart(yahooData!);
       if (eastMoneyOk) return eastMoneyData!;
     } else {
       if (eastMoneyOk) return eastMoneyData!;
-      if (yahooOk) { setCached(detailChartKey, yahooData!); return yahooData!; }
+      if (yahooOk) return storeDetailChart(yahooData!);
     }
   }
 
@@ -1356,15 +1483,14 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
       const data = market === "US"
         ? normalizeUsExtendedChartData({ quote, points: nasdaqData.points })
         : { quote, points: nasdaqData.points };
-      setCached(detailChartKey, data);
-      return data;
+      return storeDetailChart(data);
     }
     if (yahooData && (hasRealChartPoints(yahooData.points) || yahooData.quote.price > 0)) {
       const data = extendedQuote
         ? { ...yahooData, quote: { ...yahooData.quote, ...extendedQuote } }
         : yahooData;
       const normalizedData = market === "US" ? normalizeUsExtendedChartData(data) : data;
-      if (hasRealChartPoints(normalizedData.points)) setCached(detailChartKey, normalizedData);
+      if (hasRealChartPoints(normalizedData.points)) return storeDetailChart(normalizedData);
       return normalizedData;
     }
   }
@@ -1389,7 +1515,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
       ? { ...yahooData, quote: { ...yahooData.quote, ...extendedQuote } }
       : yahooData;
     const normalizedData = market === "US" ? normalizeUsExtendedChartData(data) : data;
-    if (hasRealChartPoints(normalizedData.points)) setCached(detailChartKey, normalizedData);
+    if (hasRealChartPoints(normalizedData.points)) return storeDetailChart(normalizedData);
     return normalizedData;
   }
 
@@ -1400,7 +1526,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
         ? { ...nasdaqData, quote: { ...nasdaqData.quote, ...extendedQuote } }
         : nasdaqData;
       const normalizedData = market === "US" ? normalizeUsExtendedChartData(data) : data;
-      if (hasRealChartPoints(normalizedData.points)) setCached(detailChartKey, normalizedData);
+      if (hasRealChartPoints(normalizedData.points)) return storeDetailChart(normalizedData);
       return normalizedData;
     }
   }
@@ -1411,7 +1537,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
       ? await fetchEastMoneyGlobalFallback(aShareRaw, "A", range)
       : null;
     if (aShareIndexFallback && (hasRealChartPoints(aShareIndexFallback.points) || aShareIndexFallback.quote.price > 0)) {
-      if (hasRealChartPoints(aShareIndexFallback.points)) setCached(detailChartKey, aShareIndexFallback);
+      if (hasRealChartPoints(aShareIndexFallback.points)) return storeDetailChart(aShareIndexFallback);
       return aShareIndexFallback;
     }
   }
@@ -1419,7 +1545,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
   if (market === "JP") {
     const eastMoneyData = await fetchEastMoneyGlobalFallback(symbol, market, range);
     if (eastMoneyData && (eastMoneyData.quote.price > 0 || hasRealChartPoints(eastMoneyData.points))) {
-      if (hasRealChartPoints(eastMoneyData.points)) setCached(detailChartKey, eastMoneyData);
+      if (hasRealChartPoints(eastMoneyData.points)) return storeDetailChart(eastMoneyData);
       return eastMoneyData;
     }
   }

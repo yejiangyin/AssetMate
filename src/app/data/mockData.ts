@@ -47,6 +47,7 @@ export type Holding = {
   autoTradeStatus?: "normal" | "suspended" | "fund_limit" | "buy_disabled" | null;
   autoTradeStatusNote?: string;
   autoTradeStatusSource?: string | null;
+  fundBuyConfirmDays?: number;
   priceDate?:    string;
   fundNavHistory?:        Array<{ date: string; nav: number }>;
   estimatedNav?:           number;

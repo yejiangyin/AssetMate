@@ -1348,13 +1348,13 @@ export function StockDetail() {
 
   const load = useCallback(async (
     r: TimeRange,
-    options: { force?: boolean; reset?: boolean } = {},
+    options: { force?: boolean; reset?: boolean; keepCurrent?: boolean } = {},
   ) => {
     if (!detailTarget) return;
-    const { force = false, reset = false } = options;
+    const { force = false, reset = false, keepCurrent = false } = options;
     const requestSeq = ++requestSeqRef.current;
-    const existingData = reset ? null : dataRef.current;
-    const existingDataRange = reset ? null : dataRangeRef.current;
+    const existingData = reset && !keepCurrent ? null : dataRef.current;
+    const existingDataRange = reset && !keepCurrent ? null : dataRangeRef.current;
     const hasExistingData = Boolean(existingData);
     if (reset || !hasExistingData) setLoading(true);
     else setRefreshing(true);
@@ -1499,16 +1499,22 @@ export function StockDetail() {
     if (initializedTargetKeyRef.current === detailTargetKey) return;
     initializedTargetKeyRef.current = detailTargetKey;
     const defaultRange: TimeRange = detailTarget.market === "FUND" ? "f1y" : "fs";
+    const fallback = fallbackQuoteData(detailTarget, language);
     setRange(defaultRange);
     setChartWindow(null);
     windowContextRef.current = "";
-    setData(null);
-    setDataRange(null);
+    if (fallback) {
+      setData(fallback);
+      setDataRange(defaultRange);
+    } else {
+      setData(null);
+      setDataRange(null);
+    }
     setActiveChartPoint(undefined);
     setRefreshing(false);
-    setLoading(true);
+    setLoading(!fallback);
     lastSyncedRefreshRef.current = lastRefreshAt;
-    void load(defaultRange, { reset: true });
+    void load(defaultRange, { reset: true, keepCurrent: Boolean(fallback) });
     if (detailTarget.market === "FUND") return;
     const symbol = detailTarget.yahooSymbol;
     const market = detailTarget.market;
@@ -1516,7 +1522,7 @@ export function StockDetail() {
       void fetchDetailChart(symbol, market, "1d").catch(() => null);
     }, 250);
     return () => window.clearTimeout(tid);
-  }, [detailTarget, detailTargetKey, lastRefreshAt, load]);
+  }, [detailTarget, detailTargetKey, language, lastRefreshAt, load]);
 
   useEffect(() => {
     if (!detailTarget || range === "fs") {
@@ -1545,7 +1551,7 @@ export function StockDetail() {
     if (!detailTarget || !lastRefreshAt) return;
     if (lastSyncedRefreshRef.current === lastRefreshAt) return;
     lastSyncedRefreshRef.current = lastRefreshAt;
-    void load(range, { force: true });
+    void load(range);
   }, [lastRefreshAt, detailTarget, range, load]);
 
   useEffect(() => subscribeQuoteSync((payload) => {
