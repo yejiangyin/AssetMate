@@ -315,6 +315,15 @@ const STORAGE_KEY = "asset-helper:v2";
 const STORAGE_VERSION = 2;
 const MAX_DCA_EXECUTIONS = 300;
 const MAX_DCA_EXECUTIONS_PER_PLAN = 24;
+const NON_CRITICAL_STORAGE_KEYS = [
+  "asset-helper:chart-cache:v1",
+  "asset-helper:fund-history-cache:v1",
+  "asset-helper:corporate-actions-cache:v1",
+  "asset-helper:market-page-cache:v1",
+  "asset-helper:trading-calendar:v1",
+  "asset-helper:fx-rates",
+  "dashboard.assetSeries.v4",
+];
 
 type PersistedState = Partial<Pick<
   AppState,
@@ -553,6 +562,65 @@ function defaultState(): AppState {
   };
 }
 
+function buildPersistedState(state: AppState): PersistedState {
+  return {
+    version: STORAGE_VERSION,
+    groups: state.groups,
+    holdings: state.holdings,
+    defaultPrivacyMode: state.defaultPrivacyMode,
+    colorScheme: state.colorScheme,
+    theme: state.theme,
+    currency: state.currency,
+    language: state.language,
+    refreshInterval: state.refreshInterval,
+    tradeTimeOnly: state.tradeTimeOnly,
+    dividendReinvest: state.dividendReinvest,
+    dcaPlans: state.dcaPlans,
+    dcaExecutions: pruneDCAExecutions(state.dcaExecutions),
+    assetSnapshots: state.assetSnapshots,
+  };
+}
+
+function clearNonCriticalStorage() {
+  if (typeof window === "undefined") return;
+  for (const key of NON_CRITICAL_STORAGE_KEYS) {
+    try {
+      window.localStorage.removeItem(key);
+    } catch {
+      // Best effort only; these caches can be rebuilt.
+    }
+  }
+}
+
+function savePersistedState(snapshot: PersistedState, options: { clearCachesOnFailure?: boolean } = {}) {
+  if (typeof window === "undefined") return { ok: true };
+  const raw = JSON.stringify(snapshot);
+  const write = () => {
+    window.localStorage.setItem(STORAGE_KEY, raw);
+    return window.localStorage.getItem(STORAGE_KEY) === raw;
+  };
+
+  try {
+    if (write()) return { ok: true };
+  } catch {
+    // Retry after clearing rebuildable caches below.
+  }
+
+  if (options.clearCachesOnFailure) {
+    clearNonCriticalStorage();
+    try {
+      if (write()) return { ok: true };
+    } catch {
+      // Fall through to the user-facing error below.
+    }
+  }
+
+  return {
+    ok: false,
+    error: "导入失败：浏览器扩展存储空间不足，已尝试清理行情缓存，请重新导入或先清空本地数据。",
+  };
+}
+
 export function loadInitialState(): AppState {
   const base = defaultState();
   if (typeof window === "undefined") return base;
@@ -628,6 +696,36 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   /* theme colors — recomputed when theme changes */
   const tc = useMemo(() => buildThemeColors(state.theme), [state.theme]);
   const stats = useMemo(() => computeStats(state.holdings), [state.holdings]);
+  const persistedSnapshot = useMemo<PersistedState>(() => ({
+    version: STORAGE_VERSION,
+    groups: state.groups,
+    holdings: state.holdings,
+    defaultPrivacyMode: state.defaultPrivacyMode,
+    colorScheme: state.colorScheme,
+    theme: state.theme,
+    currency: state.currency,
+    language: state.language,
+    refreshInterval: state.refreshInterval,
+    tradeTimeOnly: state.tradeTimeOnly,
+    dividendReinvest: state.dividendReinvest,
+    dcaPlans: state.dcaPlans,
+    dcaExecutions: pruneDCAExecutions(state.dcaExecutions),
+    assetSnapshots: state.assetSnapshots,
+  }), [
+    state.groups,
+    state.holdings,
+    state.defaultPrivacyMode,
+    state.colorScheme,
+    state.theme,
+    state.currency,
+    state.language,
+    state.refreshInterval,
+    state.tradeTimeOnly,
+    state.dividendReinvest,
+    state.dcaPlans,
+    state.dcaExecutions,
+    state.assetSnapshots,
+  ]);
 
   const applyDCAState = useCallback((
     holdings: Holding[],
@@ -777,42 +875,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const snapshot: PersistedState = {
-      version: STORAGE_VERSION,
-      groups: state.groups,
-      holdings: state.holdings,
-      defaultPrivacyMode: state.defaultPrivacyMode,
-      colorScheme: state.colorScheme,
-      theme: state.theme,
-      currency: state.currency,
-      language: state.language,
-      refreshInterval: state.refreshInterval,
-      tradeTimeOnly: state.tradeTimeOnly,
-      dividendReinvest: state.dividendReinvest,
-      dcaPlans: state.dcaPlans,
-      dcaExecutions: pruneDCAExecutions(state.dcaExecutions),
-      assetSnapshots: state.assetSnapshots,
-    };
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
-    } catch {
-      // QuotaExceededError — silently ignore
-    }
-  }, [
-    state.groups,
-    state.holdings,
-    state.defaultPrivacyMode,
-    state.colorScheme,
-    state.theme,
-    state.currency,
-    state.language,
-    state.refreshInterval,
-    state.tradeTimeOnly,
-    state.dividendReinvest,
-    state.dcaPlans,
-    state.dcaExecutions,
-    state.assetSnapshots,
-  ]);
+    savePersistedState(persistedSnapshot);
+  }, [persistedSnapshot]);
 
   useEffect(() => {
     if (!state.refreshInterval) return;
@@ -874,34 +938,36 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       }
       const holdings = data.holdings.map(normalizeHolding);
       const settings = data.settings ?? {};
-      setState((s) => {
-        const dcaExecutions = Array.isArray(data.dcaExecutions) ? pruneDCAExecutions(data.dcaExecutions) : s.dcaExecutions;
-        const dcaPlans = Array.isArray(data.dcaPlans) ? hydratePlans(data.dcaPlans, dcaExecutions) : s.dcaPlans;
-        const dcaState = applyDCAState(holdings, dcaPlans, dcaExecutions);
-        return {
-          ...s,
-          groups: Array.isArray(data.groups) ? data.groups : s.groups,
-          holdings: dcaState.holdings,
-          dcaPlans: dcaState.dcaPlans,
-          dcaExecutions: dcaState.dcaExecutions,
-          assetSnapshots: Array.isArray(data.assetSnapshots)
-            ? upsertPortfolioSnapshot(data.assetSnapshots, dcaState.holdings)
-            : upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings),
-          defaultPrivacyMode: typeof settings.defaultPrivacyMode === "boolean"
-            ? settings.defaultPrivacyMode
-            : typeof settings.privacyMode === "boolean"
-              ? settings.privacyMode
-              : s.defaultPrivacyMode,
-          privacyMode: s.privacyMode,
-          colorScheme: enumOr(settings.colorScheme, COLOR_SCHEMES, s.colorScheme),
-          theme: enumOr(settings.theme, THEMES, s.theme),
-          currency: enumOr(settings.currency, CURRENCIES, s.currency),
-          language: enumOr(settings.language, LANGUAGES, s.language),
-          refreshInterval: enumOr(settings.refreshInterval, REFRESH_INTERVALS, s.refreshInterval),
-          tradeTimeOnly: typeof settings.tradeTimeOnly === "boolean" ? settings.tradeTimeOnly : s.tradeTimeOnly,
-          dividendReinvest: typeof settings.dividendReinvest === "boolean" ? settings.dividendReinvest : s.dividendReinvest,
-        };
-      });
+      const current = stateRef.current;
+      const dcaExecutions = Array.isArray(data.dcaExecutions) ? pruneDCAExecutions(data.dcaExecutions) : current.dcaExecutions;
+      const dcaPlans = Array.isArray(data.dcaPlans) ? hydratePlans(data.dcaPlans, dcaExecutions) : current.dcaPlans;
+      const dcaState = applyDCAState(holdings, dcaPlans, dcaExecutions);
+      const nextState: AppState = {
+        ...current,
+        groups: Array.isArray(data.groups) ? data.groups : current.groups,
+        holdings: dcaState.holdings,
+        dcaPlans: dcaState.dcaPlans,
+        dcaExecutions: dcaState.dcaExecutions,
+        assetSnapshots: Array.isArray(data.assetSnapshots)
+          ? upsertPortfolioSnapshot(data.assetSnapshots, dcaState.holdings)
+          : upsertPortfolioSnapshot(current.assetSnapshots, dcaState.holdings),
+        defaultPrivacyMode: typeof settings.defaultPrivacyMode === "boolean"
+          ? settings.defaultPrivacyMode
+          : typeof settings.privacyMode === "boolean"
+            ? settings.privacyMode
+            : current.defaultPrivacyMode,
+        privacyMode: current.privacyMode,
+        colorScheme: enumOr(settings.colorScheme, COLOR_SCHEMES, current.colorScheme),
+        theme: enumOr(settings.theme, THEMES, current.theme),
+        currency: enumOr(settings.currency, CURRENCIES, current.currency),
+        language: enumOr(settings.language, LANGUAGES, current.language),
+        refreshInterval: enumOr(settings.refreshInterval, REFRESH_INTERVALS, current.refreshInterval),
+        tradeTimeOnly: typeof settings.tradeTimeOnly === "boolean" ? settings.tradeTimeOnly : current.tradeTimeOnly,
+        dividendReinvest: typeof settings.dividendReinvest === "boolean" ? settings.dividendReinvest : current.dividendReinvest,
+      };
+      const saved = savePersistedState(buildPersistedState(nextState), { clearCachesOnFailure: true });
+      if (!saved.ok) return saved;
+      setState(nextState);
       return { ok: true };
     } catch {
       return { ok: false, error: "JSON 格式无法解析" };
