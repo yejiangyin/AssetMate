@@ -61,6 +61,27 @@ describe("normalizeHolding", () => {
   test("preserves T+0 fund confirmation rules", () => {
     assert.equal(normalizeHolding(holding({ fundBuyConfirmDays: 0 })).fundBuyConfirmDays, 0);
   });
+
+  test("removes announced A-share dividends that never received an ex-dividend date", () => {
+    const normalized = normalizeHolding(holding({
+      market: "A",
+      symbol: "600900",
+      name: "长江电力",
+      assetType: "stock",
+      cashDividendTotal: 790,
+      corporateActions: [{
+        id: "eastmoney-stock:cash_dividend:600900:2026-04-30:0.79",
+        type: "cash_dividend",
+        date: "2026-04-30",
+        amount: 790,
+        source: "eastmoney-stock",
+        announcementDate: "2026-04-30",
+      }],
+    }));
+
+    assert.equal(normalized.cashDividendTotal, 0);
+    assert.deepEqual(normalized.corporateActions, []);
+  });
 });
 
 describe("applyCorporateAction", () => {

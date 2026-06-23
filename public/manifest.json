@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "资产助手",
-  "version": "1.0.7",
-  "version_name": "1.0.7",
+  "version": "1.0.8",
+  "version_name": "1.0.8",
   "description": "个人资产与多市场行情查看插件。",
   "icons": {
     "16":  "icons/icon-16.png",
@@ -22,6 +22,9 @@
   },
   "host_permissions": [
     "https://query1.finance.yahoo.com/v8/finance/*",
+    "https://query1.finance.yahoo.com/v1/finance/*",
+    "https://query2.finance.yahoo.com/v8/finance/*",
+    "https://query2.finance.yahoo.com/v1/finance/*",
     "https://api.nasdaq.com/api/quote/*",
     "https://api.robinhood.com/marketdata/*",
     "https://api.coingecko.com/api/v3/*",

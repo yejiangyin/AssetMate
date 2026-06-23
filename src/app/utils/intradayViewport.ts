@@ -63,16 +63,12 @@ function intradaySessionCandidates(market: string, symbol: string): IntradaySess
     }];
   }
   if (market === "JP" || (market === "INDEX" && JP_INDEX_SYMBOLS.has(upperSymbol))) {
-    return [
-      {
-        segments: [["08:00", "10:30"], ["11:30", "14:00"]] as const,
-        ticks: ["08:00", "09:00", "10:30", "11:30", "12:30", "14:00"],
-      },
-      {
-        segments: [["09:00", "11:30"], ["12:30", "15:00"]] as const,
-        ticks: ["09:00", "10:00", "11:30", "12:30", "13:30", "15:00"],
-      },
-    ];
+    return [{
+      // JPX extended the cash-equity close from 15:00 to 15:30 in Nov 2024.
+      // Session times shown in Beijing time (UTC+8): Tokyo 09:00→08:00, 15:30→14:30.
+      segments: [["08:00", "10:30"], ["11:30", "14:30"]] as const,
+      ticks: ["08:00", "09:00", "10:30", "11:30", "13:00", "14:30"],
+    }];
   }
   if (market === "INDEX" && US_INDEX_SYMBOLS.has(upperSymbol)) {
     return [
@@ -236,14 +232,35 @@ export function buildIntradayViewportPoints(
     return buildFromSpec(filtered, US_FIXED_SESSIONS[usSession]);
   }
 
-  const session = pickIntradaySessionSpec(points, market, symbol);
-  if (!session || points.length < 2) {
+  const upperSymbol = symbol.toUpperCase();
+  const isJapan = market === "JP" || (market === "INDEX" && JP_INDEX_SYMBOLS.has(upperSymbol));
+  const effectivePoints = isJapan ? filterLatestMarketDate(points, "Asia/Shanghai") : points;
+  const session = pickIntradaySessionSpec(effectivePoints, market, symbol);
+  if (!session || effectivePoints.length < 2) {
     return {
-      points: points.map((point) => ({ ...point, displayPrice: point.price, displayVolume: point.volume })),
+      points: effectivePoints.map((point) => ({ ...point, displayPrice: point.price, displayVolume: point.volume })),
       ticks: null as string[] | null,
     };
   }
-  return buildFromSpec(points, session);
+  return buildFromSpec(effectivePoints, session);
+}
+
+function filterLatestMarketDate(points: ChartPoint[], timeZone: string) {
+  const dated = points
+    .map((point) => {
+      if (typeof point.timestamp !== "number" || !Number.isFinite(point.timestamp)) return null;
+      const date = new Intl.DateTimeFormat("en-CA", {
+        timeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(new Date(point.timestamp));
+      return { point, date };
+    })
+    .filter((item): item is { point: ChartPoint; date: string } => item != null);
+  if (!dated.length) return points;
+  const latestDate = dated.reduce((latest, item) => item.date > latest ? item.date : latest, "");
+  return dated.filter((item) => item.date === latestDate).map((item) => item.point);
 }
 
 function buildFromSpec(points: ChartPoint[], session: IntradaySessionSpec) {

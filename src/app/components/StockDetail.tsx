@@ -226,13 +226,29 @@ function buildDetailActionHolding(target: DetailTarget): Holding | null {
 
 function actionMarkerFromEvent(event: CorporateActionEvent, language: Language, currency: string): ChartActionMarker {
   const isDividend = event.type === "cash_dividend";
-  const label = isDividend
-    ? language === "en" ? "D" : "分"
-    : language === "en" ? "S" : "权";
-  const title = isDividend
-    ? language === "en" ? "Dividend" : "现金分红"
-    : language === "en" ? "Split / Ex-rights" : "拆分/除权";
+  const isResolution = event.type === "dividend_resolution" || event.type === "split_resolution";
+  const isDividendResolution = event.type === "dividend_resolution";
+  const label = isResolution
+    ? language === "en" ? "R" : "议"
+    : isDividend
+      ? language === "en" ? "D" : "分"
+      : language === "en" ? "S" : "权";
+  const title = isDividendResolution
+    ? language === "en" ? "Dividend Resolution" : "分红决议"
+    : event.type === "split_resolution"
+      ? language === "en" ? "Bonus / Transfer Resolution" : "送转决议"
+      : isDividend
+        ? language === "en" ? "Dividend" : "现金分红"
+        : language === "en" ? "Split / Ex-rights" : "拆分/除权";
   const details: string[] = [];
+  if (isResolution) {
+    details.push(language === "en"
+      ? "Approved by shareholders; record and ex-dividend dates are pending."
+      : isDividendResolution
+        ? "分红方案已获股东大会通过，尚待确定登记日及除息日"
+        : "送转方案已获股东大会通过，尚待确定登记日及除权日");
+  }
+  if (event.announcementDate) details.push(`${language === "en" ? "Announcement" : "公告"} ${event.announcementDate}`);
   if (event.recordDate) details.push(`${language === "en" ? "Record" : "登记"} ${event.recordDate}`);
   if (event.exDate) details.push(`${language === "en" ? "Ex-date" : "除息/除权"} ${event.exDate}`);
   if (event.payDate) details.push(`${language === "en" ? "Pay" : "发放"} ${event.payDate}`);
@@ -252,7 +268,7 @@ function actionMarkerFromEvent(event: CorporateActionEvent, language: Language, 
     date: event.date,
     label,
     title,
-    color: isDividend ? "#F59E0B" : "#8B5CF6",
+    color: isResolution ? (isDividendResolution ? "#3B82F6" : "#7C3AED") : isDividend ? "#F59E0B" : "#8B5CF6",
     details,
   };
 }
@@ -1514,12 +1530,14 @@ export function StockDetail() {
     setRefreshing(false);
     setLoading(!fallback);
     lastSyncedRefreshRef.current = lastRefreshAt;
-    void load(defaultRange, { reset: true, keepCurrent: Boolean(fallback) });
+    // Render the holding/search fallback immediately, but always verify the quote
+    // on entry so a persisted chart cannot keep last week's close indefinitely.
+    void load(defaultRange, { force: true, reset: true, keepCurrent: Boolean(fallback) });
     if (detailTarget.market === "FUND") return;
     const symbol = detailTarget.yahooSymbol;
     const market = detailTarget.market;
     const tid = window.setTimeout(() => {
-      void fetchDetailChart(symbol, market, "1d").catch(() => null);
+      void fetchDetailChart(symbol, market, "1d", true).catch(() => null);
     }, 250);
     return () => window.clearTimeout(tid);
   }, [detailTarget, detailTargetKey, language, lastRefreshAt, load]);
@@ -1727,7 +1745,8 @@ export function StockDetail() {
   const lineColor = isUp ? upColor : dnColor;
   const prevClose = displayQuote?.prevClose ?? q?.prevClose ?? 0;
   const hasRealChart = points.some((point) => point.price > 0);
-  const sessionHasChart = countDisplayPrices(areaChartData) >= 2;
+  const sessionRealPointCount = countDisplayPrices(areaChartData);
+  const sessionHasChart = sessionRealPointCount >= 2;
   const hasSessionVolume = sessionHasChart && areaChartData.some((point) => isPositiveFiniteNumber(point.displayVolume));
   const isRangeLoading = !isRangeReady && (loading || refreshing);
   const showSkeleton = loading && !data;
@@ -2161,7 +2180,9 @@ export function StockDetail() {
                   }}
                 >
                   {hasRealChart && !sessionHasChart
-                    ? (language === "en" ? "No intraday data for this session" : "当前时段暂无分时数据")
+                    ? range === "fs" && sessionRealPointCount === 1
+                      ? (language === "en" ? "Sparse trading today; no continuous intraday chart" : "今日成交稀疏，暂无连续分时")
+                      : (language === "en" ? "No intraday data for this session" : "当前时段暂无分时数据")
                     : (language === "en" ? "No chart data" : "暂无真实图表数据")}
                 </div>
               )}

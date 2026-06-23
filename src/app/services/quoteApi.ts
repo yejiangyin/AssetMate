@@ -50,7 +50,11 @@ export const FUND_RANGE_TABS: { value: TimeRange; label: string }[] = [
 function yahooQuerySpec(range: TimeRange) {
   switch (range) {
     case "fs":
-      return { rangeParam: "5d", interval: "5m" };
+      // 1m granularity for the intraday view. Yahoo allows up to 7 days of
+      // 1m data, so we pull 5d to safely cover Monday-morning lookbacks where
+      // the last US session was Friday. buildIntradayViewportPoints filters
+      // to the latest trading day on the client side.
+      return { rangeParam: "5d", interval: "1m" };
     case "1d":
       return { rangeParam: "max", interval: "1d" };
     case "5d":
@@ -202,10 +206,24 @@ const A_INDEX_YAHOO_SYMBOL: Record<string, string> = {
 /* ═══════════════════════════════════════════════════════
    Time label formatter
 ══════════════════════════════════════════════════════════ */
-function fmtTime(ts: number, range: TimeRange): string {
+function yahooDisplayTimeZone(yahooSymbol: string) {
+  const upper = yahooSymbol.toUpperCase();
+  // Japan quotes are displayed in Beijing time (UTC+8) for consistency with
+  // the rest of the app. Tokyo is UTC+9, so all JPX session times shift back 1h.
+  if (upper.endsWith(".T") || upper === "^N225" || upper === "N225") return "Asia/Shanghai";
+  return undefined;
+}
+
+export function formatYahooTimestamp(ts: number, range: TimeRange, yahooSymbol = ""): string {
   const d = new Date(ts * 1000);
+  const timeZone = yahooDisplayTimeZone(yahooSymbol);
   if (range === "fs") {
-    return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+    return d.toLocaleTimeString("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+      ...(timeZone ? { timeZone } : {}),
+    });
   }
   if (range === "1d") {
     return `${String(d.getFullYear()).slice(2)}/${d.getMonth() + 1}/${d.getDate()}`;
@@ -346,7 +364,7 @@ function hasRealChartPoints(points: ChartPoint[]) {
   return points.some((point) => point.price > 0);
 }
 
-function buildYahooRawPoints(result: any, range: TimeRange) {
+function buildYahooRawPoints(result: any, range: TimeRange, yahooSymbol = "") {
   const tss: number[] = result?.timestamp ?? [];
   const q0 = result?.indicators?.quote?.[0] ?? {};
   const opens: (number | null)[] = q0.open ?? [];
@@ -361,10 +379,14 @@ function buildYahooRawPoints(result: any, range: TimeRange) {
     if (price == null || isNaN(price)) continue;
     rawPoints.push({
       ts: tss[i]!,
-      time: fmtTime(tss[i]!, range),
+      time: formatYahooTimestamp(tss[i]!, range, yahooSymbol),
       timestamp: tss[i]! * 1000,
       dateLabel: range === "fs"
-        ? new Date(tss[i]! * 1000).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" })
+        ? new Date(tss[i]! * 1000).toLocaleDateString("zh-CN", {
+          month: "numeric",
+          day: "numeric",
+          ...(yahooDisplayTimeZone(yahooSymbol) ? { timeZone: yahooDisplayTimeZone(yahooSymbol) } : {}),
+        })
         : undefined,
       price,
       volume: typeof vols[i] === "number" ? (vols[i] as number) : undefined,
@@ -677,7 +699,7 @@ async function fetchEastMoneyGlobalFallback(symbol: string, market: string, rang
 ══════════════════════════════════════════════════════════ */
 const CACHE_TTL = 2 * 60 * 1000;
 const CACHE_MAX_ITEMS = 80;
-const PERSISTENT_CHART_STORAGE_KEY = "asset-helper:chart-cache:v1";
+const PERSISTENT_CHART_STORAGE_KEY = "asset-helper:chart-cache:v3";
 const PERSISTENT_FUND_HISTORY_STORAGE_KEY = "asset-helper:fund-history-cache:v1";
 const PERSISTENT_CHART_MAX_ITEMS = 36;
 const PERSISTENT_FUND_HISTORY_MAX_ITEMS = 60;
@@ -840,7 +862,7 @@ export async function fetchChart(yahooSymbol: string, range: TimeRange, force = 
   const canIncremental = !includePrePost && yahooIncrementalWindowDays(range) > 0 && persistedEntry?.data && hasRealChartPoints(persistedEntry.data.points);
   const fullRefresh = shouldFullRefresh(persistedEntry, DAILY_FULL_REFRESH_TTL) || !canIncremental;
   const windowDays = fullRefresh ? 0 : yahooIncrementalWindowDays(range);
-  const hosts = ["query1.finance.yahoo.com"];
+  const hosts = ["query2.finance.yahoo.com", "query1.finance.yahoo.com"];
   let lastError: unknown = null;
 
   for (const host of hosts) {
@@ -874,7 +896,7 @@ export async function fetchChart(yahooSymbol: string, range: TimeRange, force = 
         typeof n === "number" && Number.isFinite(n) && n > 0 ? n : undefined
       );
 
-      const rawPoints = buildYahooRawPoints(result, range);
+      const rawPoints = buildYahooRawPoints(result, range, yahooSymbol);
       const points: ChartPoint[] = range === "3mo"
         ? aggregateYahooCalendarPoints(rawPoints, "quarter")
         : range === "1y"
@@ -1001,7 +1023,7 @@ async function fetchYahooRecentDailyChart(yahooSymbol: string, days: number, for
     return reuseInflight(inflightChartRequests, key, async () => fetchYahooRecentDailyChart(yahooSymbol, days, true));
   }
 
-  const hosts = ["query1.finance.yahoo.com"];
+  const hosts = ["query2.finance.yahoo.com", "query1.finance.yahoo.com"];
   let lastError: unknown = null;
   for (const host of hosts) {
     const ctrl = new AbortController();
@@ -1015,7 +1037,7 @@ async function fetchYahooRecentDailyChart(yahooSymbol: string, days: number, for
       const result = json?.chart?.result?.[0];
       if (!result) throw new Error("empty recent daily result");
 
-      const rawPoints = buildYahooRawPoints(result, "1d");
+      const rawPoints = buildYahooRawPoints(result, "1d", yahooSymbol);
       const points = rawPoints
         .slice(-Math.max(days, 30))
         .map(({ ts: _ts, ...point }) => point);

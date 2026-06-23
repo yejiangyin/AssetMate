@@ -9,6 +9,7 @@ import type { MarketType } from "../services/tradingCalendar";
 import { nextExecutionDate, isTradingDay, marketDate, effectiveDcaMarket, closureReason } from "../services/tradingCalendar";
 import { resolveHoldingTradeStatus } from "../utils/tradeStatus";
 import { normalizeHoldingType, normalizeHoldingSymbol, applyHoldingAdjustment, recomputeHoldingMetrics } from "./holdingHelpers";
+import { safeUUID } from "./safeId";
 
 const DCA_QUOTE_FRESHNESS_MS = 30 * 60 * 1000;
 
@@ -658,7 +659,7 @@ function backfillMissingPendingFundExecutions(
         const executionKey = `${plan.id}:${actualDate}`;
         if (!executionKeys.has(executionKey)) {
           nextExecutions.unshift({
-            id: `dca_exec_${crypto.randomUUID()}`,
+            id: `dca_exec_${safeUUID()}`,
             planId: plan.id,
             holdingId: plan.holdingId,
             scheduledDate,
@@ -778,7 +779,7 @@ export function settleDueDCAPlans(
 
     if (!evaluation.ok || !holding) {
       nextExecutions.unshift({
-        id: `dca_exec_${crypto.randomUUID()}`,
+        id: `dca_exec_${safeUUID()}`,
         planId: plan.id,
         holdingId: plan.holdingId,
         scheduledDate,
@@ -797,7 +798,7 @@ export function settleDueDCAPlans(
 
     if (isFundHolding(holding, plan)) {
       nextExecutions.unshift({
-        id: `dca_exec_${crypto.randomUUID()}`,
+        id: `dca_exec_${safeUUID()}`,
         planId: plan.id,
         holdingId: plan.holdingId,
         scheduledDate,
@@ -819,7 +820,7 @@ export function settleDueDCAPlans(
     const quantity = plan.amount / executionPrice;
     if (!(quantity > 0)) {
       nextExecutions.unshift({
-        id: `dca_exec_${crypto.randomUUID()}`,
+        id: `dca_exec_${safeUUID()}`,
         planId: plan.id,
         holdingId: plan.holdingId,
         scheduledDate,
@@ -848,7 +849,7 @@ export function settleDueDCAPlans(
       nextExecDate: computeNextExec(plan, nextSearchDate, false),
     };
     nextExecutions.unshift({
-      id: `dca_exec_${crypto.randomUUID()}`,
+      id: `dca_exec_${safeUUID()}`,
       planId: plan.id,
       holdingId: plan.holdingId,
       scheduledDate,

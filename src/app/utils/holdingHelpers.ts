@@ -5,6 +5,7 @@
 
 import type { Holding } from "../data/mockData";
 import type { HoldingInput, HoldingAdjustmentInput, HoldingCorporateActionInput } from "../context/AppContext";
+import { safeUUID } from "./safeId";
 
 /* ─── normalize helpers ─────────────────────────────── */
 
@@ -37,7 +38,7 @@ export function normalizeHolding(h: Holding): Holding {
   const normalizedSymbol = normalizeHoldingSymbol(h.symbol, normalizedType.market);
   const marketValue = h.quantity * h.currentPrice;
   const costBasis = h.quantity * h.costPrice;
-  const cashDividendTotal = Number.isFinite(h.cashDividendTotal) ? Math.max(0, h.cashDividendTotal ?? 0) : 0;
+  const storedCashDividendTotal = Number.isFinite(h.cashDividendTotal) ? Math.max(0, h.cashDividendTotal ?? 0) : 0;
   const totalPnl = marketValue - costBasis;
   const fundNavHistory = Array.isArray(h.fundNavHistory)
     ? h.fundNavHistory
@@ -45,11 +46,25 @@ export function normalizeHolding(h: Holding): Holding {
       .sort((a, b) => b.date.localeCompare(a.date))
       .slice(0, 20)
     : undefined;
-  const corporateActions = Array.isArray(h.corporateActions)
-    ? h.corporateActions
-      .filter((action) => typeof action?.id === "string" && typeof action?.type === "string" && typeof action?.date === "string")
-      .slice(-60)
+  const rawCorporateActions = Array.isArray(h.corporateActions)
+    ? h.corporateActions.filter((action) => (
+      typeof action?.id === "string" &&
+      typeof action?.type === "string" &&
+      typeof action?.date === "string"
+    ))
     : [];
+  const invalidAnnouncedStockActions = rawCorporateActions.filter((action) => (
+    action.source === "eastmoney-stock" && !action.exDate
+  ));
+  const invalidCashDividendTotal = invalidAnnouncedStockActions.reduce((total, action) => (
+    action.type === "cash_dividend" && Number.isFinite(action.amount)
+      ? total + Math.max(0, action.amount ?? 0)
+      : total
+  ), 0);
+  const corporateActions = rawCorporateActions
+    .filter((action) => !(action.source === "eastmoney-stock" && !action.exDate))
+    .slice(-60);
+  const cashDividendTotal = Math.max(0, storedCashDividendTotal - invalidCashDividendTotal);
   const fundBuyConfirmDays = Number.isInteger(h.fundBuyConfirmDays) && h.fundBuyConfirmDays! >= 0 && h.fundBuyConfirmDays! <= 30
     ? h.fundBuyConfirmDays
     : undefined;
@@ -142,7 +157,7 @@ export function buildHolding(input: HoldingInput, id: string): Holding {
 export function applyCorporateAction(current: Holding, input: HoldingCorporateActionInput): Holding {
   const currentCostBasis = current.quantity * current.costPrice;
   const baseAction = {
-    id: input.id || `corp_${crypto.randomUUID()}`,
+    id: input.id || `corp_${safeUUID()}`,
     type: input.type,
     date: input.date || new Date().toISOString().slice(0, 10),
     recordDate: input.recordDate,

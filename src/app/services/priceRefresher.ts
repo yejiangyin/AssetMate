@@ -2,7 +2,7 @@
  * Batch live-price refresher for portfolio holdings.
  */
 
-import { fetchCnFundEstimate, fetchCnFundOfficialHistory, fetchCnFundOfficialNav, fetchCnFundTradeStatus } from "./securitiesApi";
+import { fetchCnFundEstimate, fetchCnFundOfficialHistory, fetchCnFundOfficialNav, fetchCnFundTradeStatus, resolveYahooUsPrice, Market } from "./securitiesApi";
 import { fetchEastMoneyQuoteBySymbol, fetchEastMoneyQuotesBySymbols, fetchEastMoneyTradeStatusesBySymbols } from "./eastMoneyApi";
 import { fetchNasdaqQuote } from "./nasdaqApi";
 import { fetchTencentQuote, fetchTencentQuoteFromYahooSymbol, fetchTencentTradeStatus } from "./tencentQuote";
@@ -38,7 +38,11 @@ export type PriceMap = Record<string, HoldingLiveUpdate>;
 
 const FX_STORAGE_KEY = "asset-helper:fx-rates";
 const FX_CACHE_TTL = 24 * 60 * 60 * 1000;
-const FX_DEFAULTS = {
+type FxCode = "USD" | "HKD" | "JPY" | "USDT" | "USDC" | "CNY" | "EUR" | "GBP";
+
+type FxRateMap = Record<FxCode, number>;
+
+const FX_DEFAULTS: Readonly<FxRateMap> = Object.freeze({
   USD: 6.78,
   HKD: 0.87,
   JPY: 0.043,
@@ -47,11 +51,7 @@ const FX_DEFAULTS = {
   CNY: 1,
   EUR: 7.89,
   GBP: 9.15,
-};
-
-type FxCode = keyof typeof FX_DEFAULTS;
-
-type FxRateMap = Record<FxCode, number>;
+});
 
 function isPositiveRate(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -103,62 +103,16 @@ if (typeof window !== "undefined" && !(window as unknown as Record<string, unkno
   });
 }
 
-function resolveYahooUsPrice(meta: any, isUs = false) {
-  const positive = (value: unknown) => {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-  };
-  const prevClose = positive(meta?.previousClose ?? meta?.chartPreviousClose);
-  const regularPrice = positive(meta?.regularMarketPrice);
-  const regularHigh = positive(meta?.regularMarketDayHigh);
-  const regularLow = positive(meta?.regularMarketDayLow);
-  const regularVolume = positive(meta?.regularMarketVolume);
-  if (!isUs) {
-    const price = regularPrice;
-    const basePrevClose = prevClose || price;
-    const rawChange = Number(meta?.regularMarketChange ?? (price - basePrevClose));
-    const rawChangePct = Number(meta?.regularMarketChangePercent ?? (basePrevClose > 0 ? rawChange / basePrevClose : 0));
-    return {
-      price,
-      prevClose: basePrevClose,
-      change: rawChange,
-      changePercent: Math.abs(rawChangePct) > 1 ? rawChangePct / 100 : rawChangePct,
-      high: regularHigh || price,
-      low: regularLow || price,
-      volume: regularVolume,
-    };
-  }
-
-  const marketState = String(meta?.marketState ?? "").toUpperCase();
-  const prePrice = positive(meta?.preMarketPrice);
-  const postPrice = positive(meta?.postMarketPrice);
-  const price = postPrice && (marketState.includes("POST") || marketState === "CLOSED")
-    ? postPrice
-    : prePrice && marketState.includes("PRE")
-      ? prePrice
-      : regularPrice;
-  const basePrevClose = prevClose || price;
-  const change = price - basePrevClose;
-  return {
-    price,
-    prevClose: basePrevClose,
-    change,
-    changePercent: basePrevClose > 0 ? change / basePrevClose : 0,
-    high: Math.max(regularHigh || price, price),
-    low: Math.min(regularLow || price, price),
-    volume: positive(meta?.postMarketVolume ?? meta?.preMarketVolume ?? regularVolume),
-  };
-}
-
 
 async function fetchOne(yahooSymbol: string): Promise<LivePrice | null> {
-  const hosts = ["query1.finance.yahoo.com"];
+  const hosts = ["query2.finance.yahoo.com", "query1.finance.yahoo.com"];
   const isUs = !/(\.HK|\.SS|\.SZ|\.T|-USD|-USDT|=|\^)/i.test(yahooSymbol);
+  const market: Market = isUs ? "US" : "HK"; // non-US just needs a non-"US" value to take the other branch
   for (const host of hosts) {
     const ctrl = new AbortController();
     const tid  = setTimeout(() => ctrl.abort(), 6000);
     try {
-      const url = `https://${host}/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1d&range=1d&includePrePost=${isUs ? "true" : "false"}&_=${Date.now()}`;
+      const url = `https://${host}/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1m&range=1d&includePrePost=${isUs ? "true" : "false"}&_=${Date.now()}`;
       const res  = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
       clearTimeout(tid);
       if (!res.ok) continue;
@@ -167,7 +121,7 @@ async function fetchOne(yahooSymbol: string): Promise<LivePrice | null> {
       const meta  = json?.chart?.result?.[0]?.meta;
       if (!meta) continue;
 
-      const resolved = resolveYahooUsPrice(meta, isUs);
+      const resolved = resolveYahooUsPrice(meta, market);
       const price = resolved.price;
       if (!(price > 0)) continue;
 
@@ -345,39 +299,37 @@ const COINGECKO_IDS: Record<string, string> = {
 };
 
 async function fetchCrypto(symbol: string): Promise<LivePrice | null> {
-  const coinId = COINGECKO_IDS[symbol.toUpperCase()];
-  if (!coinId) {
-    const binance = await fetchBinanceCryptoQuote(symbol);
-    if (binance) {
-      return {
-        price: binance.price,
-        change: binance.change,
-        changePercent: binance.changePercent,
-        prevClose: binance.prevClose,
-        high: binance.high,
-        low: binance.low,
-        volume: binance.volume,
-        fetchedAt: Date.now(),
-        source: "binance",
-      };
-    }
-    const okx = await fetchOkxCryptoQuote(symbol);
-    if (okx) {
-      return {
-        price: okx.price,
-        change: okx.change,
-        changePercent: okx.changePercent,
-        prevClose: okx.prevClose,
-        high: okx.high,
-        low: okx.low,
-        volume: okx.volume,
-        fetchedAt: Date.now(),
-        source: "okx",
-      };
-    }
-    return fetchStockLike(symbol, "CRYPTO");
+  const binance = await fetchBinanceCryptoQuote(symbol);
+  if (binance) {
+    return {
+      price: binance.price,
+      change: binance.change,
+      changePercent: binance.changePercent,
+      prevClose: binance.prevClose,
+      high: binance.high,
+      low: binance.low,
+      volume: binance.volume,
+      fetchedAt: Date.now(),
+      source: "binance",
+    };
+  }
+  const okx = await fetchOkxCryptoQuote(symbol);
+  if (okx) {
+    return {
+      price: okx.price,
+      change: okx.change,
+      changePercent: okx.changePercent,
+      prevClose: okx.prevClose,
+      high: okx.high,
+      low: okx.low,
+      volume: okx.volume,
+      fetchedAt: Date.now(),
+      source: "okx",
+    };
   }
 
+  const coinId = COINGECKO_IDS[symbol.toUpperCase()];
+  if (!coinId) return fetchStockLike(symbol, "CRYPTO");
   const ctrl = new AbortController();
   const tid = setTimeout(() => ctrl.abort(), 6000);
   try {
@@ -385,22 +337,6 @@ async function fetchCrypto(symbol: string): Promise<LivePrice | null> {
     const res = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
     clearTimeout(tid);
     if (!res.ok) {
-      const binance = await fetchBinanceCryptoQuote(symbol);
-      if (binance) {
-        return {
-          price: binance.price, change: binance.change, changePercent: binance.changePercent,
-          prevClose: binance.prevClose, high: binance.high, low: binance.low, volume: binance.volume,
-          fetchedAt: Date.now(), source: "binance",
-        };
-      }
-      const okx = await fetchOkxCryptoQuote(symbol);
-      if (okx) {
-        return {
-          price: okx.price, change: okx.change, changePercent: okx.changePercent,
-          prevClose: okx.prevClose, high: okx.high, low: okx.low, volume: okx.volume,
-          fetchedAt: Date.now(), source: "okx",
-        };
-      }
       return fetchStockLike(symbol, "CRYPTO");
     }
 
@@ -408,22 +344,6 @@ async function fetchCrypto(symbol: string): Promise<LivePrice | null> {
     const price = json?.[coinId]?.usd;
     const changePercent = json?.[coinId]?.usd_24h_change;
     if (typeof price !== "number") {
-      const binance = await fetchBinanceCryptoQuote(symbol);
-      if (binance) {
-        return {
-          price: binance.price, change: binance.change, changePercent: binance.changePercent,
-          prevClose: binance.prevClose, high: binance.high, low: binance.low, volume: binance.volume,
-          fetchedAt: Date.now(), source: "binance",
-        };
-      }
-      const okx = await fetchOkxCryptoQuote(symbol);
-      if (okx) {
-        return {
-          price: okx.price, change: okx.change, changePercent: okx.changePercent,
-          prevClose: okx.prevClose, high: okx.high, low: okx.low, volume: okx.volume,
-          fetchedAt: Date.now(), source: "okx",
-        };
-      }
       return fetchStockLike(symbol, "CRYPTO");
     }
 
@@ -439,34 +359,6 @@ async function fetchCrypto(symbol: string): Promise<LivePrice | null> {
     };
   } catch {
     clearTimeout(tid);
-    const binance = await fetchBinanceCryptoQuote(symbol);
-    if (binance) {
-      return {
-        price: binance.price,
-        change: binance.change,
-        changePercent: binance.changePercent,
-        prevClose: binance.prevClose,
-        high: binance.high,
-        low: binance.low,
-        volume: binance.volume,
-        fetchedAt: Date.now(),
-        source: "binance",
-      };
-    }
-    const okx = await fetchOkxCryptoQuote(symbol);
-    if (okx) {
-      return {
-        price: okx.price,
-        change: okx.change,
-        changePercent: okx.changePercent,
-        prevClose: okx.prevClose,
-        high: okx.high,
-        low: okx.low,
-        volume: okx.volume,
-        fetchedAt: Date.now(),
-        source: "okx",
-      };
-    }
     return fetchStockLike(symbol, "CRYPTO");
   }
 }
