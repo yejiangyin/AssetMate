@@ -1,11 +1,12 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { groups as initialGroups, holdings as initialHoldings, Group, Holding } from "../data/mockData";
 import { FX, refreshPrices, toCNY } from "../services/priceRefresher";
-import { MarketType, DCAFrequency, isMarketOpenNow, refreshTradingCalendar } from "../services/tradingCalendar";
+import { MarketType, DCAFrequency, isMarketOpenNow, isTradingDay, refreshTradingCalendar } from "../services/tradingCalendar";
 import type { ChartPoint } from "../services/quoteApi";
 import { fetchCorporateActions } from "../services/corporateActions";
 import { normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction } from "../utils/holdingHelpers";
 import { dedupeDCAExecutions, hydratePlans, repairDCAData, settleDueDCAPlans, syncPlanWithHolding, computeNextExec } from "../utils/dcaEngine";
+import { safeUUID } from "../utils/safeId";
 
 /* ─── types ──────────────────────────────────────────── */
 type ColorScheme    = "red-up" | "green-up";
@@ -317,9 +318,13 @@ const MAX_DCA_EXECUTIONS = 300;
 const MAX_DCA_EXECUTIONS_PER_PLAN = 24;
 const NON_CRITICAL_STORAGE_KEYS = [
   "asset-helper:chart-cache:v1",
+  "asset-helper:chart-cache:v2",
   "asset-helper:fund-history-cache:v1",
   "asset-helper:corporate-actions-cache:v1",
+  "asset-helper:corporate-actions-cache:v2",
+  "asset-helper:corporate-actions-cache:v3",
   "asset-helper:market-page-cache:v1",
+  "asset-helper:market-page-cache:v2",
   "asset-helper:trading-calendar:v1",
   "asset-helper:fx-rates",
   "dashboard.assetSeries.v4",
@@ -419,6 +424,9 @@ function pruneDCAExecutions(executions: DCAExecution[]) {
 }
 
 function hasFundNavRefreshWindow(holdings: Holding[], now = new Date()) {
+  // Skip weekends/holidays — CN public funds only publish NAV on trading days,
+  // so polling outside those days just wastes network requests.
+  if (!isTradingDay("FUND", now)) return false;
   const hour = Number(new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Shanghai",
     hour: "2-digit",
@@ -476,7 +484,7 @@ function applyAutomaticCorporateActions(
     if (!holding.autoCorporateActionSince) changed = true;
 
     for (const action of actions) {
-      if (action.date < since || actionAlreadyApplied(next, action.id)) continue;
+      if (action.date < since || action.date > today || actionAlreadyApplied(next, action.id)) continue;
       if (action.type === "split" && action.ratio && action.ratio > 0) {
         next = applyHoldingCorporateAction(next, {
           id: action.id,
@@ -948,6 +956,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         holdings: dcaState.holdings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
+        // upsertPortfolioSnapshot(snapshots, holdings, date) keeps all
+        // historical snapshots from the first arg and replaces only today's
+        // entry with a freshly computed one from `holdings`. Passing the
+        // imported snapshot array here preserves the 180-day trend history;
+        // the .slice(-180) inside the function caps the total length.
         assetSnapshots: Array.isArray(data.assetSnapshots)
           ? upsertPortfolioSnapshot(data.assetSnapshots, dcaState.holdings)
           : upsertPortfolioSnapshot(current.assetSnapshots, dcaState.holdings),
@@ -981,7 +994,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   /* groups */
   const addGroup    = useCallback((g: Omit<Group, "id" | "sort">) => {
-    setState((s) => ({ ...s, groups: [...s.groups, { ...g, id: `group_${crypto.randomUUID()}`, sort: Date.now() }] }));
+    setState((s) => ({ ...s, groups: [...s.groups, { ...g, id: `group_${safeUUID()}`, sort: Date.now() }] }));
   }, []);
   const updateGroup = useCallback((id: string, patch: Partial<Omit<Group, "id" | "sort">>) => {
     setState((s) => ({
@@ -999,7 +1012,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   /* holdings */
   const addHolding = useCallback((input: HoldingInput) => {
-    const h = buildHolding(input, `holding_${crypto.randomUUID()}`);
+    const h = buildHolding(input, `holding_${safeUUID()}`);
     setState((s) => {
       const updated = [h, ...s.holdings];
       const dcaState = applyDCAState(updated, s.dcaPlans, s.dcaExecutions);
@@ -1130,7 +1143,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         totalInvested: 0,
         execCount: 0,
       }, linkedHolding),
-      id:           `dca_${crypto.randomUUID()}`,
+      id:           `dca_${safeUUID()}`,
       nextExecDate: "",
       totalInvested: 0,
       execCount: 0,

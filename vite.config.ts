@@ -87,6 +87,20 @@ export default defineConfig({
           });
         },
       },
+      "/api/yahoo2": {
+        target: "https://query2.finance.yahoo.com",
+        changeOrigin: true,
+        secure: true,
+        rewrite: (p) => p.replace(/^\/api\/yahoo2/, ""),
+        configure: (proxy) => {
+          proxy.on("proxyReq", (proxyReq) => {
+            proxyReq.setHeader("User-Agent", YAHOO_UA);
+            proxyReq.setHeader("Accept", "application/json,text/plain,*/*");
+            proxyReq.setHeader("Referer", "https://finance.yahoo.com/");
+            proxyReq.setHeader("Origin", "https://finance.yahoo.com");
+          });
+        },
+      },
       // Proxy Tencent quote endpoint — no CORS headers on qt.gtimg.cn so browser
       // blocks direct fetch. Node proxy forwards without CORS restriction.
       "/api/tencent": {

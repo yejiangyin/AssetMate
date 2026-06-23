@@ -10,7 +10,7 @@ import {
 export type CorporateActionEvent = {
   id: string;
   source: "yahoo" | "eastmoney-fund" | "eastmoney-stock";
-  type: "cash_dividend" | "split";
+  type: "cash_dividend" | "split" | "dividend_resolution" | "split_resolution";
   date: string;
   amount?: number;
   ratio?: number;
@@ -24,7 +24,7 @@ export type CorporateActionEvent = {
 const cache = new Map<string, { ts: number; data: CorporateActionEvent[] }>();
 const inflight = new Map<string, Promise<CorporateActionEvent[]>>();
 const CACHE_TTL = 30 * 60 * 1000;
-const PERSISTENT_ACTION_STORAGE_KEY = "asset-helper:corporate-actions-cache:v1";
+const PERSISTENT_ACTION_STORAGE_KEY = "asset-helper:corporate-actions-cache:v3";
 const PERSISTENT_ACTION_MAX_ITEMS = 120;
 const PERSISTENT_ACTION_TTL = 24 * 60 * 60 * 1000;
 const ACTION_FULL_REFRESH_TTL = 7 * 24 * 60 * 60 * 1000;
@@ -193,22 +193,110 @@ function normalizeAStockCode(symbol: string) {
   return symbol.replace(/\.(SH|SS|SZ)$/i, "").trim();
 }
 
+function isDisplayableEastMoneyStockAction(event: CorporateActionEvent) {
+  if (event.source !== "eastmoney-stock") return true;
+  if (event.type === "dividend_resolution" || event.type === "split_resolution") {
+    return Boolean(event.announcementDate || event.date);
+  }
+  return Boolean(event.exDate);
+}
+
+export function parseEastMoneyStockCorporateActionRows(code: string, rows: unknown[]): CorporateActionEvent[] {
+  return rows.flatMap((rawRow) => {
+    const row = rawRow as Record<string, unknown>;
+    const exDate = normalizeYMD(row.EX_DIVIDEND_DATE);
+    const recordDate = normalizeYMD(row.EQUITY_RECORD_DATE);
+    const announcementDate = normalizeYMD(row.NOTICE_DATE || row.PLAN_NOTICE_DATE || row.PUBLISH_DATE);
+    const progress = String(row.ASSIGN_PROGRESS ?? "").trim();
+    const description = String(row.IMPL_PLAN_PROFILE ?? progress).trim();
+    const result: CorporateActionEvent[] = [];
+
+    const cashPerTen = Number(row.PRETAX_BONUS_RMB);
+    const amount = Number.isFinite(cashPerTen) && cashPerTen > 0
+      ? Number((cashPerTen / 10).toFixed(6))
+      : 0;
+    const bonus = Number(row.BONUS_RATIO);
+    const transfer = Number(row.IT_RATIO);
+    const totalBonusPerTen = (Number.isFinite(bonus) && bonus > 0 ? bonus : 0) + (Number.isFinite(transfer) && transfer > 0 ? transfer : 0);
+    const ratio = totalBonusPerTen > 0 ? 1 + totalBonusPerTen / 10 : 0;
+
+    if (!exDate) {
+      const shareholderApproved = /股东大会.*(?:决议|通过)|(?:决议|通过).*股东大会/.test(progress);
+      if (!shareholderApproved || !announcementDate) return [];
+      if (amount > 0) {
+        result.push({
+          id: `eastmoney-stock:dividend_resolution:${code}:${announcementDate}:${amount}`,
+          source: "eastmoney-stock",
+          type: "dividend_resolution",
+          date: announcementDate,
+          amount,
+          announcementDate,
+          description,
+        });
+      }
+      if (ratio > 0 && Math.abs(ratio - 1) > 1e-8) {
+        result.push({
+          id: `eastmoney-stock:split_resolution:${code}:${announcementDate}:${ratio}`,
+          source: "eastmoney-stock",
+          type: "split_resolution",
+          date: announcementDate,
+          ratio,
+          announcementDate,
+          description,
+        });
+      }
+      return result;
+    }
+
+    if (amount > 0) {
+      result.push({
+        id: `eastmoney-stock:cash_dividend:${code}:${exDate}:${amount}`,
+        source: "eastmoney-stock",
+        type: "cash_dividend",
+        date: exDate,
+        amount,
+        recordDate,
+        exDate,
+        announcementDate,
+        description,
+      });
+    }
+
+    if (ratio > 0 && Math.abs(ratio - 1) > 1e-8) {
+      result.push({
+        id: `eastmoney-stock:split:${code}:${exDate}:${ratio}`,
+        source: "eastmoney-stock",
+        type: "split",
+        date: exDate,
+        ratio,
+        recordDate,
+        exDate,
+        announcementDate,
+        description,
+      });
+    }
+    return result;
+  }).sort((a, b) => a.date.localeCompare(b.date));
+}
+
 async function fetchEastMoneyStockCorporateActions(symbol: string): Promise<CorporateActionEvent[]> {
   const code = normalizeAStockCode(symbol);
   if (!/^\d{6}$/.test(code)) return [];
   const key = `eastmoney-stock-actions:${code}`;
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.ts < CACHE_TTL) return hit.data;
+  if (hit && Date.now() - hit.ts < CACHE_TTL) return hit.data.filter(isDisplayableEastMoneyStockAction);
   const persistentHit = getFreshPersistentActions(key);
   if (persistentHit) {
-    cache.set(key, { ts: Date.now(), data: persistentHit });
-    return persistentHit;
+    const displayable = persistentHit.filter(isDisplayableEastMoneyStockAction);
+    cache.set(key, { ts: Date.now(), data: displayable });
+    return displayable;
   }
   const running = inflight.get(key);
   if (running) return running;
 
   const task = (async () => {
     const persistent = readPersistentActions(key);
+    const validPersistentActions = (persistent?.data ?? []).filter(isDisplayableEastMoneyStockAction);
     const fullRefresh = shouldFullRefresh(persistent, ACTION_FULL_REFRESH_TTL);
     const ctrl = new AbortController();
     const tid = setTimeout(() => ctrl.abort(), 8000);
@@ -233,57 +321,14 @@ async function fetchEastMoneyStockCorporateActions(symbol: string): Promise<Corp
       if (!res.ok) throw new Error(`EastMoney stock actions HTTP ${res.status}`);
       const json = await res.json();
       const rows = Array.isArray(json?.result?.data) ? json.result.data : [];
-      const actions = rows.flatMap((row: any) => {
-        const exDate = normalizeYMD(row?.EX_DIVIDEND_DATE);
-        const recordDate = normalizeYMD(row?.EQUITY_RECORD_DATE);
-        const announcementDate = normalizeYMD(row?.NOTICE_DATE || row?.PLAN_NOTICE_DATE || row?.PUBLISH_DATE);
-        const date = exDate || recordDate || announcementDate;
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return [];
-        const description = String(row?.IMPL_PLAN_PROFILE ?? row?.ASSIGN_PROGRESS ?? "").trim();
-        const result: CorporateActionEvent[] = [];
-
-        const cashPerTen = Number(row?.PRETAX_BONUS_RMB);
-        const amount = Number.isFinite(cashPerTen) && cashPerTen > 0 ? cashPerTen / 10 : 0;
-        if (amount > 0) {
-          result.push({
-            id: `eastmoney-stock:cash_dividend:${code}:${date}:${amount}`,
-            source: "eastmoney-stock",
-            type: "cash_dividend",
-            date,
-            amount,
-            recordDate,
-            exDate,
-            announcementDate,
-            description,
-          });
-        }
-
-        const bonus = Number(row?.BONUS_RATIO);
-        const transfer = Number(row?.IT_RATIO);
-        const totalBonusPerTen = (Number.isFinite(bonus) && bonus > 0 ? bonus : 0) + (Number.isFinite(transfer) && transfer > 0 ? transfer : 0);
-        const ratio = totalBonusPerTen > 0 ? 1 + totalBonusPerTen / 10 : 0;
-        if (ratio > 0 && Math.abs(ratio - 1) > 1e-8) {
-          result.push({
-            id: `eastmoney-stock:split:${code}:${date}:${ratio}`,
-            source: "eastmoney-stock",
-            type: "split",
-            date,
-            ratio,
-            recordDate,
-            exDate,
-            announcementDate,
-            description,
-          });
-        }
-        return result;
-      }).sort((a: CorporateActionEvent, b: CorporateActionEvent) => a.date.localeCompare(b.date));
-      const merged = fullRefresh ? actions : mergeCorporateActions(persistent?.data ?? [], actions);
+      const actions = parseEastMoneyStockCorporateActionRows(code, rows);
+      const merged = fullRefresh ? actions : mergeCorporateActions(validPersistentActions, actions);
       cache.set(key, { ts: Date.now(), data: merged });
       writePersistentActions(key, merged, { fullRefresh, previousFullRefreshAt: persistent?.lastFullRefreshAt });
       return merged;
     } catch {
       clearTimeout(tid);
-      return persistent?.data ?? [];
+      return validPersistentActions;
     } finally {
       inflight.delete(key);
     }

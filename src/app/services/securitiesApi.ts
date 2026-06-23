@@ -89,11 +89,27 @@ function shouldUseYahooProxy() {
   return isLocalDevHost();
 }
 
-function yahooUrl(path: string): string {
-  return shouldUseYahooProxy() ? `/api/yahoo${path}` : `https://query1.finance.yahoo.com${path}`;
+function yahooUrls(path: string): string[] {
+  return shouldUseYahooProxy()
+    ? [`/api/yahoo2${path}`, `/api/yahoo${path}`]
+    : [
+      `https://query2.finance.yahoo.com${path}`,
+      `https://query1.finance.yahoo.com${path}`,
+    ];
 }
 
-function resolveYahooUsPrice(meta: any, market: Market) {
+/**
+ * Resolve a Yahoo Finance quote `meta` block into a normalized price snapshot.
+ *
+ * Yahoo's `regularMarketChangePercent` is inconsistently scaled across markets:
+ * US tickers usually return a decimal (0.0123 = 1.23%), while HK/JP/A often
+ * return the percentage directly (1.23 = 1.23%). We normalize both shapes to
+ * a decimal fraction here so downstream code can treat them uniformly.
+ *
+ * Shared by the live price refresher (priceRefresher.ts) and the search quote
+ * path (securitiesApi.ts). Keep this the single source of truth.
+ */
+export function resolveYahooUsPrice(meta: any, market: Market) {
   const numberOrZero = (value: unknown) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
@@ -101,14 +117,18 @@ function resolveYahooUsPrice(meta: any, market: Market) {
   const prevClose = numberOrZero(meta?.previousClose ?? meta?.chartPreviousClose);
   const regularPrice = numberOrZero(meta?.regularMarketPrice);
   if (market !== "US") {
+    const price = regularPrice;
+    const basePrevClose = prevClose || price;
+    const rawChange = Number(meta?.regularMarketChange ?? (price - basePrevClose));
+    const rawChangePct = Number(meta?.regularMarketChangePercent ?? (basePrevClose > 0 ? rawChange / basePrevClose : 0));
     return {
-      price: regularPrice,
-      prevClose: prevClose || regularPrice,
-      high: numberOrZero(meta?.regularMarketDayHigh) || regularPrice,
-      low: numberOrZero(meta?.regularMarketDayLow) || regularPrice,
+      price,
+      prevClose: basePrevClose,
+      change: rawChange,
+      changePercent: Math.abs(rawChangePct) > 1 ? rawChangePct / 100 : rawChangePct,
+      high: numberOrZero(meta?.regularMarketDayHigh) || price,
+      low: numberOrZero(meta?.regularMarketDayLow) || price,
       volume: numberOrZero(meta?.regularMarketVolume),
-      change: Number(meta?.regularMarketChange ?? regularPrice - (prevClose || regularPrice)),
-      changePercent: Number(meta?.regularMarketChangePercent ?? ((prevClose || regularPrice) > 0 ? (regularPrice - (prevClose || regularPrice)) / (prevClose || regularPrice) : 0)),
     };
   }
 
@@ -120,15 +140,16 @@ function resolveYahooUsPrice(meta: any, market: Market) {
     : prePrice && marketState.includes("PRE")
       ? prePrice
       : regularPrice;
-  const change = price - (prevClose || price);
+  const basePrevClose = prevClose || price;
+  const change = price - basePrevClose;
   return {
     price,
-    prevClose: prevClose || price,
+    prevClose: basePrevClose,
+    change,
+    changePercent: basePrevClose > 0 ? change / basePrevClose : 0,
     high: Math.max(numberOrZero(meta?.regularMarketDayHigh) || price, price),
     low: Math.min(numberOrZero(meta?.regularMarketDayLow) || price, price),
     volume: numberOrZero(meta?.postMarketVolume ?? meta?.preMarketVolume ?? meta?.regularMarketVolume),
-    change,
-    changePercent: (prevClose || price) > 0 ? change / (prevClose || price) : 0,
   };
 }
 
@@ -255,8 +276,11 @@ function yahooExchangeToMarket(exchange: string, quoteType: string, symbol: stri
   return null;
 }
 
-function stripSuffix(symbol: string) {
-  return symbol.replace(/\.(SS|SZ|HK)$/i, "");
+export function normalizeSearchSymbol(symbol: string, market: Market) {
+  if (market === "CRYPTO") {
+    return symbol.replace(/-(USD|USDT)$/i, "").replace(/\/(USD|USDT)$/i, "");
+  }
+  return symbol.replace(/\.(SS|SZ|HK|T)$/i, "");
 }
 
 function toYahooTicker(symbol: string, market: Market): string {
@@ -326,64 +350,60 @@ function isExchangeTradedFundCandidate(params: {
    Yahoo Finance — search
 ══════════════════════════════════════════════════════════ */
 async function yahooSearch(query: string): Promise<LiveResult[]> {
-  const [signal, clear] = mkAbort(5000);
-  try {
-    const path =
-      `/v1/finance/search` +
-      `?q=${encodeURIComponent(query)}&quotesCount=10&newsCount=0&enableFuzzyQuery=true&_=${Date.now()}`;
-    const url = yahooUrl(path);
-    const res = await fetch(url, { signal, cache: "no-store" });
-    clear();
-    if (!res.ok) return [];
+  const path =
+    `/v1/finance/search` +
+    `?q=${encodeURIComponent(query)}&quotesCount=10&newsCount=0&enableFuzzyQuery=true&_=${Date.now()}`;
+  for (const url of yahooUrls(path)) {
+    const [signal, clear] = mkAbort(5000);
+    try {
+      const res = await fetch(url, { signal, cache: "no-store" });
+      clear();
+      if (!res.ok) continue;
 
-    const data = await res.json();
-    const quotes: any[] = data.quotes ?? [];
+      const data = await res.json();
+      const quotes: any[] = data.quotes ?? [];
 
-    const out: LiveResult[] = [];
-    for (const q of quotes) {
-      if (!q.symbol) continue;
-      const skip = ["OPTION", "CURRENCY", "INDEX", "FUTURE"];
-      if (skip.includes((q.quoteType ?? "").toUpperCase())) continue;
+      const out: LiveResult[] = [];
+      for (const q of quotes) {
+        if (!q.symbol) continue;
+        const skip = ["OPTION", "CURRENCY", "INDEX", "FUTURE"];
+        if (skip.includes((q.quoteType ?? "").toUpperCase())) continue;
 
-      const market = yahooExchangeToMarket(q.exchange ?? "", q.quoteType ?? "", q.symbol);
-      if (!market) continue;
+        const market = yahooExchangeToMarket(q.exchange ?? "", q.quoteType ?? "", q.symbol);
+        if (!market) continue;
 
-      const qt = (q.quoteType ?? "").toUpperCase();
-      const rawName: string = q.shortname || q.longname || q.symbol;
-      let assetType: AssetType = "stock";
-      if (market === "HK") {
-        // HK-listed securities may come back as MUTUALFUND from Yahoo. Treat
-        // normal HK equities like 01810 as stocks; only ETF-like names become ETF.
-        assetType = qt === "ETF" || /ETF|FUND|TRACKER|ISHARES|CSOP|HANG SENG/i.test(rawName) ? "etf" : "stock";
-      } else if (qt === "ETF")               assetType = "etf";
-      else if (qt === "MUTUALFUND")   assetType = "fund";
-      else if (qt === "CRYPTOCURRENCY") assetType = "crypto";
+        const qt = (q.quoteType ?? "").toUpperCase();
+        const rawName: string = q.shortname || q.longname || q.symbol;
+        let assetType: AssetType = "stock";
+        if (market === "HK") {
+          assetType = qt === "ETF" || /ETF|FUND|TRACKER|ISHARES|CSOP|HANG SENG/i.test(rawName) ? "etf" : "stock";
+        } else if (qt === "ETF") assetType = "etf";
+        else if (qt === "MUTUALFUND") assetType = "fund";
+        else if (qt === "CRYPTOCURRENCY") assetType = "crypto";
 
-      const symbol = stripSuffix(q.symbol);
+        const symbol = normalizeSearchSymbol(q.symbol, market);
+        const searchPrice: number =
+          typeof q.regularMarketPrice === "number" && q.regularMarketPrice > 0
+            ? q.regularMarketPrice
+            : 0;
 
-      // Yahoo search results frequently include the live market price — use it
-      // directly so we avoid a second network round-trip (which can hit CORS/429).
-      const searchPrice: number =
-        typeof q.regularMarketPrice === "number" && q.regularMarketPrice > 0
-          ? q.regularMarketPrice
-          : 0;
-
-      out.push({
-        symbol,
-        name:      rawName,
-        enName:    market !== "A" ? (q.longname || q.shortname || undefined) : undefined,
-        market,
-        assetType,
-        currency:  CURRENCY_BY_MARKET[market],
-        price:     searchPrice,
-        priceReady: searchPrice > 0,
-        exchange:  q.exchDisp || q.exchange || undefined,
-        source:    "live",
-      });
+        out.push({
+          symbol,
+          name: rawName,
+          enName: market !== "A" ? (q.longname || q.shortname || undefined) : undefined,
+          market,
+          assetType,
+          currency: CURRENCY_BY_MARKET[market],
+          price: searchPrice,
+          priceReady: searchPrice > 0,
+          exchange: q.exchDisp || q.exchange || undefined,
+          source: "live",
+        });
+      }
+      return out;
+    } catch {
+      clear();
     }
-    return out;
-  } catch {
-    clear();
   }
   return [];
 }
@@ -612,37 +632,45 @@ function mergeResult(current: LiveResult, incoming: LiveResult): LiveResult {
   };
 }
 
-async function fetchYahooLivePrice(symbol: string, market: Market) {
+async function fetchYahooLiveSecurity(symbol: string, market: Market) {
   const ticker = toYahooTicker(symbol, market);
-  const [signal, clear] = mkAbort(6000);
-  try {
-    const path =
-      `/v8/finance/chart/${encodeURIComponent(ticker)}` +
-      `?interval=1d&range=1d&includePrePost=${market === "US" ? "true" : "false"}&_=${Date.now()}`;
-    const res = await fetch(yahooUrl(path), { signal, cache: "no-store" });
-    clear();
-    if (!res.ok) return null;
+  const path =
+    `/v8/finance/chart/${encodeURIComponent(ticker)}` +
+    `?interval=1m&range=1d&includePrePost=${market === "US" ? "true" : "false"}&_=${Date.now()}`;
+  for (const url of yahooUrls(path)) {
+    const [signal, clear] = mkAbort(6000);
+    try {
+      const res = await fetch(url, { signal, cache: "no-store" });
+      clear();
+      if (!res.ok) continue;
 
-    const json = await res.json();
-    const meta = json?.chart?.result?.[0]?.meta;
-    const resolved = resolveYahooUsPrice(meta, market);
-    const price = resolved.price;
-    if (!(price > 0)) return null;
+      const json = await res.json();
+      const meta = json?.chart?.result?.[0]?.meta;
+      const resolved = resolveYahooUsPrice(meta, market);
+      const price = resolved.price;
+      if (!(price > 0)) continue;
 
-    return {
-      price,
-      change: resolved.change,
-      changePercent: resolved.changePercent,
-      prevClose: resolved.prevClose,
-      high: resolved.high,
-      low: resolved.low,
-      volume: resolved.volume,
-      currency: String(meta?.currency || CURRENCY_BY_MARKET[market] || "USD"),
-    };
-  } catch {
-    clear();
-    return null;
+      return {
+        price,
+        change: resolved.change,
+        changePercent: resolved.changePercent,
+        prevClose: resolved.prevClose,
+        high: resolved.high,
+        low: resolved.low,
+        volume: resolved.volume,
+        currency: String(meta?.currency || CURRENCY_BY_MARKET[market] || "USD"),
+        name: String(meta?.longName || meta?.shortName || ticker),
+        exchange: String(meta?.fullExchangeName || meta?.exchangeName || ""),
+      };
+    } catch {
+      clear();
+    }
   }
+  return null;
+}
+
+async function fetchYahooLivePrice(symbol: string, market: Market) {
+  return fetchYahooLiveSecurity(symbol, market);
 }
 
 export async function fetchCnFundOfficialNav(code: string): Promise<number | null> {
@@ -717,37 +745,36 @@ export async function fetchCnFundOfficialHistory(code: string, pageSize = 60) {
 }
 
 export async function fetchCryptoPrice(symbol: string, coinId?: string) {
-  const id = coinId?.trim().toLowerCase();
-  if (!id) {
-    const binance = await fetchBinanceCryptoQuote(symbol);
-    if (binance) {
-      return {
-        price: binance.price,
-        change: binance.change,
-        changePercent: binance.changePercent,
-        prevClose: binance.prevClose,
-        high: binance.high,
-        low: binance.low,
-        volume: binance.volume,
-        currency: binance.currency,
-      };
-    }
-
-    const okx = await fetchOkxCryptoQuote(symbol);
-    if (okx) {
-      return {
-        price: okx.price,
-        change: okx.change,
-        changePercent: okx.changePercent,
-        prevClose: okx.prevClose,
-        high: okx.high,
-        low: okx.low,
-        volume: okx.volume,
-        currency: okx.currency,
-      };
-    }
-    return null;
+  const binance = await fetchBinanceCryptoQuote(symbol);
+  if (binance) {
+    return {
+      price: binance.price,
+      change: binance.change,
+      changePercent: binance.changePercent,
+      prevClose: binance.prevClose,
+      high: binance.high,
+      low: binance.low,
+      volume: binance.volume,
+      currency: binance.currency,
+    };
   }
+
+  const okx = await fetchOkxCryptoQuote(symbol);
+  if (okx) {
+    return {
+      price: okx.price,
+      change: okx.change,
+      changePercent: okx.changePercent,
+      prevClose: okx.prevClose,
+      high: okx.high,
+      low: okx.low,
+      volume: okx.volume,
+      currency: okx.currency,
+    };
+  }
+
+  const id = coinId?.trim().toLowerCase();
+  if (!id) return null;
 
   const [signal, clear] = mkAbort(6000);
   try {
@@ -779,34 +806,6 @@ export async function fetchCryptoPrice(symbol: string, coinId?: string) {
     };
   } catch {
     clear();
-    const binance = await fetchBinanceCryptoQuote(symbol);
-    if (binance) {
-      return {
-        price: binance.price,
-        change: binance.change,
-        changePercent: binance.changePercent,
-        prevClose: binance.prevClose,
-        high: binance.high,
-        low: binance.low,
-        volume: binance.volume,
-        currency: binance.currency,
-      };
-    }
-
-    const okx = await fetchOkxCryptoQuote(symbol);
-    if (okx) {
-      return {
-        price: okx.price,
-        change: okx.change,
-        changePercent: okx.changePercent,
-        prevClose: okx.prevClose,
-        high: okx.high,
-        low: okx.low,
-        volume: okx.volume,
-        currency: okx.currency,
-      };
-    }
-
     return null;
   }
 }
@@ -944,29 +943,66 @@ async function enrichSearchResults(query: string, results: LiveResult[]) {
   return filterSearchResults(query, enriched);
 }
 
-export async function searchSecuritiesLive(query: string): Promise<LiveResult[]> {
+export async function searchSecuritiesLive(query: string, marketFilter?: Market): Promise<LiveResult[]> {
   const q = query.trim();
   if (!q) return [];
 
-  const cacheKey = q.toUpperCase();
+  const filterKey = marketFilter ?? "ALL";
+  const cacheKey = `${q.toUpperCase()}::${filterKey}`;
   const cached = getCache(cacheKey);
   if (cached) return cached;
 
+  // Gate data sources by the requested market so we avoid cross-market
+  // ambiguity (e.g. a 4-digit code matching both HK and JP tickers).
+  const wantCrypto = !marketFilter || marketFilter === "CRYPTO";
+  const wantFund   = !marketFilter || marketFilter === "FUND";
+  const wantRegional = !marketFilter || marketFilter === "US" || marketFilter === "HK"
+    || marketFilter === "A" || marketFilter === "JP" || marketFilter === "BOND";
+
   const [eastMoneyResults, yahooResults, cryptoResults, fundResults] = await Promise.allSettled([
-    searchEastMoneySecurities(q),
-    yahooSearch(q),
-    coinGeckoSearch(q),
-    eastMoneyFundSearch(q),
+    wantRegional ? searchEastMoneySecurities(q) : Promise.resolve([] as LiveResult[]),
+    wantRegional || wantFund ? yahooSearch(q) : Promise.resolve([] as LiveResult[]),
+    wantCrypto ? coinGeckoSearch(q) : Promise.resolve([] as LiveResult[]),
+    wantFund ? eastMoneyFundSearch(q) : Promise.resolve([] as LiveResult[]),
   ]);
 
-  const merged = sortSearchResults(q, mergeSearchResults(
+  const mergedResults = mergeSearchResults(
     eastMoneyResults.status === "fulfilled" ? eastMoneyResults.value.map((item) => ({ ...item, source: "live" as const })) : [],
     yahooResults.status === "fulfilled" ? yahooResults.value : [],
     cryptoResults.status === "fulfilled" ? cryptoResults.value : [],
     fundResults.status === "fulfilled" ? fundResults.value : [],
-  )).slice(0, 12);
+  );
 
-  const hydrated = sortSearchResults(q, await enrichSearchResults(q, merged));
+  // Yahoo search is more aggressively rate-limited than its chart endpoint.
+  // For an exact four-digit ticker with no exact result, probe Tokyo directly so
+  // a live Japan quote remains searchable even when /v1/finance/search is down.
+  if (
+    (!marketFilter || marketFilter === "JP")
+    && /^\d{4}$/.test(q)
+    && !mergedResults.some((item) => item.market === "JP" && item.symbol.toUpperCase() === q.toUpperCase())
+  ) {
+    const japan = await fetchYahooLiveSecurity(q, "JP");
+    if (japan?.price && japan.price > 0) {
+      mergedResults.push({
+        symbol: q,
+        name: japan.name,
+        enName: japan.name,
+        market: "JP",
+        assetType: "stock",
+        currency: japan.currency || "JPY",
+        price: japan.price,
+        priceReady: true,
+        exchange: japan.exchange || "Tokyo Stock Exchange",
+        source: "live",
+      });
+    }
+  }
+
+  const filtered = marketFilter
+    ? mergedResults.filter((item) => item.market === marketFilter)
+    : mergedResults;
+
+  const hydrated = sortSearchResults(q, await enrichSearchResults(q, sortSearchResults(q, filtered).slice(0, 12)));
 
   setCache(cacheKey, hydrated);
   return hydrated;

@@ -5,6 +5,7 @@ import { useApp } from "../context/AppContext";
 import { SparklineChart } from "../components/SparklineChart";
 import { fetchDetailChart } from "../services/quoteApi";
 import type { ChartPoint } from "../services/quoteApi";
+import { mapWithConcurrency } from "../services/priceRefresher";
 import { emitQuoteSync, isSameQuoteTarget, subscribeQuoteSync } from "../services/quoteSync";
 import { formatFixedNumber } from "../utils/numberFormat";
 import { categoryLabel, t } from "../i18n";
@@ -42,25 +43,6 @@ function hasSparklinePoints(points: ChartPoint[]) {
 
 function timeLabel(date = new Date()) {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
-}
-
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  limit: number,
-  mapper: (item: T, index: number) => Promise<R>,
-) {
-  const results = new Array<R>(items.length);
-  let nextIndex = 0;
-  const workerCount = Math.min(Math.max(1, limit), items.length);
-  await Promise.all(Array.from({ length: workerCount }, async () => {
-    while (nextIndex < items.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      const item = items[index];
-      if (item !== undefined) results[index] = await mapper(item, index);
-    }
-  }));
-  return results;
 }
 
 const INDICES: IndexEntry[] = [
@@ -256,7 +238,7 @@ type MarketPageCache = {
 
 let marketPageCache: MarketPageCache | null = null;
 
-const MARKET_PAGE_CACHE_KEY = "asset-helper:market-page-cache:v1";
+const MARKET_PAGE_CACHE_KEY = "asset-helper:market-page-cache:v2";
 const FALLBACK_MARKET_PAGE_CACHE_TTL = 5 * 60 * 1000;
 
 function isValidCachedIndexEntry(entry: unknown): entry is IndexEntry {
@@ -492,7 +474,7 @@ export function Market() {
     if (showSpinner) setRefreshing(true);
     try {
       const source = current.length ? current : INDICES;
-      const updated = await mapWithConcurrency(source, 6, async (entry) => {
+      const settled = await mapWithConcurrency<IndexEntry, IndexEntry>(source, 6, async (entry) => {
         try {
           const chart = await fetchDetailChart(entry.yahooSymbol, marketForEntry(entry), "fs", force);
           const q = chart.quote;
@@ -551,6 +533,11 @@ export function Market() {
           };
         }
       });
+      // mapWithConcurrency returns PromiseSettledResult<R>[] — keep only fulfilled
+      // results so a single rejection can't blank out the whole market grid.
+      const updated = settled
+        .filter((result): result is PromiseFulfilledResult<IndexEntry> => result.status === "fulfilled")
+        .map((result) => result.value);
       setIndices(updated);
       writeMarketPageCache({
         indices: updated,

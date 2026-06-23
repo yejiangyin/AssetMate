@@ -6,7 +6,7 @@ import {
 } from "lucide-react";
 import { DCAPlan, HoldingAdjustmentInput, HoldingInput, useApp } from "../context/AppContext";
 import { Holding, Group } from "../data/mockData";
-import { searchSecuritiesLive, fetchLivePrice, fetchCnFundTradeStatus, LiveResult } from "../services/securitiesApi";
+import { searchSecuritiesLive, fetchLivePrice, fetchCnFundTradeStatus, LiveResult, Market } from "../services/securitiesApi";
 import { fetchTencentTradeStatus } from "../services/tencentQuote";
 import { toYahooSymbol } from "../services/quoteApi";
 import { FX, toCNY } from "../services/priceRefresher";
@@ -19,6 +19,7 @@ import { canSaveHoldingForm } from "../utils/holdingForm";
 import {
   assetTypeLabel,
   groupName,
+  marketLabel,
   t,
   translateTradeText,
 } from "../i18n";
@@ -47,6 +48,7 @@ type AssetType = typeof assetTypeOptions[number]["value"];
 
 const colorOptions = ["#4F9CF9","#F24E4E","#31D08B","#F59E0B","#8B5CF6","#EC4899","#14B8A6","#F97316"];
 const DEFAULT_GROUP_COLOR = "#4F9CF9";
+const MARKET_SCOPE_OPTIONS: Market[] = ["US", "HK", "A", "JP", "FUND", "CRYPTO", "BOND"];
 
 const blankForm = (): HoldingInput => ({
   groupId: "", symbol: "", name: "", market: "US", assetType: "",
@@ -152,9 +154,9 @@ function holdingUnitPriceDecimals(h: Holding) {
 }
 
 /* ─── tiny primitives ─────────────────────────────────── */
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, children, className }: { label: string; children: React.ReactNode; className?: string }) {
   return (
-    <div>
+    <div className={className}>
       <p style={{ color: "var(--text-muted)", fontSize: 11, marginBottom: 4 }}>{label}</p>
       {children}
     </div>
@@ -174,11 +176,11 @@ function Input({ value, onChange, placeholder, type = "text" }: {
   );
 }
 
-function Sel<T extends string>({ value, onChange, options }: {
-  value: T; onChange: (v: T) => void; options: { value: T; label: string }[];
+function Sel<T extends string>({ value, onChange, options, style }: {
+  value: T; onChange: (v: T) => void; options: { value: T; label: string }[]; style?: React.CSSProperties;
 }) {
   return (
-    <div style={{ position: "relative" }}>
+    <div style={{ position: "relative", ...style }}>
       <select value={value} onChange={(e) => onChange(e.target.value as T)}
         style={{
           width: "100%", height: 38, background: "var(--bg-card)",
@@ -195,9 +197,10 @@ function Sel<T extends string>({ value, onChange, options }: {
 
 /* ─── Autocomplete with live API ─────────────────────── */
 function AutoInput({
-  value, onChange, onSelect, placeholder,
+  value, onChange, onSelect, placeholder, marketFilter,
 }: {
   value: string; onChange: (v: string) => void; onSelect: (r: LiveResult) => void | Promise<void>; placeholder?: string;
+  marketFilter?: Market;
 }) {
   const { language } = useApp();
   const text = t(language);
@@ -208,11 +211,11 @@ function AutoInput({
   const wrapRef  = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  const doSearch = useCallback(async (q: string) => {
+  const doSearch = useCallback(async (q: string, filter?: Market) => {
     if (!q.trim()) { setHits([]); setOpen(false); return; }
     setLoading(true);
     try {
-      const results = await searchSecuritiesLive(q);
+      const results = await searchSecuritiesLive(q, filter);
       setHits(results); setOpen(results.length > 0);
       if (results.length) setApiOk(results[0]?.source === "live");
     } catch { setHits([]); setApiOk(false); }
@@ -222,8 +225,15 @@ function AutoInput({
   const handleChange = (v: string) => {
     onChange(v);
     clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => doSearch(v), 350);
+    timerRef.current = setTimeout(() => doSearch(v, marketFilter), 350);
   };
+
+  // Re-run search when the market filter changes so results stay in scope.
+  useEffect(() => {
+    if (!value.trim()) return;
+    void doSearch(value, marketFilter);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [marketFilter]);
 
   useEffect(() => {
     const close = (e: MouseEvent) => {
@@ -351,6 +361,12 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
   const [securityQuery, setSecurityQuery] = useState(() =>
     initial.symbol && initial.name ? `${initial.name} (${initial.symbol})` : [initial.symbol, initial.name].filter(Boolean).join(" ")
   );
+  // Market scope narrows the live search to a single market so identical
+  // tickers from different exchanges (e.g. HK 00700 vs JP 7001) don't get
+  // mixed together. Defaults to the holding's market when editing.
+  const [marketScope, setMarketScope] = useState<Market | "">(() =>
+    isEdit && (MARKET_SCOPE_OPTIONS as string[]).includes(initial.market) ? (initial.market as Market) : ""
+  );
   const set = <K extends keyof HoldingInput>(k: K, v: HoldingInput[K]) =>
     setForm((f) => ({ ...f, [k]: v }));
 
@@ -377,6 +393,29 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
     { value: "reinvest", label: text.holdings.dividendReinvest },
   ];
 
+  const marketScopeOptions = useMemo(() => [
+    { value: "" as Market | "", label: text.holdings.allMarkets },
+    ...MARKET_SCOPE_OPTIONS.map((m) => ({ value: m as Market | "", label: marketLabel(m, language) })),
+  ], [language, text.holdings.allMarkets]);
+
+  const handleMarketScopeChange = (next: Market | "") => {
+    setMarketScope(next);
+    // Clear the previously selected security so stale cross-market data
+    // doesn't get saved alongside the new scope.
+    setSecurityQuery("");
+    setForm((f) => ({
+      ...f,
+      symbol: "",
+      name: "",
+      assetType: "",
+      currency: "",
+      currentPrice: 0,
+      autoTradeStatus: null,
+      autoTradeStatusNote: "",
+      autoTradeStatusSource: null,
+    }));
+  };
+
   const handleSelect = (r: LiveResult) => {
     const normalizedType = normalizeHoldingType(r.symbol, r.name, r.market, r.assetType);
     const normalizedSymbol = normalizeHoldingSymbol(r.symbol, normalizedType.market);
@@ -395,16 +434,17 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
       autoTradeStatusSource: null,
     }));
 
-    if (r.price <= 0) {
-      void fetchLivePrice(r.symbol, r.market, r.coinId).then((quote) => {
-        if (!quote || quote.price <= 0) return;
-        setForm((f) => (
-          f.symbol === normalizedSymbol && f.market === normalizedType.market
-            ? { ...f, currentPrice: quote.price, currency: quote.currency || f.currency }
-            : f
-        ));
-      }).catch(() => null);
-    }
+    // Search endpoints may include delayed or previous-session prices. Keep that
+    // value for immediate feedback, then always verify it through the live quote
+    // path before the user saves the holding.
+    void fetchLivePrice(r.symbol, r.market, r.coinId).then((quote) => {
+      if (!quote || quote.price <= 0) return;
+      setForm((f) => (
+        f.symbol === normalizedSymbol && f.market === normalizedType.market
+          ? { ...f, currentPrice: quote.price, currency: quote.currency || f.currency }
+          : f
+      ));
+    }).catch(() => null);
 
     const market = normalizedType.market;
     const sym = normalizedSymbol;
@@ -444,10 +484,17 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
         <div className="overflow-y-auto px-4 py-3 flex flex-col gap-3" style={{ scrollbarWidth: "none" }}>
           <p style={{ color: "#4F9CF9", fontSize: 11, fontWeight: 600 }}>{text.holdings.basicInfo}</p>
 
-          <Field label={text.holdings.security}>
-            <AutoInput value={securityQuery} onChange={setSecurityQuery}
-              onSelect={handleSelect} placeholder={text.holdings.searchSecurityPlaceholder} />
-          </Field>
+          <div className="flex gap-2 items-end">
+            <Field label={text.holdings.marketScope}>
+              <Sel value={marketScope} onChange={(v) => handleMarketScopeChange(v)} options={marketScopeOptions}
+                style={{ width: 96, flexShrink: 0 }} />
+            </Field>
+            <Field label={text.holdings.security} className="flex-1 min-w-0">
+              <AutoInput value={securityQuery} onChange={setSecurityQuery}
+                onSelect={handleSelect} placeholder={text.holdings.searchSecurityPlaceholder}
+                marketFilter={marketScope || undefined} />
+            </Field>
+          </div>
 
           {form.autoTradeStatus && form.autoTradeStatus !== "normal" && (
             <div className="rounded-lg px-2.5 py-2" style={{
