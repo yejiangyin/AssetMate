@@ -68,6 +68,9 @@ export function normalizeHolding(h: Holding): Holding {
   const fundBuyConfirmDays = Number.isInteger(h.fundBuyConfirmDays) && h.fundBuyConfirmDays! >= 0 && h.fundBuyConfirmDays! <= 30
     ? h.fundBuyConfirmDays
     : undefined;
+  // totalPnl includes cash dividends received while holding — dividends are
+  // realized income even if the position is still open.
+  const totalPnlWithDividend = totalPnl + cashDividendTotal;
   return {
     ...h,
     symbol: normalizedSymbol,
@@ -86,13 +89,12 @@ export function normalizeHolding(h: Holding): Holding {
     autoCorporateActionSince: h.autoCorporateActionSince ?? "",
     corporateActions,
     marketValue,
-    totalPnl,
-    totalPnlRate: costBasis > 0 ? totalPnl / costBasis : 0,
+    totalPnl: totalPnlWithDividend,
+    totalPnlRate: costBasis > 0 ? totalPnlWithDividend / costBasis : 0,
   };
 }
 
 /* ─── metrics ───────────────────────────────────────── */
-
 export function recomputeHoldingMetrics(
   holding: Holding,
   patch: Partial<Holding> = {},
@@ -102,7 +104,8 @@ export function recomputeHoldingMetrics(
   const marketValue = next.quantity * next.currentPrice;
   const costBasis = next.quantity * next.costPrice;
   const cashDividendTotal = Number.isFinite(next.cashDividendTotal) ? Math.max(0, next.cashDividendTotal ?? 0) : 0;
-  const totalPnl = marketValue - costBasis;
+  // totalPnl includes cash dividends received while holding.
+  const totalPnl = marketValue - costBasis + cashDividendTotal;
   return {
     ...next,
     cashDividendTotal,

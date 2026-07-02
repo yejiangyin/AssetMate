@@ -82,10 +82,17 @@ describe("normalizeHolding", () => {
     assert.equal(normalized.cashDividendTotal, 0);
     assert.deepEqual(normalized.corporateActions, []);
   });
+
+  test("includes cash dividends in unrealized total P/L", () => {
+    // 10 shares, cost 1, current 2 → price gain 10; dividends 5 → total 15
+    const normalized = normalizeHolding(holding({ cashDividendTotal: 5 }));
+    assert.equal(normalized.totalPnl, 15);
+    assert.equal(normalized.totalPnlRate, 1.5); // 15 / 10
+  });
 });
 
 describe("applyCorporateAction", () => {
-  test("records cash dividends without changing holding P/L, quantity, or cost", () => {
+  test("records cash dividends and includes them in total P/L", () => {
     const adjusted = applyCorporateAction(holding(), {
       type: "cash_dividend",
       date: "2026-06-04",
@@ -95,7 +102,8 @@ describe("applyCorporateAction", () => {
     assert.equal(adjusted.quantity, 10);
     assert.equal(adjusted.costPrice, 1);
     assert.equal(adjusted.cashDividendTotal, 3);
-    assert.equal(adjusted.totalPnl, 10);
+    // totalPnl = (marketValue - costBasis) + cashDividendTotal = 10 + 3 = 13
+    assert.equal(adjusted.totalPnl, 13);
     assert.equal(adjusted.corporateActions?.length, 1);
   });
 

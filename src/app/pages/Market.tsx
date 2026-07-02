@@ -8,6 +8,7 @@ import type { ChartPoint } from "../services/quoteApi";
 import { mapWithConcurrency } from "../services/priceRefresher";
 import { emitQuoteSync, isSameQuoteTarget, subscribeQuoteSync } from "../services/quoteSync";
 import { formatFixedNumber } from "../utils/numberFormat";
+import { filterLatestIntradayDay } from "../utils/intradayViewport";
 import { categoryLabel, t } from "../i18n";
 
 /* ─── static market catalogue ──────────────────────────
@@ -238,7 +239,7 @@ type MarketPageCache = {
 
 let marketPageCache: MarketPageCache | null = null;
 
-const MARKET_PAGE_CACHE_KEY = "asset-helper:market-page-cache:v2";
+const MARKET_PAGE_CACHE_KEY = "asset-helper:market-page-cache:v6";
 const FALLBACK_MARKET_PAGE_CACHE_TTL = 5 * 60 * 1000;
 
 function isValidCachedIndexEntry(entry: unknown): entry is IndexEntry {
@@ -371,7 +372,7 @@ function IndexCard({ entry, catColor, onPress }: {
     : (entry.changeRate ?? 0);
   const sparklineData = useMemo(
     () => entry.detailPoints?.length
-      ? sparklineDataFromPoints(entry.detailPoints)
+      ? sparklineDataFromPoints(filterLatestIntradayDay(entry.detailPoints, marketForEntry(entry), entry.yahooSymbol))
       : entry.data,
     [entry],
   );
@@ -476,7 +477,8 @@ export function Market() {
       const source = current.length ? current : INDICES;
       const settled = await mapWithConcurrency<IndexEntry, IndexEntry>(source, 6, async (entry) => {
         try {
-          const chart = await fetchDetailChart(entry.yahooSymbol, marketForEntry(entry), "fs", force);
+          const market = marketForEntry(entry);
+          const chart = await fetchDetailChart(entry.yahooSymbol, market, "fs", force);
           const q = chart.quote;
           const nextValue = q.price > 0 ? q.price : null;
           const normalizedChange = Number.isFinite(q.change) ? q.change : null;
@@ -487,7 +489,7 @@ export function Market() {
             : null;
           emitQuoteSync({
             symbol: entry.yahooSymbol,
-            market: marketForEntry(entry),
+            market,
             range: "fs",
             source: "market",
             quote: {
@@ -498,14 +500,15 @@ export function Market() {
             points: chart.points,
             refreshedAt: Date.now(),
           });
-          const hasChart = hasSparklinePoints(chart.points);
+          const sparklinePoints = filterLatestIntradayDay(chart.points, market, entry.yahooSymbol);
+          const hasChart = hasSparklinePoints(sparklinePoints);
           const nextEntry = {
             ...entry,
             currentValue: nextValue,
             changeAmount: normalizedChange,
             changeRate: normalizedChangeRate,
             data: hasChart
-              ? sparklineDataFromPoints(chart.points)
+              ? sparklineDataFromPoints(sparklinePoints)
               : [],
             detailPoints: hasChart ? chart.points : entry.detailPoints,
             chartAvailable: hasChart,
@@ -604,16 +607,17 @@ export function Market() {
             ? Math.abs(payload.quote.changePercent) * (normalizedChange >= 0 ? 1 : -1)
             : payload.quote.changePercent)
           : entry.changeRate;
-        const hasChart = payload.range === "fs" && payload.points
-          ? hasSparklinePoints(payload.points)
-          : false;
+        const sparklinePoints = payload.range === "fs" && payload.points
+          ? filterLatestIntradayDay(payload.points, payload.market, payload.symbol)
+          : [];
+        const hasChart = hasSparklinePoints(sparklinePoints);
         return {
           ...entry,
           currentValue: payload.quote.price > 0 ? payload.quote.price : entry.currentValue,
           changeAmount: normalizedChange,
           changeRate: normalizedChangeRate,
           data: hasChart
-            ? sparklineDataFromPoints(payload.points ?? [])
+            ? sparklineDataFromPoints(sparklinePoints)
             : entry.data,
           detailPoints: hasChart
             ? payload.points

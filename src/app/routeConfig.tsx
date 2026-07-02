@@ -1,10 +1,13 @@
+import { lazy, Suspense, type ComponentType, type LazyExoticComponent } from "react";
 import { Navigate } from "react-router";
 import { Layout }    from "./components/Layout";
-import { Dashboard } from "./pages/Dashboard";
-import { Holdings }  from "./pages/Holdings";
-import { Settings }  from "./pages/Settings";
-import { Market }    from "./pages/Market";
 import { appText } from "./i18n";
+
+const Dashboard = lazy(() => import("./pages/Dashboard").then((module) => ({ default: module.Dashboard })));
+const Holdings = lazy(() => import("./pages/Holdings").then((module) => ({ default: module.Holdings })));
+const Market = lazy(() => import("./pages/Market").then((module) => ({ default: module.Market })));
+const Backtest = lazy(() => import("./pages/Backtest").then((module) => ({ default: module.Backtest })));
+const Settings = lazy(() => import("./pages/Settings").then((module) => ({ default: module.Settings })));
 
 function readRouteLanguage() {
   try {
@@ -46,16 +49,39 @@ function RouteErrorFallback() {
   );
 }
 
+function RouteLoadingFallback() {
+  const text = readRouteLanguage() === "en" ? "Loading..." : "加载中...";
+  return (
+    <div
+      className="flex h-full items-center justify-center"
+      style={{ background: "var(--bg, #EEF4FB)", color: "var(--text-secondary, #64748B)", fontSize: 13, fontWeight: 700 }}
+    >
+      {text}
+    </div>
+  );
+}
+
+function withSuspense(Component: LazyExoticComponent<ComponentType>) {
+  return function SuspendedRoute() {
+    return (
+      <Suspense fallback={<RouteLoadingFallback />}>
+        <Component />
+      </Suspense>
+    );
+  };
+}
+
 export const appRoutes = [
   {
     path: "/",
     Component: Layout,
     errorElement: <RouteErrorFallback />,
     children: [
-      { index: true,      Component: Dashboard },
-      { path: "holdings", Component: Holdings  },
-      { path: "market",   Component: Market    },
-      { path: "settings", Component: Settings  },
+      { index: true,      Component: withSuspense(Dashboard) },
+      { path: "holdings", Component: withSuspense(Holdings)  },
+      { path: "market",   Component: withSuspense(Market)    },
+      { path: "backtest", Component: withSuspense(Backtest)  },
+      { path: "settings", Component: withSuspense(Settings)  },
       { path: "*",        element: <Navigate to="/" replace /> },
     ],
   },

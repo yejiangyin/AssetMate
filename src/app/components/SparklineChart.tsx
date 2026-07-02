@@ -1,18 +1,27 @@
-import { useId } from "react";
+import { useId, type ReactNode } from "react";
 import { AreaChart, Area, ResponsiveContainer, Tooltip, YAxis } from "recharts";
 import { formatFixedNumber } from "../utils/numberFormat";
 
+type SparklineDatum = {
+  v?: number;
+  [key: string]: unknown;
+};
+
 interface SparklineChartProps {
-  data: { v?: number }[];
+  data: SparklineDatum[];
   color: string;
   height?: number;
+  tooltip?: (point: SparklineDatum) => ReactNode;
 }
 
-export function SparklineChart({ data, color, height = 36 }: SparklineChartProps) {
+export function SparklineChart({ data, color, height = 36, tooltip }: SparklineChartProps) {
   const uid = useId().replace(/:/g, "");
   const gradId = `grad-${uid}`;
   const safeData = data
-    .map((point) => ({ v: typeof point.v === "number" && Number.isFinite(point.v) ? point.v : undefined }))
+    .map((point) => ({
+      ...point,
+      v: typeof point.v === "number" && Number.isFinite(point.v) ? point.v : undefined,
+    }))
     .filter((point) => point.v != null);
   if (safeData.length === 0) {
     return <div style={{ width: "100%", height }} />;
@@ -51,7 +60,9 @@ export function SparklineChart({ data, color, height = 36 }: SparklineChartProps
                   pointerEvents: "none",
                 }}
               >
-                {formatFixedNumber(Number(payload[0]?.value))}
+                {tooltip
+                  ? tooltip(payload[0]?.payload as SparklineDatum)
+                  : formatFixedNumber(Number(payload[0]?.value))}
               </div>
             ) : null
           }

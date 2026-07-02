@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useId, useState, useCallback, useRef } from "react";
-import { RefreshCw, Eye, EyeOff, TrendingUp } from "lucide-react";
+import { RefreshCw, Eye, EyeOff, TrendingUp, PanelRightClose, PanelRightOpen } from "lucide-react";
 import { useApp } from "../context/AppContext";
 import { motion } from "motion/react";
 import { AreaChart, Area, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
@@ -8,6 +8,7 @@ import { fetchRecentDailyChart, toYahooSymbol } from "../services/quoteApi";
 import { mapWithConcurrency, toCNY } from "../services/priceRefresher";
 import { BrandMark } from "../components/BrandMark";
 import { formatExactMoney, formatPercent } from "../utils/numberFormat";
+import { getExtensionViewMode, openExtensionMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
 import { getMarketBadge } from "../utils/marketBadge";
 import { groupName, t } from "../i18n";
 
@@ -35,12 +36,13 @@ type EstimatedAssetSeries = {
 };
 
 function fmtPnl(v: number, priv: boolean, c: string) {
-  const sign = v >= 0 ? "+" : "-";
+  const sign = v > 0 ? "+" : v < 0 ? "-" : "";
   return <span style={{ color: c, whiteSpace: "nowrap" }}>{priv ? `${sign}--` : `${sign}${formatExactMoney(Math.abs(v), "CNY", 2)}`}</span>;
 }
 
 function fmtRate(v: number, c: string, priv: boolean) {
-  return <span style={{ color: c, fontSize: 12 }}>{priv ? "--" : formatPercent(v)}</span>;
+  const formatted = v === 0 ? "0.0000%" : formatPercent(v);
+  return <span style={{ color: c, fontSize: 12 }}>{priv ? "--" : formatted}</span>;
 }
 
 
@@ -108,7 +110,7 @@ function writeCachedAssetSeries(cacheKey: string, points: AssetSeriesPoint[]) {
 }
 
 export function Dashboard() {
-  const { stats, holdings, groups, privacyMode, togglePrivacy, refresh, isRefreshing, lastRefreshed, profitColor, openDetail, tc, assetSnapshots, language } = useApp();
+  const { stats, holdings, groups, privacyMode, togglePrivacy, refresh, isRefreshing, lastRefreshed, profitColor, openDetail, tc, assetSnapshots, language, setDefaultOpenMode } = useApp();
   const text = t(language);
   const navigate = useNavigate();
   const heroGradId = useId().replace(/:/g, "");
@@ -289,8 +291,10 @@ export function Dashboard() {
   }, [freshCachedAssetSeries, staleCachedAssetSeries, estimatedAssetSeries, hasCompleteSnapshotSeries, seriesCacheKey, snapshotSeries]);
 
   const todayColor = profitColor(stats.todayPnl);
-  const cumulColor = profitColor(stats.cumulativePnl);
-  const costBasis  = stats.totalAsset - stats.cumulativePnl;
+  const cumulColor = profitColor(stats.unrealizedPnl);
+  const realizedColor = profitColor(stats.realizedPnl);
+  const totalColor = profitColor(stats.totalInvestmentPnl);
+  const costBasis  = stats.totalAsset - stats.unrealizedPnl;
 
   /* ── asset allocation by holding group, same as Holdings page ── */
   const alloc = useMemo(() => {
@@ -347,6 +351,36 @@ export function Dashboard() {
     void refresh();
   }, [refresh, dashboardRefreshing]);
 
+  const isSidePanel = getExtensionViewMode() === "sidepanel";
+  const switchTitle = isSidePanel
+    ? (language === "en" ? "Switch to popup" : "切换为弹窗")
+    : (language === "en" ? "Switch to side panel" : "切换为右侧面板");
+  const handleSwitchView = useCallback(() => {
+    const mode: ExtensionOpenMode = isSidePanel ? "popup" : "sidepanel";
+    // Persist as the default open mode so the chosen view sticks for next time.
+    setDefaultOpenMode(mode);
+    if (isSidePanel) {
+      // Side panel → popup: just close the side panel. Don't call openPopup
+      // (it opens a popup that immediately loses focus and closes). The
+      // default mode is now popup, so the user gets the popup next time they
+      // click the toolbar icon.
+      void syncExtensionOpenMode(mode).finally(() => {
+        if (typeof window !== "undefined") {
+          try { window.close(); } catch { /* ignore */ }
+        }
+      });
+    } else {
+      // Popup → side panel: open the side panel then close the popup.
+      void openExtensionMode(mode).then(() => {
+        if (typeof window !== "undefined") {
+          window.setTimeout(() => {
+            try { window.close(); } catch { /* ignore */ }
+          }, 150);
+        }
+      });
+    }
+  }, [isSidePanel, setDefaultOpenMode]);
+
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {/* Header */}
@@ -362,6 +396,14 @@ export function Dashboard() {
           <span className="text-tm text-[11px]">{lastRefreshed}</span>
           <button onClick={togglePrivacy} className="flex items-center justify-center rounded-lg size-[30px] bg-app-card">
             {privacyMode ? <EyeOff size={14} color="var(--text-secondary)" /> : <Eye size={14} color="var(--text-secondary)" />}
+          </button>
+          <button onClick={handleSwitchView}
+            className="flex items-center justify-center rounded-lg size-[30px] bg-app-card"
+            title={switchTitle}
+            aria-label={switchTitle}>
+            {isSidePanel
+              ? <PanelRightClose size={14} color="var(--text-secondary)" />
+              : <PanelRightOpen size={14} color="var(--text-secondary)" />}
           </button>
           <button onClick={handleRefresh}
             className="flex items-center justify-center rounded-lg size-[30px] bg-app-card"
@@ -384,8 +426,9 @@ export function Dashboard() {
       {/* Hero Card */}
       <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}
         className="mx-3 mt-3 rounded-2xl p-4 bg-app-surface border border-app-accent/15">
-        <div className="flex items-start justify-between">
-          <div>
+        {/* ── Row 1: total asset (primary) + today P/L (accent) ── */}
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
             <p className="text-tm text-[11px] mb-0.5">{text.dashboard.totalAsset}</p>
             <p className="text-tp text-[26px] font-bold tracking-tighter leading-tight">
               {privacyMode ? "¥ ******" : formatExactMoney(stats.totalAsset, "CNY", 2)}
@@ -394,31 +437,39 @@ export function Dashboard() {
               ≈ {privacyMode ? "***" : formatExactMoney(stats.usdEquiv, "USD", 2)} USD
             </p>
           </div>
-          <div className="inline-flex items-center gap-1 rounded-full px-2 py-1"
-            style={{ background: `${todayColor}15` }}>
-            <span className="text-[10px]" style={{ color: todayColor }}>{text.dashboard.today}</span>
+          <div className="shrink-0 text-right">
+            <p className="text-tm text-[10px]">{text.dashboard.todayPnl}</p>
+            <p className="truncate text-base font-bold tracking-tight" style={{ color: todayColor }}>
+              {fmtPnl(stats.todayPnl, privacyMode, todayColor)}
+            </p>
+            <div className="mt-0.5">{fmtRate(stats.todayPnlRate, todayColor, privacyMode)}</div>
           </div>
         </div>
 
-        <div className="flex gap-3 mt-4 pt-4 border-t border-app-border">
-          <div className="flex-1 min-w-0">
-            <p className="text-tm text-[10px]">{text.dashboard.todayPnl}</p>
-            <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.todayPnl, privacyMode, todayColor)}</p>
-            <div>{fmtRate(stats.todayPnlRate, todayColor, privacyMode)}</div>
+        {/* ── Row 2: cost basis + position count (auxiliary, small) ── */}
+        <div className="flex items-center justify-between gap-3 mt-2">
+          <p className="text-tm text-[10px]">
+            {text.dashboard.costBasis} {privacyMode ? "¥***" : formatExactMoney(costBasis, "CNY", 2)}
+          </p>
+          <p className="text-tmi text-[10px]">{text.dashboard.positionsGroups(holdings.length, groups.length)}</p>
+        </div>
+
+        {/* ── Row 3: total + unrealized + realized P/L (3 cols) ── */}
+        <div className="grid grid-cols-3 gap-x-3 gap-y-2 mt-3 pt-3 border-t border-app-border">
+          <div className="min-w-0">
+            <p className="text-tm text-[10px]">{text.dashboard.totalInvestmentPnl}</p>
+            <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.totalInvestmentPnl, privacyMode, totalColor)}</p>
+            <div>{fmtRate(stats.totalInvestmentRate, totalColor, privacyMode)}</div>
           </div>
-          <div className="w-px shrink-0 bg-app-surface2" />
-          <div className="flex-1 min-w-0">
-            <p className="text-tm text-[10px]">{text.dashboard.cumulativePnl}</p>
-            <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.cumulativePnl, privacyMode, cumulColor)}</p>
-            <div>{fmtRate(stats.cumulativeRate, cumulColor, privacyMode)}</div>
+          <div className="min-w-0">
+            <p className="text-tm text-[10px]">{text.dashboard.totalPnl}</p>
+            <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.unrealizedPnl, privacyMode, cumulColor)}</p>
+            <div>{fmtRate(stats.unrealizedRate, cumulColor, privacyMode)}</div>
           </div>
-          <div className="w-px shrink-0 bg-app-surface2" />
-          <div className="flex-1 min-w-0">
-            <p className="text-tm text-[10px]">{text.dashboard.costBasis}</p>
-            <p className="truncate text-tp text-sm font-semibold tracking-tight">
-              {privacyMode ? "¥***" : formatExactMoney(costBasis, "CNY", 2)}
-            </p>
-            <span className="text-tm text-[10px]">{text.dashboard.positionsGroups(holdings.length, groups.length)}</span>
+          <div className="min-w-0">
+            <p className="text-tm text-[10px]">{text.dashboard.realizedPnl}</p>
+            <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.realizedPnl, privacyMode, realizedColor)}</p>
+            <div>{fmtRate(stats.realizedRate, realizedColor, privacyMode)}</div>
           </div>
         </div>
 

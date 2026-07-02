@@ -21,6 +21,18 @@ export type CorporateActionEvent = {
   description?: string;
 };
 
+type YahooDividendEvent = {
+  date?: number | string;
+  amount?: number | string;
+};
+
+type YahooSplitEvent = {
+  date?: number | string;
+  splitRatio?: string;
+  numerator?: number | string;
+  denominator?: number | string;
+};
+
 const cache = new Map<string, { ts: number; data: CorporateActionEvent[] }>();
 const inflight = new Map<string, Promise<CorporateActionEvent[]>>();
 const CACHE_TTL = 30 * 60 * 1000;
@@ -372,8 +384,8 @@ async function fetchYahooCorporateActions(yahooSymbol: string, days = 45): Promi
       if (!res.ok) throw new Error(`Yahoo actions HTTP ${res.status}`);
       const json = await res.json();
       const events = json?.chart?.result?.[0]?.events ?? {};
-      const dividends = Object.values(events.dividends ?? {}) as any[];
-      const splits = Object.values(events.splits ?? {}) as any[];
+      const dividends = Object.values(events.dividends ?? {}) as YahooDividendEvent[];
+      const splits = Object.values(events.splits ?? {}) as YahooSplitEvent[];
       const data: CorporateActionEvent[] = [
         ...dividends.map((item) => {
           const ts = Number(item?.date);

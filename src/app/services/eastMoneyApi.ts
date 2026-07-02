@@ -598,12 +598,60 @@ export async function fetchEastMoneyTradeStatusesBySymbols(items: Array<{ symbol
 
 export async function fetchEastMoneyQuoteBySymbol(symbol: string, market: string) {
   const quotes = await fetchEastMoneyQuotesBySymbols([{ symbol, market }]);
-  return quotes[0] ?? null;
+  const quote = quotes[0] ?? null;
+  if (!quote) return null;
+  const fxScale = isEastMoneyFxPer100(symbol, market) ? 1 / 100 : 1;
+  return fxScale === 1 ? quote : scaleEastMoneyQuote(quote, fxScale);
+}
+
+/**
+ * EastMoney quotes FX pairs against CNY in its own convention. Most pairs
+ * (USD, EUR, GBP, HKD …) are quoted per 1 unit of foreign currency, matching
+ * Yahoo's `XXXCNY=X`. JPY is the exception: `JPYCNYC` reports "100 日元人民币
+ * 中间价" — i.e. per 100 JPY. Yahoo's `JPYCNY=X` is per 1 JPY, so we must
+ * divide every JPY price field (quote + chart points) by 100 to align the two
+ * sources; otherwise the fallback JPY rate is ~100× too large.
+ */
+const EASTMONEY_FX_PER_100_SYMBOLS = new Set(["JPYCNY=X", "JPYCNY"]);
+
+export function isEastMoneyFxPer100(symbol: string, market: string) {
+  return market === "FX" && EASTMONEY_FX_PER_100_SYMBOLS.has(symbol.toUpperCase());
+}
+
+function scaleEastMoneyQuote(quote: EastMoneyQuote, factor: number): EastMoneyQuote {
+  if (factor === 1) return quote;
+  const scale = (value: number) => (Number.isFinite(value) ? value * factor : value);
+  return {
+    ...quote,
+    price: scale(quote.price),
+    change: scale(quote.change),
+    open: scale(quote.open),
+    high: scale(quote.high),
+    low: scale(quote.low),
+    prevClose: scale(quote.prevClose),
+  };
+}
+
+function scaleEastMoneyPoints(points: EastMoneyChartPoint[], factor: number): EastMoneyChartPoint[] {
+  if (factor === 1) return points;
+  const scale = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value * factor : value);
+  return points.map((point) => ({
+    ...point,
+    price: scale(point.price) as number,
+    open: scale(point.open) as number | undefined,
+    high: scale(point.high) as number | undefined,
+    low: scale(point.low) as number | undefined,
+    close: scale(point.close) as number | undefined,
+  }));
 }
 
 export async function fetchEastMoneyChart(symbol: string, market: string, range: EastMoneyChartRange) {
   const secids = toEastMoneyChartSecids(symbol, market);
   if (!secids.length) throw new Error(`EastMoney chart unsupported for ${market}:${symbol}`);
+
+  // EastMoney reports JPY/CNY per 100 JPY; normalize to per 1 JPY so the value
+  // matches Yahoo's JPYCNY=X convention used throughout the app.
+  const fxScale = isEastMoneyFxPer100(symbol, market) ? 1 / 100 : 1;
 
   const quotePromise = fetchEastMoneyQuoteBySymbol(symbol, market).catch(() => null);
   let points: EastMoneyChartPoint[] | null = null;
@@ -626,10 +674,14 @@ export async function fetchEastMoneyChart(symbol: string, market: string, range:
     throw lastError instanceof Error ? lastError : new Error(`empty eastmoney chart data for ${market}:${symbol}`);
   }
 
-  if (quote) return { quote: { ...quote, isLive: true }, points };
+  // quote was already scaled inside fetchEastMoneyQuoteBySymbol; only the
+  // chart points (trend/kline) need normalization here.
+  const normalizedPoints = scaleEastMoneyPoints(points, fxScale);
 
-  const latest = points[points.length - 1];
-  const previous = points[points.length - 2] ?? latest;
+  if (quote) return { quote: { ...quote, isLive: true }, points: normalizedPoints };
+
+  const latest = normalizedPoints[normalizedPoints.length - 1];
+  const previous = normalizedPoints[normalizedPoints.length - 2] ?? latest;
   if (!latest) throw new Error(`EastMoney quote unavailable for ${market}:${symbol}`);
 
   const latestPrice = latest.close ?? latest.price;
@@ -657,6 +709,6 @@ export async function fetchEastMoneyChart(symbol: string, market: string, range:
       source: "eastmoney",
       isLive: true,
     },
-    points,
+    points: normalizedPoints,
   };
 }

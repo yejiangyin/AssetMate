@@ -30,13 +30,17 @@ export const appText = {
       dashboard: "总览",
       holdings: "持仓",
       market: "行情",
+      backtest: "回测",
       settings: "设置",
     },
     dashboard: {
       totalAsset: "总资产（CNY）",
       today: "今日",
       todayPnl: "今日盈亏",
-      cumulativePnl: "累计盈亏",
+      cumulativePnl: "当前持仓收益",
+      realizedPnl: "已实现收益",
+      totalInvestmentPnl: "总投资收益",
+      totalPnl: "当前持仓收益",
       costBasis: "持仓成本",
       positionsGroups: (positions: number, groups: number) => `${positions} 只 · ${groups} 组`,
       snapshotTrend: "近 30 日走势（账户快照）",
@@ -65,6 +69,9 @@ export const appText = {
       totalMarketValue: "持仓市值",
       todayPnl: "今日盈亏",
       cumulativePnl: "累计盈亏",
+      closedProceeds: "卖出金额",
+      closedCost: "卖出成本",
+      closedPnl: "已实现收益",
       searchPlaceholder: "搜索代码或名称",
       searchSecurityPlaceholder: "搜索代码或名称，例如 006479 / 苹果 / BTC",
       allGroups: (groups: number) => `全部分组 · ${groups} 个自定义分组`,
@@ -243,6 +250,10 @@ export const appText = {
       languageDesc: "切换插件界面的显示语言",
       privacy: "隐私模式",
       privacyDesc: "设置每次打开插件时默认隐藏或显示敏感数据",
+      openMode: "默认打开方式",
+      openModeDesc: "点击浏览器工具栏图标时打开弹窗或右侧面板",
+      openModePopup: "弹窗",
+      openModeSidePanel: "右侧面板",
       theme: "外观主题",
       themePreview: "主题预览",
       themeLight: "浅色",
@@ -324,13 +335,17 @@ export const appText = {
       dashboard: "Home",
       holdings: "Holdings",
       market: "Market",
+      backtest: "Backtest",
       settings: "Settings",
     },
     dashboard: {
       totalAsset: "Total Assets (CNY)",
       today: "Today",
       todayPnl: "Today's P/L",
-      cumulativePnl: "Total P/L",
+      cumulativePnl: "Open P/L",
+      realizedPnl: "Realized P/L",
+      totalInvestmentPnl: "Total Investment P/L",
+      totalPnl: "Open P/L",
       costBasis: "Cost Basis",
       positionsGroups: (positions: number, groups: number) => `${positions} holdings · ${groups} groups`,
       snapshotTrend: "Last 30 Days (Snapshots)",
@@ -359,6 +374,9 @@ export const appText = {
       totalMarketValue: "Market Value",
       todayPnl: "Today's P/L",
       cumulativePnl: "Total P/L",
+      closedProceeds: "Proceeds",
+      closedCost: "Cost Basis",
+      closedPnl: "Realized P/L",
       searchPlaceholder: "Search symbol or name",
       searchSecurityPlaceholder: "Search code or name, e.g. 006479 / Apple / BTC",
       allGroups: (groups: number) => `All groups · ${groups} custom groups`,
@@ -537,6 +555,10 @@ export const appText = {
       languageDesc: "Switch the extension display language",
       privacy: "Privacy Mode",
       privacyDesc: "Hide or show sensitive data by default when opening the extension",
+      openMode: "Default Open Mode",
+      openModeDesc: "Open the toolbar icon as a popup or side panel",
+      openModePopup: "Popup",
+      openModeSidePanel: "Side Panel",
       theme: "Theme",
       themePreview: "Theme preview",
       themeLight: "Light",
@@ -629,6 +651,21 @@ export function monthDayLabel(date: string, language: Language) {
   if (!date) return "—";
   const [, month = "", day = ""] = date.split("-");
   return language === "en" ? `${month}/${day}` : `${month}月${day}日`;
+}
+
+export function dcaFrequencySummary(
+  frequency: DCAFrequency,
+  language: Language,
+  dayOfWeek = 1,
+  dayOfMonth = 1,
+) {
+  if (frequency === "daily") return frequencyLabel("daily", language);
+  if (frequency === "weekly") {
+    return language === "en"
+      ? `${frequencyLabel("weekly", language)} ${weekdayLabel(dayOfWeek, language)}`
+      : `每周${weekdayLabel(dayOfWeek, language)}`;
+  }
+  return language === "en" ? `Monthly on day ${dayOfMonth}` : `每月 ${dayOfMonth} 日`;
 }
 
 export function marketLabel(market: string | null | undefined, language: Language) {

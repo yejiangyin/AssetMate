@@ -18,6 +18,7 @@ import { computeFundConfirmationDate, fundSettlementDays, parseChineseMoneyLimit
 import type { Language } from "../context/AppContext";
 import {
   dcaMarketForLabel,
+  dcaFrequencySummary,
   frequencyLabel,
   monthDayLabel,
   t,
@@ -31,15 +32,6 @@ const FREQ_OPTIONS: DCAFrequency[] = ["daily","weekly","monthly"];
 
 const WEEKDAY_OPTIONS = [1, 2, 3, 4, 5];
 const CHECKER_MARKETS: MarketType[] = ["US", "HK", "UK", "DE", "IN", "VN", "A", "JP", "CRYPTO", "FUND", "BOND", "GOLD"];
-
-/* ─── helpers ────────────────────────────────────────── */
-function freqSummary(plan: DCAPlan, language: Language): string {
-  if (plan.frequency === "daily") return frequencyLabel("daily", language);
-  if (plan.frequency === "weekly") return language === "en"
-    ? `${frequencyLabel("weekly", language)} ${weekdayLabel(plan.dayOfWeek ?? 1, language)}`
-    : `每周${weekdayLabel(plan.dayOfWeek ?? 1, language)}`;
-  return language === "en" ? `Monthly on day ${plan.dayOfMonth ?? 1}` : `每月 ${plan.dayOfMonth ?? 1} 日`;
-}
 
 function dateLabel(d: string, language: Language): string {
   return monthDayLabel(d, language);
@@ -166,7 +158,9 @@ function PlanCard({
           {formatFixedNumber(plan.amount)} {plan.currency}
         </span>
         <span style={{ color: tc.textMuted, fontSize: 11 }}>·</span>
-        <span style={{ color: tc.textMuted, fontSize: 11 }}>{freqSummary(plan, language)}</span>
+        <span style={{ color: tc.textMuted, fontSize: 11 }}>
+          {dcaFrequencySummary(plan.frequency, language, plan.dayOfWeek ?? 1, plan.dayOfMonth ?? 1)}
+        </span>
       </div>
       {/* Row 3: stats + actions */}
       <div className="flex items-center justify-between mt-2 pt-2"
@@ -943,14 +937,14 @@ export function DCAPanel() {
                 {/* Summary strip */}
                 <div className="flex gap-px mx-3 mt-3 rounded-xl overflow-hidden"
                   style={{ border: `1px solid ${tc.border}` }}>
-                  {[
+                  {([
                     { label: text.dca.planCount, value: dcaPlans.length, unit: language === "en" ? "" : "个" },
                     { label: text.dca.enabled, value: activeCount,     unit: language === "en" ? "" : "个",   color: "#31D08B" },
                     { label: text.dca.totalInvested, value: formatFixedNumber(totalInvested, 2), unit: "" },
-                  ].map((item) => (
+                  ] satisfies Array<{ label: string; value: string | number; unit: string; color?: string }>).map((item) => (
                     <div key={item.label} className="flex-1 py-2.5 text-center" style={{ background: tc.bgCard }}>
                       <p style={{ color: tc.textMicro, fontSize: 9 }}>{item.label}</p>
-                      <p style={{ color: (item as any).color ?? tc.textPrimary, fontSize: 14, fontWeight: 700 }}>
+                      <p style={{ color: item.color ?? tc.textPrimary, fontSize: 14, fontWeight: 700 }}>
                         {item.value}<span style={{ fontSize: 10 }}>{item.unit}</span>
                       </p>
                     </div>
