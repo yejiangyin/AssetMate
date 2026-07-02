@@ -4,11 +4,12 @@ import { createPortal } from "react-dom";
 import {
   DollarSign, Clock, Eye, Download, Upload, Trash2,
   RefreshCw, Moon, Sun, Monitor, ChevronRight, Check, Shield,
-  Zap, AlertCircle, CalendarClock, Languages,
+  Zap, AlertCircle, CalendarClock, Languages, PanelRight,
 } from "lucide-react";
 import { useApp } from "../context/AppContext";
 import { motion, AnimatePresence } from "motion/react";
 import { BrandMark } from "../components/BrandMark";
+import { getExtensionViewMode, openExtensionMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
 import { getTradingCalendarStatus, refreshTradingCalendar } from "../services/tradingCalendar";
 import { t, type AppCopy } from "../i18n";
 
@@ -207,6 +208,7 @@ export function Settings() {
     refreshInterval, setRefreshInterval,
     tradeTimeOnly, setTradeTimeOnly,
     dividendReinvest, setDividendReinvest,
+    defaultOpenMode, setDefaultOpenMode,
     exportPortfolio, importPortfolio, clearLocalData,
     tc, dcaPlans, openDCAPanel,
   } = useApp();
@@ -312,6 +314,43 @@ export function Settings() {
 
           <SettingRow icon={Eye} label={text.privacy} description={text.privacyDesc} iconColor="#8B5CF6" tc={tc}>
             <ToggleSwitch value={defaultPrivacyMode} onChange={setDefaultPrivacyMode} />
+          </SettingRow>
+
+          <SettingRow icon={PanelRight} label={text.openMode} description={text.openModeDesc} iconColor="#4F9CF9" tc={tc}>
+            <Select
+              value={defaultOpenMode}
+              onChange={(value) => {
+                const mode = value as ExtensionOpenMode;
+                setDefaultOpenMode(mode);
+                // Only switch if the target differs from the current view.
+                const currentView = getExtensionViewMode();
+                if (mode === currentView) return;
+                if (currentView === "sidepanel" && mode === "popup") {
+                  // Side panel → popup: just close the side panel. Don't
+                  // call openPopup (the popup would open and then immediately
+                  // lose focus and close). The default mode is now popup, so
+                  // the user gets the popup next time they click the icon.
+                  void syncExtensionOpenMode(mode).finally(() => {
+                    if (typeof window !== "undefined") {
+                      try { window.close(); } catch { /* ignore */ }
+                    }
+                  });
+                  return;
+                }
+                // Popup → side panel: open the side panel then close the popup.
+                void openExtensionMode(mode).then(() => {
+                  if (typeof window !== "undefined") {
+                    window.setTimeout(() => {
+                      try { window.close(); } catch { /* ignore */ }
+                    }, 150);
+                  }
+                });
+              }}
+              tc={tc}
+              options={[
+                { value: "popup", label: text.openModePopup },
+                { value: "sidepanel", label: text.openModeSidePanel },
+              ]} />
           </SettingRow>
 
           {/* Theme — live preview + selector */}

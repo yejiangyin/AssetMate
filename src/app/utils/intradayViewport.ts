@@ -234,6 +234,17 @@ export function buildIntradayViewportPoints(
 
   const upperSymbol = symbol.toUpperCase();
   const isJapan = market === "JP" || (market === "INDEX" && JP_INDEX_SYMBOLS.has(upperSymbol));
+  const isFx = market === "FX";
+  // FX trades ~24h/day with no fixed session, so there is no session spec to
+  // apply — but we still must filter the 5d/1m Yahoo pull down to the latest
+  // trading day, otherwise the intraday chart plots an entire week of ticks.
+  if (isFx) {
+    const fxPoints = filterLatestMarketDate(points, "Asia/Shanghai");
+    return {
+      points: fxPoints.map((point) => ({ ...point, displayPrice: point.price, displayVolume: point.volume })),
+      ticks: null as string[] | null,
+    };
+  }
   const effectivePoints = isJapan ? filterLatestMarketDate(points, "Asia/Shanghai") : points;
   const session = pickIntradaySessionSpec(effectivePoints, market, symbol);
   if (!session || effectivePoints.length < 2) {
@@ -261,6 +272,35 @@ function filterLatestMarketDate(points: ChartPoint[], timeZone: string) {
   if (!dated.length) return points;
   const latestDate = dated.reduce((latest, item) => item.date > latest ? item.date : latest, "");
   return dated.filter((item) => item.date === latestDate).map((item) => item.point);
+}
+
+/**
+ * Filter intraday ("fs") points down to the latest trading day, so sparklines
+ * and other single-day views show one session instead of the full 5d/1m pull.
+ *
+ * US sessions cross midnight in Beijing time, so pre-noon points are shifted
+ * back to the previous calendar day before grouping. All other markets use a
+ * straight calendar-date filter in Beijing time.
+ */
+export function filterLatestIntradayDay(points: ChartPoint[], market: string, symbol: string): ChartPoint[] {
+  if (!points.length) return points;
+  const upperSymbol = symbol.toUpperCase();
+  if (market === "US" || (market === "INDEX" && US_INDEX_SYMBOLS.has(upperSymbol))) {
+    const dated = points
+      .map((point) => {
+        if (typeof point.timestamp !== "number" || !Number.isFinite(point.timestamp)) return null;
+        const d = new Date(point.timestamp);
+        // US overnight session: points before noon belong to the previous trading day.
+        if (d.getHours() < 12) d.setDate(d.getDate() - 1);
+        const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+        return { point, date };
+      })
+      .filter((item): item is { point: ChartPoint; date: string } => item != null);
+    if (!dated.length) return points;
+    const latestDate = dated.reduce((latest, item) => item.date > latest ? item.date : latest, "");
+    return dated.filter((item) => item.date === latestDate).map((item) => item.point);
+  }
+  return filterLatestMarketDate(points, "Asia/Shanghai");
 }
 
 function buildFromSpec(points: ChartPoint[], session: IntradaySessionSpec) {

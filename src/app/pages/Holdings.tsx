@@ -5,7 +5,7 @@ import {
   ChevronRight, BarChart2, CalendarClock, Repeat2, Eye, EyeOff,
 } from "lucide-react";
 import { DCAPlan, HoldingAdjustmentInput, HoldingInput, useApp } from "../context/AppContext";
-import { Holding, Group } from "../data/mockData";
+import { Holding, Group, ClosedHolding } from "../data/mockData";
 import { searchSecuritiesLive, fetchLivePrice, fetchCnFundTradeStatus, LiveResult, Market } from "../services/securitiesApi";
 import { fetchTencentTradeStatus } from "../services/tencentQuote";
 import { toYahooSymbol } from "../services/quoteApi";
@@ -101,7 +101,7 @@ function holdingMarketValue(h: Holding) {
 }
 
 function holdingTotalPnl(h: Holding) {
-  return h.quantity * (h.currentPrice - h.costPrice);
+  return h.quantity * (h.currentPrice - h.costPrice) + (h.cashDividendTotal ?? 0);
 }
 
 function holdingTotalPnlRate(h: Holding) {
@@ -151,6 +151,119 @@ function holdingUnitPriceDecimals(h: Holding) {
     return 4;
   }
   return 2;
+}
+
+function ClosedHoldingsView({
+  items,
+  baseCurrency,
+  privacyMode,
+  profitColor,
+  onDelete,
+  language,
+}: {
+  items: ClosedHolding[];
+  baseCurrency: string;
+  privacyMode: boolean;
+  profitColor: (value: number) => string;
+  onDelete: (id: string) => void;
+  language: Language;
+}) {
+  const sorted = useMemo(() => {
+    return [...items].sort((a, b) => `${b.closedAt}_${b.id}`.localeCompare(`${a.closedAt}_${a.id}`));
+  }, [items]);
+  const emptyText = language === "en" ? "No realized records yet" : "暂无已实现记录";
+  const subtitle = language === "en"
+    ? "Sell and close records keep realized P/L, including cash dividends when applicable."
+    : "卖出和清仓后会在这里保留已实现收益，完整清仓记录会计入现金分红。";
+
+  if (!sorted.length) {
+    return (
+      <div className="flex flex-col items-center justify-center py-14 gap-2 px-6 text-center">
+        <BarChart2 size={30} color="var(--text-micro)" />
+        <p style={{ color: "var(--text-muted)", fontSize: 13, fontWeight: 700 }}>{emptyText}</p>
+        <p style={{ color: "var(--text-micro)", fontSize: 11, lineHeight: 1.5 }}>{subtitle}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2 px-3 py-3">
+      {sorted.map((item) => {
+        const pnl = convertAmount(item.realizedPnl, item.currency, baseCurrency);
+        const proceeds = convertAmount(item.proceeds, item.currency, baseCurrency);
+        const color = profitColor(pnl);
+        return (
+          <div
+            key={item.id}
+            className="rounded-2xl p-3"
+            style={{ background: "var(--bg-card)", border: "1px solid var(--border-sub)" }}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 min-w-0">
+                  <p className="truncate" style={{ color: "var(--text-primary)", fontSize: 14, fontWeight: 800 }}>
+                    {item.name}
+                  </p>
+                  <span style={{ color: "var(--text-muted)", fontSize: 10, fontWeight: 700 }}>{item.symbol}</span>
+                </div>
+                <p style={{ color: "var(--text-micro)", fontSize: 10, marginTop: 3 }}>
+                  {item.isPartial
+                    ? (language === "en" ? "Partial" : "减仓")
+                    : (language === "en" ? "Closed" : "清仓")} {item.closedAt || "-"} · {marketLabel(item.market, language)} · {assetTypeLabel(item.assetType, language)}
+                </p>
+              </div>
+              <button
+                onClick={() => onDelete(item.id)}
+                className="flex items-center justify-center rounded-lg shrink-0"
+                style={{ width: 28, height: 28, background: "rgba(242,78,78,0.1)", color: "#F24E4E" }}
+                title={language === "en" ? "Delete record" : "删除历史记录"}
+              >
+                <Trash2 size={13} />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 mt-3">
+              <div>
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{language === "en" ? "Quantity" : "数量"}</p>
+                <p className="truncate" style={{ color: "var(--text-primary)", fontSize: 12, fontWeight: 700 }}>
+                  {formatHoldingQuantity(item.quantity)}
+                </p>
+              </div>
+              <div>
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{language === "en" ? "Sell Price" : "卖出价"}</p>
+                <p className="truncate" style={{ color: "var(--text-primary)", fontSize: 12, fontWeight: 700 }}>
+                  {privacyMode ? `${currencySymbol(item.currency)}***` : formatExactMoney(item.closePrice, item.currency, 4)}
+                </p>
+              </div>
+              <div>
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{language === "en" ? "Proceeds" : "卖出金额"}</p>
+                <p className="truncate" style={{ color: "var(--text-primary)", fontSize: 12, fontWeight: 700 }}>
+                  {privacyMode ? `${currencySymbol(baseCurrency)}***` : formatSummaryMoney(proceeds, baseCurrency)}
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-3 rounded-xl px-3 py-2 flex items-center justify-between" style={{ background: `${color}12` }}>
+              <span style={{ color: "var(--text-muted)", fontSize: 11 }}>
+                {language === "en" ? "Realized P/L" : "已实现收益"}
+                {(item.cashDividendTotal ?? 0) > 0 && (
+                  <span style={{ marginLeft: 5, color: "var(--text-micro)" }}>
+                    {language === "en" ? "incl. dividend" : "含分红"}
+                  </span>
+                )}
+              </span>
+              <span className="truncate" style={{ color, fontSize: 13, fontWeight: 800 }}>
+                {pnl >= 0 ? "+" : "-"}{privacyMode ? `${currencySymbol(baseCurrency)}--` : formatSummaryMoney(pnl, baseCurrency)}
+                <span style={{ marginLeft: 6, fontSize: 11 }}>
+                  {privacyMode ? "--" : formatPercent(item.realizedReturn)}
+                </span>
+              </span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 /* ─── tiny primitives ─────────────────────────────────── */
@@ -1220,11 +1333,12 @@ function NewGroupSheet({
    Main page
 ══════════════════════════════════════════════════════════ */
 export function Holdings() {
-  const { holdings, groups, privacyMode, profitColor, currency,
-    addHolding, updateHolding, adjustHolding, removeHolding, addGroup, updateGroup, removeGroup,
+  const { holdings, closedHoldings, groups, privacyMode, profitColor, currency,
+    addHolding, updateHolding, adjustHolding, removeHolding, removeClosedHolding, addGroup, updateGroup, removeGroup,
     openDetail, refresh, isRefreshing, lastRefreshed, lastRefreshAt, dcaPlans, openDCAPanel, togglePrivacy, language } = useApp();
   const text = t(language);
 
+  const [viewMode,     setViewMode]     = useState<"current" | "closed">("current");
   const [activeGroup,  setActiveGroup]  = useState("ALL");
   const [search,       setSearch]       = useState("");
   const [sortKey,      setSortKey]      = useState<"marketValue" | "todayPnlRate" | "totalPnlRate">("marketValue");
@@ -1234,6 +1348,7 @@ export function Holdings() {
   const [editTarget,   setEditTarget]   = useState<Holding | null>(null);
   const [adjustTarget, setAdjustTarget] = useState<{ holding: Holding; mode: "buy" | "sell" } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [deleteClosedTarget, setDeleteClosedTarget] = useState<string | null>(null);
   const [deleteGroupTarget, setDeleteGroupTarget] = useState<Group | null>(null);
   const [editingGroup, setEditingGroup] = useState<Group | null>(null);
   const [showNewGroup, setShowNewGroup] = useState(false);
@@ -1300,8 +1415,17 @@ export function Holdings() {
     return { totalAsset, todayPnl, cumulPnl };
   }, [currency, filtered]);
 
+  /* ── closed-history strip stats: realized P/L, cost basis, proceeds ── */
+  const closedStripStats = useMemo(() => {
+    const proceeds = closedHoldings.reduce((s, h) => s + convertAmount(h.proceeds, h.currency, currency), 0);
+    const cost     = closedHoldings.reduce((s, h) => s + convertAmount(h.costBasis, h.currency, currency), 0);
+    const pnl      = closedHoldings.reduce((s, h) => s + convertAmount(h.realizedPnl, h.currency, currency), 0);
+    return { proceeds, cost, pnl };
+  }, [currency, closedHoldings]);
+
   const stripTodayColor = profitColor(stripStats.todayPnl);
   const stripCumulColor = profitColor(stripStats.cumulPnl);
+  const stripClosedPnlColor = profitColor(closedStripStats.pnl);
 
   const openQuote = (h: Holding) => {
     openDetail({
@@ -1399,26 +1523,75 @@ export function Holdings() {
 
         {/* ── Summary strip ── */}
         <div className="flex gap-3 px-4 py-2.5" style={{ borderBottom: "1px solid var(--border-sub)" }}>
-          <div className="flex-1 min-w-0">
-            <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.holdings.totalMarketValue}</p>
-            <p className="truncate" style={{ color: "var(--text-primary)", fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
-              {privacyMode ? `${currencySymbol(currency)}***` : formatSummaryMoney(stripStats.totalAsset, currency)}
-            </p>
-          </div>
-          <div style={{ width: 1, flexShrink: 0, background: "var(--bg-card)" }} />
-          <div className="flex-1 min-w-0">
-            <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.holdings.todayPnl}</p>
-            <p className="truncate" style={{ color: stripTodayColor, fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
-              {stripStats.todayPnl >= 0 ? "+" : "-"}{privacyMode ? `${currencySymbol(currency)}--` : formatSummaryMoney(stripStats.todayPnl, currency)}
-            </p>
-          </div>
-          <div style={{ width: 1, flexShrink: 0, background: "var(--bg-card)" }} />
-          <div className="flex-1 min-w-0">
-            <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.holdings.cumulativePnl}</p>
-            <p className="truncate" style={{ color: stripCumulColor, fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
-              {stripStats.cumulPnl >= 0 ? "+" : "-"}{privacyMode ? `${currencySymbol(currency)}--` : formatSummaryMoney(stripStats.cumulPnl, currency)}
-            </p>
-          </div>
+          {viewMode === "closed" ? (
+            <>
+              <div className="flex-1 min-w-0">
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.holdings.closedProceeds}</p>
+                <p className="truncate" style={{ color: "var(--text-primary)", fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
+                  {privacyMode ? `${currencySymbol(currency)}***` : formatSummaryMoney(closedStripStats.proceeds, currency)}
+                </p>
+              </div>
+              <div style={{ width: 1, flexShrink: 0, background: "var(--bg-card)" }} />
+              <div className="flex-1 min-w-0">
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.holdings.closedCost}</p>
+                <p className="truncate" style={{ color: "var(--text-primary)", fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
+                  {privacyMode ? `${currencySymbol(currency)}***` : formatSummaryMoney(closedStripStats.cost, currency)}
+                </p>
+              </div>
+              <div style={{ width: 1, flexShrink: 0, background: "var(--bg-card)" }} />
+              <div className="flex-1 min-w-0">
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.holdings.closedPnl}</p>
+                <p className="truncate" style={{ color: stripClosedPnlColor, fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
+                  {closedStripStats.pnl >= 0 ? "+" : "-"}{privacyMode ? `${currencySymbol(currency)}--` : formatSummaryMoney(closedStripStats.pnl, currency)}
+                </p>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="flex-1 min-w-0">
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.holdings.totalMarketValue}</p>
+                <p className="truncate" style={{ color: "var(--text-primary)", fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
+                  {privacyMode ? `${currencySymbol(currency)}***` : formatSummaryMoney(stripStats.totalAsset, currency)}
+                </p>
+              </div>
+              <div style={{ width: 1, flexShrink: 0, background: "var(--bg-card)" }} />
+              <div className="flex-1 min-w-0">
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.holdings.todayPnl}</p>
+                <p className="truncate" style={{ color: stripTodayColor, fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
+                  {stripStats.todayPnl >= 0 ? "+" : "-"}{privacyMode ? `${currencySymbol(currency)}--` : formatSummaryMoney(stripStats.todayPnl, currency)}
+                </p>
+              </div>
+              <div style={{ width: 1, flexShrink: 0, background: "var(--bg-card)" }} />
+              <div className="flex-1 min-w-0">
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.holdings.cumulativePnl}</p>
+                <p className="truncate" style={{ color: stripCumulColor, fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
+                  {stripStats.cumulPnl >= 0 ? "+" : "-"}{privacyMode ? `${currencySymbol(currency)}--` : formatSummaryMoney(stripStats.cumulPnl, currency)}
+                </p>
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="flex gap-2 px-4 py-2" style={{ borderBottom: "1px solid var(--border-sub)" }}>
+          {([
+            { key: "current" as const, label: language === "en" ? "Open Holdings" : "当前持仓" },
+            { key: "closed" as const, label: language === "en" ? "Realized P/L" : "已实现收益" },
+          ]).map((item) => (
+            <button
+              key={item.key}
+              onClick={() => setViewMode(item.key)}
+              className="flex-1 rounded-xl py-2 transition-colors"
+              style={{
+                background: viewMode === item.key ? "rgba(79,156,249,0.15)" : "var(--bg-card)",
+                color: viewMode === item.key ? "#4F9CF9" : "var(--text-muted)",
+                border: viewMode === item.key ? "1px solid rgba(79,156,249,0.25)" : "1px solid var(--border-sub)",
+                fontSize: 12,
+                fontWeight: 700,
+              }}
+            >
+              {item.label}{item.key === "closed" ? ` · ${closedHoldings.length}` : ""}
+            </button>
+          ))}
         </div>
 
       </div>
@@ -1427,6 +1600,16 @@ export function Holdings() {
         className="flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "none", overscrollBehaviorY: "contain", WebkitOverflowScrolling: "touch", paddingBottom: 16 }}
       >
+        {viewMode === "closed" ? (
+          <ClosedHoldingsView
+            items={closedHoldings}
+            baseCurrency={currency}
+            privacyMode={privacyMode}
+            profitColor={profitColor}
+            onDelete={(id) => setDeleteClosedTarget(id)}
+            language={language}
+          />
+        ) : (
         <>
           {/* Search */}
           <div style={{ padding: "14px 12px 8px" }}>
@@ -1639,6 +1822,7 @@ export function Holdings() {
             )}
           </div>
         </>
+        )}
       </div>
 
       {/* ── Modals / sheets ── */}
@@ -1713,6 +1897,30 @@ export function Holdings() {
                 <button onClick={() => setDeleteTarget(null)} className="flex-1 rounded-xl py-2.5"
                   style={{ background: "var(--bg-surface2)", color: "var(--text-secondary)", fontSize: 13 }}>{text.common.cancel}</button>
                 <button onClick={() => { removeHolding(deleteTarget); setDeleteTarget(null); setSelectedId(null); }}
+                  className="flex-1 rounded-xl py-2.5"
+                  style={{ background: "rgba(242,78,78,0.15)", color: "#F24E4E", fontSize: 13, fontWeight: 600 }}>{text.common.confirmDelete}</button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {deleteClosedTarget && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="absolute inset-0 flex items-center justify-center px-6"
+            style={{ background: "var(--scrim)", zIndex: 50 }}>
+            <motion.div initial={{ scale: 0.92 }} animate={{ scale: 1 }} exit={{ scale: 0.92 }}
+              className="w-full rounded-2xl p-5"
+              style={{ background: "var(--bg-overlay)", border: "1px solid var(--border)" }}>
+              <p style={{ color: "var(--text-primary)", fontSize: 15, fontWeight: 600, marginBottom: 6 }}>
+                {language === "en" ? "Delete Record" : "删除清仓记录"}
+              </p>
+              <p style={{ color: "var(--text-muted)", fontSize: 13, marginBottom: 16 }}>{text.holdings.deleteHoldingDesc}</p>
+              <div className="flex gap-2">
+                <button onClick={() => setDeleteClosedTarget(null)} className="flex-1 rounded-xl py-2.5"
+                  style={{ background: "var(--bg-surface2)", color: "var(--text-secondary)", fontSize: 13 }}>{text.common.cancel}</button>
+                <button onClick={() => { removeClosedHolding(deleteClosedTarget); setDeleteClosedTarget(null); }}
                   className="flex-1 rounded-xl py-2.5"
                   style={{ background: "rgba(242,78,78,0.15)", color: "#F24E4E", fontSize: 13, fontWeight: 600 }}>{text.common.confirmDelete}</button>
               </div>

@@ -6,11 +6,10 @@
  */
 
 import { fetchCnFundEstimate, fetchCnFundOfficialHistory, fetchCnFundOfficialNav, fetchCryptoPrice } from "./securitiesApi";
-import { fetchEastMoneyChart, fetchEastMoneyQuoteBySymbol } from "./eastMoneyApi";
+import { fetchEastMoneyChart, fetchEastMoneyQuoteBySymbol, type EastMoneyChartRange } from "./eastMoneyApi";
 import { fetchNasdaqChart, fetchNasdaqExtendedQuote } from "./nasdaqApi";
 import { fetchTencentIntraday, fetchTencentKline, fetchTencentQuote, fetchTencentQuoteFromYahooSymbol } from "./tencentQuote";
-import { fetchBinanceCryptoKline, fetchBinanceCryptoQuote, fetchOkxCryptoKline, fetchOkxCryptoQuote, type PublicQuote } from "./publicMarketApi";
-import { fetchRobinhoodExtendedQuote } from "./robinhoodApi";
+import { fetchBinanceCryptoKline, fetchBinanceCryptoQuote, fetchOkxCryptoKline, fetchOkxCryptoQuote, type PublicMarketTimeRange, type PublicQuote } from "./publicMarketApi";
 import { formatExactMoney, formatExactNumber } from "../utils/numberFormat";
 import {
   mergePointSeries,
@@ -46,6 +45,23 @@ export const FUND_RANGE_TABS: { value: TimeRange; label: string }[] = [
   { value: "f10y",  label: "近10年" },
   { value: "fmax",  label: "全时" },
 ];
+
+type YahooDividendEvent = {
+  date?: number | string;
+  amount?: number | string;
+};
+
+function toEastMoneyChartRange(range: TimeRange): EastMoneyChartRange {
+  return range === "fs" || range === "1d" || range === "5d" || range === "1mo" || range === "3mo" || range === "1y" || range === "max"
+    ? range
+    : "max";
+}
+
+function toPublicMarketTimeRange(range: TimeRange): PublicMarketTimeRange {
+  return range === "fs" || range === "1d" || range === "5d" || range === "1mo" || range === "3mo" || range === "1y" || range === "max"
+    ? range
+    : "max";
+}
 
 function yahooQuerySpec(range: TimeRange) {
   switch (range) {
@@ -132,6 +148,13 @@ export interface QuoteInfo {
 export interface ChartData {
   quote:  QuoteInfo;
   points: ChartPoint[];
+}
+
+export interface DailyPricePoint {
+  date: string;
+  price: number;
+  dividend?: number;
+  adjusted?: boolean;
 }
 
 interface FundHistoryItem {
@@ -421,6 +444,122 @@ function chartDataFromQuote(quote: QuoteInfo): ChartData {
   return { quote, points: [] };
 }
 
+function ymdToUnixSeconds(value: string, fallback: number) {
+  const parsed = new Date(`${value}T00:00:00Z`).getTime();
+  return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : fallback;
+}
+
+export async function fetchBacktestDailyPrices(symbol: string, market: string, startDate?: string, endDate?: string): Promise<DailyPricePoint[]> {
+  if (market === "FUND") {
+    const history = await fetchCnFundOfficialHistory(symbol, 4000);
+    return history
+      .map((point) => ({ date: point.date, price: point.nav }))
+      .filter((point) => point.date && Number.isFinite(point.price) && point.price > 0)
+      .sort((a, b) => a.date.localeCompare(b.date));
+  }
+
+  const yahooSymbol = detailYahooSymbol(toYahooSymbol(symbol, market), market);
+  const hosts = ["query2.finance.yahoo.com", "query1.finance.yahoo.com"];
+  let lastError: unknown = null;
+  for (const host of hosts) {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 20000);
+    try {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const period1 = ymdToUnixSeconds(startDate ?? "", 0);
+      const period2 = ymdToUnixSeconds(endDate ?? "", nowSeconds) + 86_400;
+      const params = new URLSearchParams({
+        interval: "1d",
+        period1: String(period1),
+        period2: String(Math.max(period1 + 86_400, period2)),
+        events: "div",
+        includePrePost: "false",
+      });
+      const url = `https://${host}/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?${params.toString()}`;
+      const res = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
+      clearTimeout(tid);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const result = json?.chart?.result?.[0];
+      const timestamps: number[] = result?.timestamp ?? [];
+      const closes: Array<number | null> = result?.indicators?.quote?.[0]?.close ?? [];
+      const dividendByDate = new Map<string, number>();
+      const dividends = Object.values(result?.events?.dividends ?? {}) as YahooDividendEvent[];
+      for (const item of dividends) {
+        const ts = Number(item?.date);
+        const amount = Number(item?.amount);
+        if (!Number.isFinite(ts) || !(amount > 0)) continue;
+        const date = new Date(ts * 1000).toISOString().slice(0, 10);
+        dividendByDate.set(date, (dividendByDate.get(date) ?? 0) + amount);
+      }
+      const points = timestamps
+        .map((timestamp, index) => ({
+          date: new Date(timestamp * 1000).toISOString().slice(0, 10),
+          price: Number(closes[index]),
+          dividend: dividendByDate.get(new Date(timestamp * 1000).toISOString().slice(0, 10)) ?? 0,
+        }))
+        .filter((point) => point.date && Number.isFinite(point.price) && point.price > 0)
+        .sort((a, b) => a.date.localeCompare(b.date));
+      if (points.length) return points;
+      throw new Error("empty backtest daily prices");
+    } catch (err) {
+      clearTimeout(tid);
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("backtest daily prices failed");
+}
+
+/* ─── open.er-api.com FX fallback ───────────────────────
+   EastMoney's FX secids (120.USDCNYC etc.) report the PBoC 中间价 (daily
+   reference rate), not the real-time market exchange rate — typically off by
+   0.2-0.5% from the actual market price. When Yahoo is unavailable, we fall
+   back to open.er-api.com which publishes real-time market rates. */
+const FX_CNY_SYMBOL_TO_CODE: Record<string, string> = {
+  "CNY=X": "USD",
+  "EURCNY=X": "EUR",
+  "GBPCNY=X": "GBP",
+  "HKDCNY=X": "HKD",
+  "JPYCNY=X": "JPY",
+};
+
+async function fetchOpenErApiFxQuote(yahooSymbol: string): Promise<QuoteInfo | null> {
+  const code = FX_CNY_SYMBOL_TO_CODE[yahooSymbol.toUpperCase()];
+  if (!code) return null;
+  const ctrl = new AbortController();
+  const tid = setTimeout(() => ctrl.abort(), 6000);
+  try {
+    const res = await fetch("https://open.er-api.com/v6/latest/CNY", {
+      signal: ctrl.signal,
+      cache: "no-store",
+    });
+    clearTimeout(tid);
+    if (!res.ok) return null;
+    const json = await res.json();
+    const rate = Number(json?.rates?.[code]);
+    if (!(rate > 0)) return null;
+    const price = 1 / rate; // rates[code] = 1 CNY → foreign; we want 1 foreign → CNY
+    return {
+      symbol: yahooSymbol,
+      name: `${code}/CNY`,
+      price,
+      change: 0,
+      changePercent: 0,
+      open: price,
+      high: price,
+      low: price,
+      prevClose: 0, // filled by the caller from EastMoney if available
+      volume: 0,
+      currency: "CNY",
+      exchange: "open.er-api.com",
+      isLive: true,
+    };
+  } catch {
+    clearTimeout(tid);
+    return null;
+  }
+}
+
 function positiveValue(value: unknown): number | undefined {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
@@ -476,26 +615,8 @@ function normalizeUsExtendedChartData(data: ChartData): ChartData {
   };
 }
 
-function mergeUsExtendedQuotes(
-  nasdaqQuote: Partial<QuoteInfo> | null,
-  robinhoodQuote: Partial<QuoteInfo> | null,
-): Partial<QuoteInfo> | null {
+function mergeUsExtendedQuotes(nasdaqQuote: Partial<QuoteInfo> | null): Partial<QuoteInfo> | null {
   const merged: Partial<QuoteInfo> = { ...(nasdaqQuote ?? {}) };
-  if (robinhoodQuote?.overnightPrice && robinhoodQuote.overnightPrice > 0) {
-    merged.overnightPrice = robinhoodQuote.overnightPrice;
-    merged.overnightChange = robinhoodQuote.overnightChange;
-    merged.overnightChangePercent = robinhoodQuote.overnightChangePercent;
-  }
-  if ((!merged.preMarketPrice || merged.preMarketPrice <= 0) && robinhoodQuote?.preMarketPrice && robinhoodQuote.preMarketPrice > 0) {
-    merged.preMarketPrice = robinhoodQuote.preMarketPrice;
-    merged.preMarketChange = robinhoodQuote.preMarketChange;
-    merged.preMarketChangePercent = robinhoodQuote.preMarketChangePercent;
-  }
-  if ((!merged.postMarketPrice || merged.postMarketPrice <= 0) && robinhoodQuote?.postMarketPrice && robinhoodQuote.postMarketPrice > 0) {
-    merged.postMarketPrice = robinhoodQuote.postMarketPrice;
-    merged.postMarketChange = robinhoodQuote.postMarketChange;
-    merged.postMarketChangePercent = robinhoodQuote.postMarketChangePercent;
-  }
   return Object.keys(merged).length ? merged : null;
 }
 
@@ -670,7 +791,7 @@ function quoteFromTencent(yahooSymbol: string, tencent: Awaited<ReturnType<typeo
 
 async function fetchEastMoneyGlobalFallback(symbol: string, market: string, range: TimeRange): Promise<ChartData | null> {
   try {
-    const result = await fetchEastMoneyChart(symbol, market, range as any);
+    const result = await fetchEastMoneyChart(symbol, market, toEastMoneyChartRange(range));
     return {
       quote: {
         symbol: result.quote.symbol,
@@ -699,7 +820,7 @@ async function fetchEastMoneyGlobalFallback(symbol: string, market: string, rang
 ══════════════════════════════════════════════════════════ */
 const CACHE_TTL = 2 * 60 * 1000;
 const CACHE_MAX_ITEMS = 80;
-const PERSISTENT_CHART_STORAGE_KEY = "asset-helper:chart-cache:v3";
+const PERSISTENT_CHART_STORAGE_KEY = "asset-helper:chart-cache:v5";
 const PERSISTENT_FUND_HISTORY_STORAGE_KEY = "asset-helper:fund-history-cache:v1";
 const PERSISTENT_CHART_MAX_ITEMS = 36;
 const PERSISTENT_FUND_HISTORY_MAX_ITEMS = 60;
@@ -1226,7 +1347,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
 
       const isHkIndex = HK_INDEX_SYMBOLS.has(rawSymbol.toUpperCase());
       const [eastMoneyResult, yahooData] = await Promise.all([
-        fetchEastMoneyChart(rawSymbol, market, range).catch(() => null),
+        fetchEastMoneyChart(rawSymbol, market, toEastMoneyChartRange(range)).catch(() => null),
         fetchChart(detailYahooSymbol(symbol, market), range, force).catch(() => null),
       ]);
 
@@ -1277,7 +1398,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     }
 
     try {
-      const result = await fetchEastMoneyChart(rawSymbol, market, range as any);
+      const result = await fetchEastMoneyChart(rawSymbol, market, toEastMoneyChartRange(range));
       const data = {
         quote: {
           symbol: result.quote.symbol,
@@ -1407,9 +1528,9 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     const [coinGeckoQuote, binanceQuote, binanceKline, okxQuote, okxKline, yahooResult] = await Promise.allSettled([
       fetchCryptoPrice(normalizedSymbol),
       fetchBinanceCryptoQuote(normalizedSymbol),
-      fetchBinanceCryptoKline(normalizedSymbol, range as any),
+      fetchBinanceCryptoKline(normalizedSymbol, toPublicMarketTimeRange(range)),
       fetchOkxCryptoQuote(normalizedSymbol),
-      fetchOkxCryptoKline(normalizedSymbol, range as any),
+      fetchOkxCryptoKline(normalizedSymbol, toPublicMarketTimeRange(range)),
       fetchChart(symbol, range, force),
     ]);
 
@@ -1476,6 +1597,29 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     const eastMoneyOk = eastMoneyData && (eastMoneyData.quote.price > 0 || hasRealChartPoints(eastMoneyData.points));
     if (market === "FX" || market === "COMMODITY") {
       if (yahooOk) return storeDetailChart(yahooData!);
+      // FX fallback: EastMoney returns the PBoC 中间价 (reference rate), not
+      // the real-time market rate. Prefer open.er-api.com for the quote and
+      // only use EastMoney for intraday chart shape + prevClose reference.
+      if (market === "FX") {
+        const openErQuote = await fetchOpenErApiFxQuote(symbol);
+        if (openErQuote) {
+          if (eastMoneyOk && hasRealChartPoints(eastMoneyData!.points)) {
+            const emQuote = eastMoneyData!.quote;
+            const prevClose = emQuote.prevClose > 0 ? emQuote.prevClose : openErQuote.price;
+            const change = openErQuote.price - prevClose;
+            return storeDetailChart({
+              quote: {
+                ...openErQuote,
+                prevClose,
+                change,
+                changePercent: prevClose > 0 ? change / prevClose : 0,
+              },
+              points: eastMoneyData!.points,
+            });
+          }
+          return storeDetailChart(chartDataFromQuote(openErQuote));
+        }
+      }
       if (eastMoneyOk) return eastMoneyData!;
     } else {
       if (eastMoneyOk) return eastMoneyData!;
@@ -1490,13 +1634,13 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
       fetchNasdaqChart(symbol, range),
       fetchChart(symbol, range, force),
       market === "US"
-        ? Promise.all([fetchNasdaqExtendedQuote(symbol), fetchRobinhoodExtendedQuote(symbol)])
+        ? fetchNasdaqExtendedQuote(symbol)
         : Promise.resolve(null),
     ]);
     const nasdaqData = nasdaqResult.status === "fulfilled" ? nasdaqResult.value : null;
     const yahooData = yahooResult.status === "fulfilled" ? yahooResult.value : null;
-    const extendedQuote = extendedResult.status === "fulfilled" && Array.isArray(extendedResult.value)
-      ? mergeUsExtendedQuotes(extendedResult.value[0] ?? null, extendedResult.value[1] ?? null)
+    const extendedQuote = extendedResult.status === "fulfilled"
+      ? mergeUsExtendedQuotes(extendedResult.value ?? null)
       : null;
     if (nasdaqData && hasRealChartPoints(nasdaqData.points)) {
       const quote = extendedQuote
@@ -1519,10 +1663,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
 
   const shouldIncludePrePost = market === "US" && range === "fs";
   const extendedQuotePromise = market === "US"
-    ? Promise.all([
-      fetchNasdaqExtendedQuote(symbol).catch(() => null),
-      fetchRobinhoodExtendedQuote(symbol).catch(() => null),
-    ]).then(([nasdaqQuote, robinhoodQuote]) => mergeUsExtendedQuotes(nasdaqQuote, robinhoodQuote))
+    ? fetchNasdaqExtendedQuote(symbol).catch(() => null).then((nasdaqQuote) => mergeUsExtendedQuotes(nasdaqQuote))
     : Promise.resolve(null);
   let yahooData: ChartData | null = null;
   try {

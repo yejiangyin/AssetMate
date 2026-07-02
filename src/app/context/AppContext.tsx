@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useMemo, useRef } from "react";
-import { groups as initialGroups, holdings as initialHoldings, Group, Holding } from "../data/mockData";
+import { groups as initialGroups, holdings as initialHoldings, closedHoldings as initialClosedHoldings, Group, Holding, ClosedHolding } from "../data/mockData";
 import { FX, refreshPrices, toCNY } from "../services/priceRefresher";
 import { MarketType, DCAFrequency, isMarketOpenNow, isTradingDay, refreshTradingCalendar } from "../services/tradingCalendar";
 import type { ChartPoint } from "../services/quoteApi";
@@ -7,6 +7,7 @@ import { fetchCorporateActions } from "../services/corporateActions";
 import { normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction } from "../utils/holdingHelpers";
 import { dedupeDCAExecutions, hydratePlans, repairDCAData, settleDueDCAPlans, syncPlanWithHolding, computeNextExec } from "../utils/dcaEngine";
 import { safeUUID } from "../utils/safeId";
+import { DEFAULT_OPEN_MODE, normalizeOpenMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
 
 /* ─── types ──────────────────────────────────────────── */
 type ColorScheme    = "red-up" | "green-up";
@@ -24,6 +25,7 @@ const CURRENCIES = new Set<Currency>(["CNY", "USD", "HKD"]);
 const REFRESH_INTERVALS = new Set<RefreshInterval>([0, 1, 5, 15, 30, 60]);
 const LANGUAGES = new Set<Language>(["zh", "en"]);
 const CORPORATE_ACTION_CHECK_TTL = 24 * 60 * 60 * 1000;
+const MAX_CORPORATE_ACTION_CHECKS = 500;
 const corporateActionCheckedAt = new Map<string, number>();
 
 function enumOr<T extends string | number>(value: unknown, allowed: Set<T>, fallback: T): T {
@@ -99,6 +101,12 @@ export interface PortfolioStats {
   todayPnlRate:   number;
   cumulativePnl:  number;
   cumulativeRate: number;
+  unrealizedPnl:  number;
+  unrealizedRate: number;
+  realizedPnl:    number;
+  realizedRate:   number;
+  totalInvestmentPnl: number;
+  totalInvestmentRate: number;
   usdEquiv:       number;
   lastUpdated:    string;
 }
@@ -230,11 +238,21 @@ function buildThemeColors(theme: Theme): ThemeColors {
 const initialDCAPlans: DCAPlan[] = [];
 
 /* ─── PortfolioStats ─────────────────────────────────── */
-function computeStats(holdings: Holding[]): PortfolioStats {
+function computeStats(holdings: Holding[], closedHoldings: ClosedHolding[] = []): PortfolioStats {
   const totalMV    = holdings.reduce((s, h) => s + toCNY(h.quantity * h.currentPrice, h.currency), 0);
   const todayPnl   = holdings.reduce((s, h) => s + toCNY(h.todayPnl,    h.currency), 0);
-  const totalPnl   = holdings.reduce((s, h) => s + toCNY(h.quantity * (h.currentPrice - h.costPrice), h.currency), 0);
+  // Open-position P/L includes cash dividends received while holding — dividends
+  // are realized income even if the position is still open, so they must be
+  // reflected in the open-position return, not only at full close.
+  const totalPnl   = holdings.reduce((s, h) => s + toCNY(
+    h.quantity * (h.currentPrice - h.costPrice) + (h.cashDividendTotal ?? 0),
+    h.currency,
+  ), 0);
   const costBasis  = holdings.reduce((s, h) => s + toCNY(h.quantity * h.costPrice, h.currency), 0);
+  const realizedPnl = closedHoldings.reduce((s, h) => s + toCNY(h.realizedPnl, h.currency), 0);
+  const realizedCostBasis = closedHoldings.reduce((s, h) => s + toCNY(h.costBasis, h.currency), 0);
+  const totalInvestmentPnl = totalPnl + realizedPnl;
+  const totalInvestmentCostBasis = costBasis + realizedCostBasis;
   const prevMV     = totalMV - todayPnl;
   return {
     totalAsset:     totalMV,
@@ -244,6 +262,12 @@ function computeStats(holdings: Holding[]): PortfolioStats {
     todayPnlRate:   prevMV  > 0 ? todayPnl  / prevMV   : 0,
     cumulativePnl:  totalPnl,
     cumulativeRate: costBasis > 0 ? totalPnl / costBasis : 0,
+    unrealizedPnl:  totalPnl,
+    unrealizedRate: costBasis > 0 ? totalPnl / costBasis : 0,
+    realizedPnl,
+    realizedRate: realizedCostBasis > 0 ? realizedPnl / realizedCostBasis : 0,
+    totalInvestmentPnl,
+    totalInvestmentRate: totalInvestmentCostBasis > 0 ? totalInvestmentPnl / totalInvestmentCostBasis : 0,
     usdEquiv:       totalMV / (FX.USD || 7.25),
     lastUpdated:    new Date().toISOString(),
   };
@@ -253,6 +277,7 @@ function computeStats(holdings: Holding[]): PortfolioStats {
 interface AppState {
   groups:          Group[];
   holdings:        Holding[];
+  closedHoldings:  ClosedHolding[];
   defaultPrivacyMode: boolean;
   privacyMode:     boolean;
   colorScheme:     ColorScheme;
@@ -262,6 +287,7 @@ interface AppState {
   refreshInterval: RefreshInterval;
   tradeTimeOnly:   boolean;
   dividendReinvest:boolean;
+  defaultOpenMode:  ExtensionOpenMode;
   isRefreshing:    boolean;
   lastRefreshed:   string;
   lastRefreshAt:   number;
@@ -285,6 +311,7 @@ interface AppContextType extends AppState {
   setRefreshInterval: (v: RefreshInterval) => void;
   setTradeTimeOnly:   (v: boolean) => void;
   setDividendReinvest: (v: boolean) => void;
+  setDefaultOpenMode: (v: ExtensionOpenMode) => void;
   refresh:            () => Promise<void>;
   exportPortfolio:    () => string;
   importPortfolio:    (raw: string) => { ok: boolean; error?: string };
@@ -297,6 +324,7 @@ interface AppContextType extends AppState {
   adjustHolding:      (id: string, input: HoldingAdjustmentInput) => void;
   applyCorporateAction: (id: string, input: HoldingCorporateActionInput) => void;
   removeHolding:      (id: string) => void;
+  removeClosedHolding: (id: string) => void;
   openDetail:         (t: DetailTarget) => void;
   closeDetail:        () => void;
   profitColor:        (v: number) => string;
@@ -314,17 +342,27 @@ const AppContext = createContext<AppContextType | null>(null);
 
 const STORAGE_KEY = "asset-helper:v2";
 const STORAGE_VERSION = 2;
+const REFRESH_META_KEY = "asset-helper:portfolio-refresh-meta:v1";
+const REFRESH_RECENT_TTL = 45_000;
+const REFRESH_LOCK_TTL = 25_000;
 const MAX_DCA_EXECUTIONS = 300;
 const MAX_DCA_EXECUTIONS_PER_PLAN = 24;
 const NON_CRITICAL_STORAGE_KEYS = [
   "asset-helper:chart-cache:v1",
   "asset-helper:chart-cache:v2",
+  "asset-helper:chart-cache:v3",
+  "asset-helper:chart-cache:v4",
+  "asset-helper:chart-cache:v5",
   "asset-helper:fund-history-cache:v1",
   "asset-helper:corporate-actions-cache:v1",
   "asset-helper:corporate-actions-cache:v2",
   "asset-helper:corporate-actions-cache:v3",
   "asset-helper:market-page-cache:v1",
   "asset-helper:market-page-cache:v2",
+  "asset-helper:market-page-cache:v3",
+  "asset-helper:market-page-cache:v4",
+  "asset-helper:market-page-cache:v5",
+  "asset-helper:market-page-cache:v6",
   "asset-helper:trading-calendar:v1",
   "asset-helper:fx-rates",
   "dashboard.assetSeries.v4",
@@ -334,6 +372,7 @@ type PersistedState = Partial<Pick<
   AppState,
   | "groups"
   | "holdings"
+  | "closedHoldings"
   | "defaultPrivacyMode"
   | "privacyMode"
   | "colorScheme"
@@ -343,12 +382,57 @@ type PersistedState = Partial<Pick<
   | "refreshInterval"
   | "tradeTimeOnly"
   | "dividendReinvest"
+  | "defaultOpenMode"
   | "dcaPlans"
   | "dcaExecutions"
   | "assetSnapshots"
 >> & { version?: number };
 
+type RefreshMeta = {
+  startedAt?: number;
+  finishedAt?: number;
+};
+
 const normalizedInitialHoldings = initialHoldings.map(normalizeHolding);
+const normalizedInitialClosedHoldings = initialClosedHoldings;
+
+function positiveNumber(value: unknown, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function normalizeClosedHolding(raw: Partial<ClosedHolding> & Record<string, unknown>): ClosedHolding | null {
+  if (!raw || typeof raw.symbol !== "string" || typeof raw.name !== "string") return null;
+  const quantity = positiveNumber(raw.quantity);
+  const costPrice = positiveNumber(raw.costPrice);
+  const closePrice = positiveNumber(raw.closePrice);
+  const costBasis = positiveNumber(raw.costBasis, quantity * costPrice);
+  const proceeds = positiveNumber(raw.proceeds, quantity * closePrice);
+  const cashDividendTotal = positiveNumber(raw.cashDividendTotal);
+  const realizedPnl = positiveNumber(raw.realizedPnl, proceeds + cashDividendTotal - costBasis);
+  const closedAt = typeof raw.closedAt === "string" && raw.closedAt ? raw.closedAt : todayLocalYMD();
+  return {
+    id: typeof raw.id === "string" && raw.id ? raw.id : `closed_${safeUUID()}`,
+    sourceHoldingId: typeof raw.sourceHoldingId === "string" ? raw.sourceHoldingId : "",
+    groupId: typeof raw.groupId === "string" ? raw.groupId : "",
+    symbol: raw.symbol,
+    name: raw.name,
+    market: raw.market as Holding["market"],
+    assetType: raw.assetType as Holding["assetType"],
+    quantity,
+    costPrice,
+    closePrice,
+    costBasis,
+    proceeds,
+    realizedPnl,
+    realizedReturn: costBasis > 0 ? realizedPnl / costBasis : positiveNumber(raw.realizedReturn),
+    cashDividendTotal,
+    currency: typeof raw.currency === "string" && raw.currency ? raw.currency : "CNY",
+    openedAt: typeof raw.openedAt === "string" && raw.openedAt ? raw.openedAt : closedAt,
+    closedAt,
+    isPartial: raw.isPartial === true ? true : undefined,
+  };
+}
 
 function todayLocalYMD(date = new Date()) {
   const year = date.getFullYear();
@@ -360,6 +444,50 @@ function todayLocalYMD(date = new Date()) {
 function ymdFromIsoLike(value: string | undefined) {
   const match = String(value ?? "").match(/^\d{4}-\d{2}-\d{2}/);
   return match?.[0] ?? "";
+}
+
+export function buildClosedHolding(
+  holding: Holding,
+  closePrice = holding.currentPrice,
+  closedAt = todayLocalYMD(),
+  closedQuantity?: number,
+): ClosedHolding {
+  const totalQuantity = Number.isFinite(holding.quantity) ? holding.quantity : 0;
+  // For partial closes, only the sold quantity is recorded; for full closes
+  // the entire remaining position is recorded.
+  const quantity = Number.isFinite(closedQuantity) && closedQuantity! > 0
+    ? Math.min(closedQuantity!, totalQuantity)
+    : totalQuantity;
+  const costPrice = Number.isFinite(holding.costPrice) ? holding.costPrice : 0;
+  const safeClosePrice = Number.isFinite(closePrice) && closePrice > 0 ? closePrice : holding.currentPrice;
+  const costBasis = quantity * costPrice;
+  const proceeds = quantity * safeClosePrice;
+  // Dividends are attributed to the full close only; partial closes would
+  // double-count if they each carried the lifetime dividend total.
+  const isPartial = quantity < totalQuantity;
+  const cashDividendTotal = isPartial ? 0 : (holding.cashDividendTotal ?? 0);
+  const realizedPnl = proceeds + cashDividendTotal - costBasis;
+  return {
+    id: `closed_${safeUUID()}`,
+    sourceHoldingId: holding.id,
+    groupId: holding.groupId,
+    symbol: holding.symbol,
+    name: holding.name,
+    market: holding.market,
+    assetType: holding.assetType,
+    quantity,
+    costPrice,
+    closePrice: safeClosePrice,
+    costBasis,
+    proceeds,
+    realizedPnl,
+    realizedReturn: costBasis > 0 ? realizedPnl / costBasis : 0,
+    cashDividendTotal,
+    currency: holding.currency,
+    openedAt: ymdFromIsoLike(holding.updatedAt) || closedAt,
+    closedAt,
+    isPartial: isPartial || undefined,
+  };
 }
 
 function todayShanghaiYMD(date = new Date()) {
@@ -445,8 +573,23 @@ function corporateActionTargetKey(holding: Holding) {
   return `${holding.market}:${holding.symbol}`;
 }
 
+function pruneCorporateActionCheckedAt(activeHoldings: Holding[] = [], now = Date.now()) {
+  const activeKeys = new Set(activeHoldings.map(corporateActionTargetKey));
+  for (const [key, checkedAt] of corporateActionCheckedAt) {
+    if ((activeKeys.size > 0 && !activeKeys.has(key)) || now - checkedAt >= CORPORATE_ACTION_CHECK_TTL) {
+      corporateActionCheckedAt.delete(key);
+    }
+  }
+  while (corporateActionCheckedAt.size > MAX_CORPORATE_ACTION_CHECKS) {
+    const oldestKey = corporateActionCheckedAt.keys().next().value;
+    if (!oldestKey) break;
+    corporateActionCheckedAt.delete(oldestKey);
+  }
+}
+
 async function fetchCorporateActionMap(holdings: Holding[], force = false) {
   const now = Date.now();
+  pruneCorporateActionCheckedAt(holdings, now);
   const entries = await Promise.all(
     holdings.map(async (holding) => {
       const key = corporateActionTargetKey(holding);
@@ -549,6 +692,7 @@ function defaultState(): AppState {
   return {
     groups:          initialGroups,
     holdings:        normalizedInitialHoldings,
+    closedHoldings:  normalizedInitialClosedHoldings,
     defaultPrivacyMode: false,
     privacyMode:     false,
     colorScheme:     "red-up",
@@ -558,6 +702,7 @@ function defaultState(): AppState {
     refreshInterval: 1,
     tradeTimeOnly:   false,
     dividendReinvest:false,
+    defaultOpenMode:  DEFAULT_OPEN_MODE,
     isRefreshing:    false,
     lastRefreshed:   "—",
     lastRefreshAt:   0,
@@ -570,11 +715,43 @@ function defaultState(): AppState {
   };
 }
 
+/**
+ * Blank state used by "Reset Local Data": no holdings, no groups, no DCA plans,
+ * no snapshots — and the demo portfolio is wiped too. User-facing settings
+ * (language/theme/color-scheme/currency/refresh interval/privacy mode) are
+ * preserved from the current state so the UI doesn't visually flip when the
+ * data is cleared.
+ */
+function blankState(current: AppState): AppState {
+  const base = defaultState();
+  return {
+    ...base,
+    groups:          [],
+    holdings:        [],
+    closedHoldings:  [],
+    dcaPlans:        [],
+    dcaExecutions:   [],
+    assetSnapshots:  [],
+    // Preserve user's UI preferences instead of resetting them to defaults.
+    colorScheme:     current.colorScheme,
+    theme:           current.theme,
+    currency:        current.currency,
+    language:        current.language,
+    refreshInterval: current.refreshInterval,
+    tradeTimeOnly:   current.tradeTimeOnly,
+    dividendReinvest:current.dividendReinvest,
+    defaultOpenMode: current.defaultOpenMode,
+    defaultPrivacyMode: current.defaultPrivacyMode,
+    privacyMode:     current.defaultPrivacyMode,
+  };
+}
+
 function buildPersistedState(state: AppState): PersistedState {
   return {
     version: STORAGE_VERSION,
     groups: state.groups,
     holdings: state.holdings,
+    closedHoldings: state.closedHoldings,
     defaultPrivacyMode: state.defaultPrivacyMode,
     colorScheme: state.colorScheme,
     theme: state.theme,
@@ -583,6 +760,7 @@ function buildPersistedState(state: AppState): PersistedState {
     refreshInterval: state.refreshInterval,
     tradeTimeOnly: state.tradeTimeOnly,
     dividendReinvest: state.dividendReinvest,
+    defaultOpenMode: state.defaultOpenMode,
     dcaPlans: state.dcaPlans,
     dcaExecutions: pruneDCAExecutions(state.dcaExecutions),
     assetSnapshots: state.assetSnapshots,
@@ -600,7 +778,7 @@ function clearNonCriticalStorage() {
   }
 }
 
-function savePersistedState(snapshot: PersistedState, options: { clearCachesOnFailure?: boolean } = {}) {
+function savePersistedState(snapshot: PersistedState, options: { clearCachesOnFailure?: boolean; errorMessage?: string } = {}) {
   if (typeof window === "undefined") return { ok: true };
   const raw = JSON.stringify(snapshot);
   const write = () => {
@@ -625,8 +803,34 @@ function savePersistedState(snapshot: PersistedState, options: { clearCachesOnFa
 
   return {
     ok: false,
-    error: "导入失败：浏览器扩展存储空间不足，已尝试清理行情缓存，请重新导入或先清空本地数据。",
+    error: options.errorMessage ?? "Browser extension storage is full.",
   };
+}
+
+function readRefreshMeta(): RefreshMeta {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(REFRESH_META_KEY);
+    return raw ? JSON.parse(raw) as RefreshMeta : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeRefreshMeta(meta: RefreshMeta) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(REFRESH_META_KEY, JSON.stringify(meta));
+  } catch {
+    // Best effort only; refresh coordination is an optimization.
+  }
+}
+
+function shouldSkipCoordinatedRefresh(now = Date.now()) {
+  const meta = readRefreshMeta();
+  if (meta.finishedAt && now - meta.finishedAt < REFRESH_RECENT_TTL) return true;
+  if (meta.startedAt && now - meta.startedAt < REFRESH_LOCK_TTL) return true;
+  return false;
 }
 
 export function loadInitialState(): AppState {
@@ -636,9 +840,18 @@ export function loadInitialState(): AppState {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return base;
     const saved = JSON.parse(raw) as Partial<PersistedState>;
-    const holdings = Array.isArray(saved.holdings) && saved.holdings.length
-      ? saved.holdings.map(normalizeHolding)
+    // An empty holdings array means the user explicitly cleared their data
+    // (clearLocalData writes []). Only fall back to demo holdings when the
+    // key is missing entirely (first run / pre-migration). Same for groups.
+    const hasSavedHoldings = Array.isArray(saved.holdings);
+    const holdings = hasSavedHoldings
+      ? saved.holdings!.map(normalizeHolding)
       : base.holdings;
+    const closedHoldings = Array.isArray(saved.closedHoldings)
+      ? saved.closedHoldings
+          .map((item) => normalizeClosedHolding(item as Partial<ClosedHolding> & Record<string, unknown>))
+          .filter((item): item is ClosedHolding => item != null)
+      : [];
     const rawExecutions = Array.isArray(saved.dcaExecutions)
       ? pruneDCAExecutions(saved.dcaExecutions)
       : base.dcaExecutions;
@@ -666,6 +879,7 @@ export function loadInitialState(): AppState {
       privacyMode: defaultPrivacyMode,
       groups: Array.isArray(saved.groups) ? saved.groups : base.groups,
       holdings: finalHoldings,
+      closedHoldings,
       dcaPlans,
       dcaExecutions,
       assetSnapshots,
@@ -676,6 +890,7 @@ export function loadInitialState(): AppState {
       refreshInterval: enumOr(saved.refreshInterval, REFRESH_INTERVALS, base.refreshInterval),
       tradeTimeOnly: typeof saved.tradeTimeOnly === "boolean" ? saved.tradeTimeOnly : base.tradeTimeOnly,
       dividendReinvest: typeof saved.dividendReinvest === "boolean" ? saved.dividendReinvest : base.dividendReinvest,
+      defaultOpenMode: normalizeOpenMode(saved.defaultOpenMode),
       isRefreshing: false,
       lastRefreshAt: 0,
       detailTarget: null,
@@ -691,7 +906,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<AppState>(() => loadInitialState());
   const stateRef = useRef(state);
   const refreshPromiseRef = useRef<Promise<void> | null>(null);
+  const pendingRefreshOptionsRef = useRef<{ forceCorporateActions?: boolean; bypassCoordination?: boolean } | null>(null);
   const corporateActionRefreshPromiseRef = useRef<Promise<void> | null>(null);
+  const persistTimerRef = useRef<number | null>(null);
+  const persistedSnapshotRef = useRef<PersistedState | null>(null);
 
   useEffect(() => {
     stateRef.current = state;
@@ -703,11 +921,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   /* theme colors — recomputed when theme changes */
   const tc = useMemo(() => buildThemeColors(state.theme), [state.theme]);
-  const stats = useMemo(() => computeStats(state.holdings), [state.holdings]);
+  const stats = useMemo(() => computeStats(state.holdings, state.closedHoldings), [state.holdings, state.closedHoldings]);
   const persistedSnapshot = useMemo<PersistedState>(() => ({
     version: STORAGE_VERSION,
     groups: state.groups,
     holdings: state.holdings,
+    closedHoldings: state.closedHoldings,
     defaultPrivacyMode: state.defaultPrivacyMode,
     colorScheme: state.colorScheme,
     theme: state.theme,
@@ -716,12 +935,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     refreshInterval: state.refreshInterval,
     tradeTimeOnly: state.tradeTimeOnly,
     dividendReinvest: state.dividendReinvest,
+    defaultOpenMode: state.defaultOpenMode,
     dcaPlans: state.dcaPlans,
     dcaExecutions: pruneDCAExecutions(state.dcaExecutions),
     assetSnapshots: state.assetSnapshots,
   }), [
     state.groups,
     state.holdings,
+    state.closedHoldings,
     state.defaultPrivacyMode,
     state.colorScheme,
     state.theme,
@@ -730,6 +951,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     state.refreshInterval,
     state.tradeTimeOnly,
     state.dividendReinvest,
+    state.defaultOpenMode,
     state.dcaPlans,
     state.dcaExecutions,
     state.assetSnapshots,
@@ -796,7 +1018,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [applyCorporateActionsToLatestState]);
 
   /* live price refresh */
-  const doRefresh = useCallback(async (currentHoldings: Holding[], options: { forceCorporateActions?: boolean } = {}) => {
+  const doRefresh = useCallback(async (currentHoldings: Holding[], options: { forceCorporateActions?: boolean; bypassCoordination?: boolean } = {}) => {
+    const coordinated = !options.forceCorporateActions && !options.bypassCoordination;
+    if (coordinated && shouldSkipCoordinatedRefresh()) return;
+    if (coordinated) writeRefreshMeta({ ...readRefreshMeta(), startedAt: Date.now() });
     setState((s) => ({ ...s, isRefreshing: true }));
     try {
       const priceMap = await refreshPrices(
@@ -820,7 +1045,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
           const marketValue = h.quantity * lp.price;
           const costBasis   = h.quantity * h.costPrice;
-          const totalPnl    = marketValue - costBasis;
+          const cashDividendTotal = h.cashDividendTotal ?? 0;
+          // totalPnl includes cash dividends received while holding.
+          const totalPnl    = marketValue - costBasis + cashDividendTotal;
           const todayPnl    = Number.isFinite(lp.change) ? h.quantity * lp.change : 0;
           return {
             ...h,
@@ -847,6 +1074,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         });
         const now = new Date();
         const t   = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}:${String(now.getSeconds()).padStart(2,"0")}`;
+        writeRefreshMeta({ startedAt: 0, finishedAt: now.getTime() });
         const dcaState = applyDCAState(updated, s.dcaPlans, s.dcaExecutions, true);
         return {
           ...s,
@@ -861,16 +1089,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       });
       void runCorporateActionRefresh(currentHoldings, options.forceCorporateActions);
     } catch {
+      if (coordinated) writeRefreshMeta({ ...readRefreshMeta(), startedAt: 0 });
       setState((s) => ({ ...s, isRefreshing: false }));
     }
   }, [applyDCAState, runCorporateActionRefresh]);
 
-  const runRefresh = useCallback((currentHoldings: Holding[], options: { forceCorporateActions?: boolean } = {}) => {
-    if (refreshPromiseRef.current) return refreshPromiseRef.current;
+  const runRefresh = useCallback((currentHoldings: Holding[], options: { forceCorporateActions?: boolean; bypassCoordination?: boolean } = {}) => {
+    if (refreshPromiseRef.current) {
+      pendingRefreshOptionsRef.current = {
+        forceCorporateActions: Boolean(options.forceCorporateActions || pendingRefreshOptionsRef.current?.forceCorporateActions),
+        bypassCoordination: Boolean(options.bypassCoordination || pendingRefreshOptionsRef.current?.bypassCoordination),
+      };
+      return refreshPromiseRef.current;
+    }
 
     const task = doRefresh(currentHoldings, options)
       .finally(() => {
         refreshPromiseRef.current = null;
+        const pendingOptions = pendingRefreshOptionsRef.current;
+        pendingRefreshOptionsRef.current = null;
+        if (pendingOptions) {
+          void runRefresh(stateRef.current.holdings, pendingOptions);
+        }
       });
 
     refreshPromiseRef.current = task;
@@ -878,13 +1118,58 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [doRefresh]);
 
   useEffect(() => {
-    void runRefresh(stateRef.current.holdings);
+    // Bypass the cross-view refresh coordination on initial mount: when the
+    // user switches from popup to side panel (or vice versa) within the
+    // 45s TTL, the coordinated skip would otherwise prevent the new view
+    // from fetching data at all, leaving it showing stale values with no
+    // "refreshing" indication. Each view should always refresh at least once
+    // on open.
+    void runRefresh(stateRef.current.holdings, { bypassCoordination: true });
   }, [runRefresh]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    savePersistedState(persistedSnapshot);
+    persistedSnapshotRef.current = persistedSnapshot;
+    if (persistTimerRef.current != null) window.clearTimeout(persistTimerRef.current);
+    persistTimerRef.current = window.setTimeout(() => {
+      savePersistedState(persistedSnapshot);
+      persistTimerRef.current = null;
+    }, 250);
   }, [persistedSnapshot]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    return () => {
+      if (persistTimerRef.current != null) {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+      if (persistedSnapshotRef.current) savePersistedState(persistedSnapshotRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== STORAGE_KEY || !event.newValue) return;
+      const next = loadInitialState();
+      setState((current) => ({
+        ...next,
+        isRefreshing: current.isRefreshing,
+        lastRefreshed: current.lastRefreshed,
+        lastRefreshAt: current.lastRefreshAt,
+        detailTarget: current.detailTarget,
+        dcaPanelOpen: current.dcaPanelOpen,
+        dcaPanelHoldingId: current.dcaPanelHoldingId,
+      }));
+    };
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, []);
+
+  useEffect(() => {
+    void syncExtensionOpenMode(state.defaultOpenMode);
+  }, [state.defaultOpenMode]);
 
   useEffect(() => {
     if (!state.refreshInterval) return;
@@ -913,6 +1198,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const setRefreshInterval = useCallback((v: RefreshInterval) => setState((s) => ({ ...s, refreshInterval: v })), []);
   const setTradeTimeOnly = useCallback((v: boolean) => setState((s) => ({ ...s, tradeTimeOnly: v })), []);
   const setDividendReinvest = useCallback((v: boolean) => setState((s) => ({ ...s, dividendReinvest: v })), []);
+  const setDefaultOpenMode = useCallback((v: ExtensionOpenMode) => {
+    const mode = normalizeOpenMode(v);
+    setState((s) => {
+      const next = { ...s, defaultOpenMode: mode };
+      savePersistedState(buildPersistedState(next));
+      return next;
+    });
+    void syncExtensionOpenMode(mode);
+  }, []);
 
   const exportPortfolio = useCallback(() => JSON.stringify({
     exportedAt: new Date().toISOString(),
@@ -921,6 +1215,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     data: {
       groups: state.groups,
       holdings: state.holdings,
+      closedHoldings: state.closedHoldings,
       dcaPlans: state.dcaPlans,
       dcaExecutions: state.dcaExecutions,
       assetSnapshots: state.assetSnapshots,
@@ -933,6 +1228,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         refreshInterval: state.refreshInterval,
         tradeTimeOnly: state.tradeTimeOnly,
         dividendReinvest: state.dividendReinvest,
+        defaultOpenMode: state.defaultOpenMode,
       },
     },
   }, null, 2), [state]);
@@ -945,8 +1241,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         return { ok: false, error: "导入文件缺少 holdings 数据" };
       }
       const holdings = data.holdings.map(normalizeHolding);
-      const settings = data.settings ?? {};
       const current = stateRef.current;
+      const closedHoldings = Array.isArray(data.closedHoldings)
+        ? data.closedHoldings
+            .map((item: unknown) => normalizeClosedHolding(item as Partial<ClosedHolding> & Record<string, unknown>))
+            .filter((item: ClosedHolding | null): item is ClosedHolding => item != null)
+        : current.closedHoldings;
+      const settings = data.settings ?? {};
       const dcaExecutions = Array.isArray(data.dcaExecutions) ? pruneDCAExecutions(data.dcaExecutions) : current.dcaExecutions;
       const dcaPlans = Array.isArray(data.dcaPlans) ? hydratePlans(data.dcaPlans, dcaExecutions) : current.dcaPlans;
       const dcaState = applyDCAState(holdings, dcaPlans, dcaExecutions);
@@ -954,6 +1255,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         ...current,
         groups: Array.isArray(data.groups) ? data.groups : current.groups,
         holdings: dcaState.holdings,
+        closedHoldings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
         // upsertPortfolioSnapshot(snapshots, holdings, date) keeps all
@@ -977,19 +1279,48 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         refreshInterval: enumOr(settings.refreshInterval, REFRESH_INTERVALS, current.refreshInterval),
         tradeTimeOnly: typeof settings.tradeTimeOnly === "boolean" ? settings.tradeTimeOnly : current.tradeTimeOnly,
         dividendReinvest: typeof settings.dividendReinvest === "boolean" ? settings.dividendReinvest : current.dividendReinvest,
+        defaultOpenMode: normalizeOpenMode(settings.defaultOpenMode ?? current.defaultOpenMode),
       };
-      const saved = savePersistedState(buildPersistedState(nextState), { clearCachesOnFailure: true });
+      const storageError = nextState.language === "en"
+        ? "Import failed: browser extension storage is full. Market caches were cleared; please import again or clear local data first."
+        : "导入失败：浏览器扩展存储空间不足，已尝试清理行情缓存，请重新导入或先清空本地数据。";
+      const saved = savePersistedState(buildPersistedState(nextState), {
+        clearCachesOnFailure: true,
+        errorMessage: storageError,
+      });
       if (!saved.ok) return saved;
+      pruneCorporateActionCheckedAt(dcaState.holdings);
       setState(nextState);
+      void runRefresh(dcaState.holdings, { forceCorporateActions: true, bypassCoordination: true });
       return { ok: true };
     } catch {
       return { ok: false, error: "JSON 格式无法解析" };
     }
-  }, [applyDCAState]);
+  }, [applyDCAState, runRefresh]);
 
   const clearLocalData = useCallback(() => {
-    if (typeof window !== "undefined") window.localStorage.removeItem(STORAGE_KEY);
-    setState(defaultState());
+    if (typeof window !== "undefined") {
+      window.localStorage.removeItem(STORAGE_KEY);
+      // Clear every asset-helper:* cache (chart, market page, fx rates,
+      // corporate actions, trading calendar, fund history …). Scanning by
+      // prefix avoids the list going stale whenever a cache version bumps.
+      try {
+        const keysToRemove: string[] = [];
+        for (let i = 0; i < window.localStorage.length; i += 1) {
+          const key = window.localStorage.key(i);
+          if (key && key.startsWith("asset-helper:") && key !== STORAGE_KEY) {
+            keysToRemove.push(key);
+          }
+        }
+        keysToRemove.forEach((key) => window.localStorage.removeItem(key));
+      } catch {
+        // localStorage access can throw in private mode; ignore.
+      }
+    }
+    pruneCorporateActionCheckedAt([]);
+    // Reset to a truly blank portfolio (no demo data) while preserving the
+    // user's UI preferences so the screen doesn't visually flip on clear.
+    setState((current) => blankState(current));
   }, []);
 
   /* groups */
@@ -1072,6 +1403,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setState((s) => {
       const target = s.holdings.find((item) => item.id === id);
       if (!target) return s;
+      const numericQuantity = Number(input.quantity);
+      const numericPrice = Number(input.price);
+      const isSell = input.type === "sell"
+        && Number.isFinite(numericQuantity) && numericQuantity > 0
+        && Number.isFinite(numericPrice) && numericPrice > 0
+        && target.quantity > 0;
+      const willClose = isSell && numericQuantity >= target.quantity;
+      // Record every sell (partial or full) as a closed-holding entry so the
+      // realized P/L shows up in the closed history. For partial sells the
+      // entry carries only the sold quantity; the remaining position stays.
+      const closedHolding = isSell
+        ? buildClosedHolding(target, numericPrice, todayLocalYMD(), willClose ? target.quantity : numericQuantity)
+        : null;
       const adjusted = applyHoldingAdjustment(target, input);
       const updatedHoldings = adjusted
         ? s.holdings.map((item) => item.id === id ? adjusted : item)
@@ -1083,11 +1427,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         ? s.dcaExecutions
         : s.dcaExecutions.filter((item) => item.holdingId !== id);
       const dcaState = applyDCAState(updatedHoldings, updatedPlans, updatedExecutions);
+      // Full close: closedHolding is set and adjusted is null → prepend.
+      // Partial close: closedHolding is set and adjusted is non-null → still prepend.
+      const nextClosedHoldings = closedHolding ? [closedHolding, ...s.closedHoldings] : s.closedHoldings;
       return {
         ...s,
         holdings: dcaState.holdings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
+        closedHoldings: nextClosedHoldings,
         assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings),
       };
     });
@@ -1111,7 +1459,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [applyDCAState]);
   const removeHolding = useCallback((id: string) => {
     setState((s) => {
+      const target = s.holdings.find((h) => h.id === id);
+      if (!target) return s;
       const updatedHoldings = s.holdings.filter((h) => h.id !== id);
+      pruneCorporateActionCheckedAt(updatedHoldings);
       const updatedPlans = s.dcaPlans.filter((plan) => plan.holdingId !== id);
       const updatedExecutions = s.dcaExecutions.filter((item) => item.holdingId !== id);
       const dcaState = applyDCAState(updatedHoldings, updatedPlans, updatedExecutions);
@@ -1120,11 +1471,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         holdings: dcaState.holdings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
+        closedHoldings: [buildClosedHolding(target), ...s.closedHoldings],
         assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings),
         dcaPanelHoldingId: s.dcaPanelHoldingId === id ? null : s.dcaPanelHoldingId,
       };
     });
   }, [applyDCAState]);
+
+  const removeClosedHolding = useCallback((id: string) => {
+    setState((s) => ({
+      ...s,
+      closedHoldings: s.closedHoldings.filter((item) => item.id !== id),
+    }));
+  }, []);
 
   /* detail overlay */
   const openDetail  = useCallback((t: DetailTarget) => setState((s) => ({ ...s, detailTarget: t })), []);
@@ -1232,10 +1591,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     <AppContext.Provider value={{
       ...state, stats, tc,
       togglePrivacy, setDefaultPrivacyMode, setColorScheme, setTheme, setCurrency, setLanguage, setRefreshInterval,
-      setTradeTimeOnly, setDividendReinvest, refresh,
+      setTradeTimeOnly, setDividendReinvest, setDefaultOpenMode, refresh,
       exportPortfolio, importPortfolio, clearLocalData,
       addGroup, updateGroup, removeGroup,
-      addHolding, updateHolding, adjustHolding, applyCorporateAction, removeHolding,
+      addHolding, updateHolding, adjustHolding, applyCorporateAction, removeHolding, removeClosedHolding,
       openDetail, closeDetail,
       profitColor,
       addDCAPlan, updateDCAPlan, removeDCAPlan, toggleDCAPlan,

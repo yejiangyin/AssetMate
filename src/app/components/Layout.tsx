@@ -1,17 +1,21 @@
 import { NavLink, Outlet, useLocation } from "react-router";
-import { LayoutDashboard, BarChart2, Settings, Globe } from "lucide-react";
+import { LayoutDashboard, BarChart2, Settings, Globe, Calculator } from "lucide-react";
 import { AnimatePresence } from "motion/react";
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
+import type { CSSProperties } from "react";
 import { AppProvider } from "../context/AppContext";
 import { useApp } from "../context/AppContext";
 import { StockDetail } from "./StockDetail";
 import { DCAPanel } from "./DCAPanel";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { t } from "../i18n";
+import { getExtensionViewMode } from "../utils/extensionOpenMode";
 
 const tabs = [
   { to: "/",         key: "dashboard" as const, icon: LayoutDashboard },
   { to: "/holdings", key: "holdings" as const, icon: BarChart2 },
   { to: "/market",   key: "market" as const, icon: Globe },
+  { to: "/backtest", key: "backtest" as const, icon: Calculator },
   { to: "/settings", key: "settings" as const, icon: Settings },
 ];
 
@@ -22,6 +26,33 @@ function LayoutInner() {
   const location = useLocation();
   const previousPathRef = useRef(location.pathname);
   const accent = "var(--app-accent, #4F9CF9)";
+  const isSidePanel = getExtensionViewMode() === "sidepanel";
+  const rootStyle = useMemo(() => ({
+    width: isSidePanel ? "100vw" : 400,
+    height: isSidePanel ? "100vh" : 600,
+    minWidth: isSidePanel ? 320 : 400,
+    minHeight: isSidePanel ? 0 : 600,
+    maxHeight: isSidePanel ? "100vh" : 600,
+    background: tc.bg,
+    fontFamily: "'Inter', system-ui, sans-serif",
+    "--bg": tc.bg,
+    "--bg-card": tc.bgCard,
+    "--bg-surface": tc.bgSurface,
+    "--bg-surface2": tc.bgSurface2,
+    "--bg-overlay": tc.bgOverlay,
+    "--bg-control": tc.bgControl,
+    "--control-hover": tc.controlHover,
+    "--border": tc.border,
+    "--border-sub": tc.borderSub,
+    "--text-primary": tc.textPrimary,
+    "--text-secondary": tc.textSecondary,
+    "--text-muted": tc.textMuted,
+    "--text-micro": tc.textMicro,
+    "--option-bg": tc.optionBg,
+    "--menu-shadow": tc.menuShadow,
+    "--scrim": tc.scrim,
+    "--app-accent": "#4F9CF9",
+  }) as CSSProperties, [isSidePanel, tc]);
 
   useEffect(() => {
     if (previousPathRef.current !== location.pathname) {
@@ -34,31 +65,7 @@ function LayoutInner() {
   return (
     <div
       className="relative flex flex-col overflow-hidden"
-      style={{
-        width: 400, height: 600,
-        minWidth: 400, minHeight: 600,
-        maxHeight: 600,
-        background: tc.bg,
-        fontFamily: "'Inter', system-ui, sans-serif",
-        /* CSS custom properties for pages to consume */
-        ["--bg" as any]:              tc.bg,
-        ["--bg-card" as any]:         tc.bgCard,
-        ["--bg-surface" as any]:      tc.bgSurface,
-        ["--bg-surface2" as any]:     tc.bgSurface2,
-        ["--bg-overlay" as any]:      tc.bgOverlay,
-        ["--bg-control" as any]:      tc.bgControl,
-        ["--control-hover" as any]:   tc.controlHover,
-        ["--border" as any]:          tc.border,
-        ["--border-sub" as any]:      tc.borderSub,
-        ["--text-primary" as any]:    tc.textPrimary,
-        ["--text-secondary" as any]:  tc.textSecondary,
-        ["--text-muted" as any]:      tc.textMuted,
-        ["--text-micro" as any]:      tc.textMicro,
-        ["--option-bg" as any]:       tc.optionBg,
-        ["--menu-shadow" as any]:     tc.menuShadow,
-        ["--scrim" as any]:           tc.scrim,
-        ["--app-accent" as any]:      "#4F9CF9",
-      }}
+      style={rootStyle}
     >
       <div
         className="flex-1 min-h-0 overflow-hidden"
@@ -66,10 +73,12 @@ function LayoutInner() {
           overscrollBehaviorY: "contain",
         }}
       >
-        <Outlet />
+        <ErrorBoundary tc={tc} text={text}>
+          <Outlet />
+        </ErrorBoundary>
       </div>
 
-      {/* Bottom nav — 4 tabs */}
+      {/* Bottom nav */}
       <nav
         className="shrink-0 flex items-stretch border-t"
         style={{

@@ -13,6 +13,8 @@ export interface QuoteSyncPayload {
 }
 
 const QUOTE_SYNC_EVENT = "asset-helper:quote-sync";
+const QUOTE_SYNC_TTL_MS = 10 * 60 * 1000;
+const MAX_QUOTE_SYNC_ENTRIES = 100;
 const latestQuotePayloads = new Map<string, QuoteSyncPayload>();
 
 function payloadKey(payload: Pick<QuoteSyncPayload, "symbol" | "market" | "range">) {
@@ -21,7 +23,16 @@ function payloadKey(payload: Pick<QuoteSyncPayload, "symbol" | "market" | "range
 
 export function emitQuoteSync(payload: QuoteSyncPayload) {
   if (typeof window === "undefined") return;
+  const now = Date.now();
+  for (const [key, item] of latestQuotePayloads) {
+    if (now - item.refreshedAt > QUOTE_SYNC_TTL_MS) latestQuotePayloads.delete(key);
+  }
   latestQuotePayloads.set(payloadKey(payload), payload);
+  while (latestQuotePayloads.size > MAX_QUOTE_SYNC_ENTRIES) {
+    const oldestKey = latestQuotePayloads.keys().next().value;
+    if (!oldestKey) break;
+    latestQuotePayloads.delete(oldestKey);
+  }
   window.dispatchEvent(new CustomEvent<QuoteSyncPayload>(QUOTE_SYNC_EVENT, { detail: payload }));
 }
 
@@ -45,5 +56,12 @@ export function isSameQuoteTarget(
 export function getLatestSyncedQuote(
   target: Pick<QuoteSyncPayload, "symbol" | "market" | "range">,
 ) {
-  return latestQuotePayloads.get(payloadKey(target)) ?? null;
+  const key = payloadKey(target);
+  const payload = latestQuotePayloads.get(key);
+  if (!payload) return null;
+  if (Date.now() - payload.refreshedAt > QUOTE_SYNC_TTL_MS) {
+    latestQuotePayloads.delete(key);
+    return null;
+  }
+  return payload;
 }

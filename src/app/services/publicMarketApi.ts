@@ -23,7 +23,27 @@ export interface PublicChartPoint {
   close?: number;
 }
 
-type TimeRange = "fs" | "1d" | "5d" | "1mo" | "3mo" | "1y" | "max";
+export type PublicMarketTimeRange = "fs" | "1d" | "5d" | "1mo" | "3mo" | "1y" | "max";
+
+type BinanceKlineRow = [
+  number | string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  ...unknown[],
+];
+
+type OkxKlineRow = [
+  number | string,
+  string,
+  string,
+  string,
+  string,
+  string,
+  ...unknown[],
+];
 
 function mkAbort(ms: number): [AbortSignal, () => void] {
   const ctrl = new AbortController();
@@ -53,7 +73,7 @@ function toOkxInstId(symbol: string) {
   return `${cryptoBaseSymbol(symbol)}-USDT`;
 }
 
-function formatDateLabel(input: Date, range: TimeRange) {
+function formatDateLabel(input: Date, range: PublicMarketTimeRange) {
   const year = String(input.getFullYear()).slice(2);
   const month = input.getMonth() + 1;
   const day = input.getDate();
@@ -68,7 +88,7 @@ function formatDateLabel(input: Date, range: TimeRange) {
   return `${year}/${month}/${day}`;
 }
 
-function binanceInterval(range: TimeRange) {
+function binanceInterval(range: PublicMarketTimeRange) {
   switch (range) {
     case "fs":
       return { interval: "5m", limit: 288 };
@@ -87,7 +107,7 @@ function binanceInterval(range: TimeRange) {
   }
 }
 
-function okxBar(range: TimeRange) {
+function okxBar(range: PublicMarketTimeRange) {
   switch (range) {
     case "fs":
       return { bar: "5m", limit: 288 };
@@ -173,7 +193,7 @@ export async function fetchBinanceCryptoQuote(symbol: string): Promise<PublicQuo
   }
 }
 
-export async function fetchBinanceCryptoKline(symbol: string, range: TimeRange): Promise<PublicChartPoint[] | null> {
+export async function fetchBinanceCryptoKline(symbol: string, range: PublicMarketTimeRange): Promise<PublicChartPoint[] | null> {
   const pair = toBinanceSymbol(symbol);
   const { interval, limit } = binanceInterval(range);
   const [signal, clear] = mkAbort(7000);
@@ -184,7 +204,7 @@ export async function fetchBinanceCryptoKline(symbol: string, range: TimeRange):
     );
     clear();
     if (!res.ok) return null;
-    const rows = await res.json() as any[];
+    const rows = await res.json() as BinanceKlineRow[];
     const points = rows.map((row) => {
       const time = new Date(Number(row?.[0] ?? 0));
       const open = num(row?.[1]);
@@ -248,7 +268,7 @@ export async function fetchOkxCryptoQuote(symbol: string): Promise<PublicQuote |
   }
 }
 
-export async function fetchOkxCryptoKline(symbol: string, range: TimeRange): Promise<PublicChartPoint[] | null> {
+export async function fetchOkxCryptoKline(symbol: string, range: PublicMarketTimeRange): Promise<PublicChartPoint[] | null> {
   const instId = toOkxInstId(symbol);
   const { bar, limit } = okxBar(range);
   const [signal, clear] = mkAbort(7000);
@@ -259,7 +279,7 @@ export async function fetchOkxCryptoKline(symbol: string, range: TimeRange): Pro
     );
     clear();
     if (!res.ok) return null;
-    const rows = await res.json() as { data?: any[] };
+    const rows = await res.json() as { data?: OkxKlineRow[] };
     const points = (rows.data ?? []).slice().reverse().map((row) => {
       const time = new Date(Number(row?.[0] ?? 0));
       const open = num(row?.[1]);
