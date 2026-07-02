@@ -196,8 +196,21 @@ function corporateActionHistoryDays(range: TimeRange) {
   }
 }
 
+const DETAIL_INDEX_SYMBOLS = new Set(["000001", "399001", "000300", "399006", "000688", "HSI", "HSTECH", "HSCEI"]);
+
+function isIndexDetailTarget(target: DetailTarget) {
+  const symbol = (target.displaySymbol || target.yahooSymbol)
+    .replace(/^\^/, "")
+    .replace(/\.(SS|SZ|HK)$/i, "")
+    .toUpperCase();
+  return target.market === "INDEX"
+    || target.assetType === "index"
+    || DETAIL_INDEX_SYMBOLS.has(symbol)
+    || /指数|成指|创业板指|科创\s*50|300|INDEX/i.test(target.name);
+}
+
 function buildDetailActionHolding(target: DetailTarget): Holding | null {
-  if (["CRYPTO", "GOLD", "INDEX", "FX"].includes(target.market)) return null;
+  if (["CRYPTO", "GOLD", "FX"].includes(target.market) || isIndexDetailTarget(target)) return null;
   const market = target.market as Holding["market"];
   if (!["US", "HK", "A", "JP", "FUND", "CRYPTO", "BOND", "GOLD"].includes(market)) return null;
   const assetType = ["stock", "etf", "fund", "crypto", "cash", "bond"].includes(target.assetType)
