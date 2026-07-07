@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { parseEastMoneyStockCorporateActionRows } from "./corporateActions";
+import { fetchCorporateActions, parseEastMoneyStockCorporateActionRows } from "./corporateActions";
+import { createHolding, withMockFetch } from "../testUtils";
 
 test("shows shareholder-approved A-share dividend resolutions without treating them as implemented", () => {
   const actions = parseEastMoneyStockCorporateActionRows("600900", [{
@@ -67,4 +68,35 @@ test("keeps implemented A-share dividends on their ex-dividend date", () => {
   assert.equal(actions[0]?.exDate, "2026-02-12");
   assert.equal(actions[0]?.recordDate, "2026-02-11");
   assert.equal(actions[0]?.amount, 0.21);
+});
+
+test("falls back from Yahoo query2 to query1 for corporate actions", async () => {
+  const requested: string[] = [];
+  await withMockFetch((async (input: string | URL | Request) => {
+    const url = String(input);
+    requested.push(url);
+    if (url.includes("query2.finance.yahoo.com")) {
+      return { ok: false, status: 503 } as Response;
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        chart: {
+          result: [{
+            events: {
+              dividends: {
+                d1: { date: Date.parse("2026-01-02T00:00:00Z") / 1000, amount: 0.5 },
+              },
+            },
+          }],
+        },
+      }),
+    } as Response;
+  }) as typeof fetch, async () => {
+    const actions = await fetchCorporateActions(createHolding({ symbol: "AAPL", market: "US", assetType: "stock" }), 45);
+
+    assert.deepEqual(requested.map((url) => new URL(url).host), ["query2.finance.yahoo.com", "query1.finance.yahoo.com"]);
+    assert.equal(actions[0]?.type, "cash_dividend");
+    assert.equal(actions[0]?.amount, 0.5);
+  });
 });

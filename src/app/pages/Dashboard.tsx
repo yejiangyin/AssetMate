@@ -8,7 +8,7 @@ import { fetchRecentDailyChart, toYahooSymbol } from "../services/quoteApi";
 import { mapWithConcurrency, toCNY } from "../services/priceRefresher";
 import { BrandMark } from "../components/BrandMark";
 import { formatExactMoney, formatPercent } from "../utils/numberFormat";
-import { getExtensionViewMode, openExtensionMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
+import { useViewSwitcher } from "../utils/useViewSwitcher";
 import { getMarketBadge } from "../utils/marketBadge";
 import { groupName, t } from "../i18n";
 
@@ -16,6 +16,19 @@ const UNGROUPED = { id: "", name: "未分组", color: "var(--text-micro)" };
 const SERIES_DISPLAY_POINTS = 30;
 const ASSET_SERIES_CACHE_KEY = "dashboard.assetSeries.v4";
 const ASSET_SERIES_CACHE_TTL = 4 * 60 * 60 * 1000;
+const MARKET_TIME_ZONES: Record<string, string> = {
+  A: "Asia/Shanghai",
+  FUND: "Asia/Shanghai",
+  BOND: "Asia/Shanghai",
+  HK: "Asia/Hong_Kong",
+  JP: "Asia/Tokyo",
+  US: "America/New_York",
+  INDEX: "Asia/Shanghai",
+  CRYPTO: "UTC",
+  FX: "UTC",
+  GOLD: "UTC",
+  COMMODITY: "UTC",
+};
 
 type AssetSeriesPoint = {
   date: string;
@@ -41,16 +54,26 @@ function fmtPnl(v: number, priv: boolean, c: string) {
 }
 
 function fmtRate(v: number, c: string, priv: boolean) {
-  const formatted = v === 0 ? "0.0000%" : formatPercent(v);
+  const formatted = formatPercent(v, 2);
   return <span style={{ color: c, fontSize: 12 }}>{priv ? "--" : formatted}</span>;
 }
 
 
 function snapshotToTime(date: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return 0;
   const [year, month, day] = date.split("-").map(Number);
   if (!year || !month || !day) return 0;
   const stamp = new Date(year, month - 1, day).getTime();
-  return Number.isFinite(stamp) ? stamp : 0;
+  const parsed = new Date(stamp);
+  if (
+    !Number.isFinite(stamp)
+    || parsed.getFullYear() !== year
+    || parsed.getMonth() !== month - 1
+    || parsed.getDate() !== day
+  ) {
+    return 0;
+  }
+  return stamp;
 }
 
 function ymdFromTime(time: number) {
@@ -59,6 +82,20 @@ function ymdFromTime(time: number) {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function ymdFromTimeZone(time: number, market: string) {
+  const timeZone = MARKET_TIME_ZONES[market] ?? "UTC";
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date(time));
+  } catch {
+    return ymdFromTime(time);
+  }
 }
 
 function dateLabelFromYMD(date: string) {
@@ -110,7 +147,7 @@ function writeCachedAssetSeries(cacheKey: string, points: AssetSeriesPoint[]) {
 }
 
 export function Dashboard() {
-  const { stats, holdings, groups, privacyMode, togglePrivacy, refresh, isRefreshing, lastRefreshed, profitColor, openDetail, tc, assetSnapshots, language, setDefaultOpenMode } = useApp();
+  const { stats, holdings, groups, privacyMode, togglePrivacy, refresh, isRefreshing, lastRefreshed, lastRefreshError, profitColor, openDetail, tc, assetSnapshots, language } = useApp();
   const text = t(language);
   const navigate = useNavigate();
   const heroGradId = useId().replace(/:/g, "");
@@ -163,6 +200,8 @@ export function Dashboard() {
 
   const seriesCacheKey = useMemo(() => makeSeriesCacheKey(holdings), [holdings]);
   const seriesHoldingsRef = useRef<{ key: string; holdings: typeof holdings }>({ key: "", holdings: [] });
+  // The trend cache key intentionally tracks valuation inputs only. Display-only
+  // changes such as holding names should not trigger a historical series reload.
   if (seriesHoldingsRef.current.key !== seriesCacheKey) {
     seriesHoldingsRef.current = { key: seriesCacheKey, holdings };
   }
@@ -181,7 +220,8 @@ export function Dashboard() {
   }, [hasCompleteSnapshotSeries, seriesHoldings.length, seriesCacheKey, freshCachedAssetSeries]);
 
   useEffect(() => {
-    if (seriesHoldings.length === 0 || hasCompleteSnapshotSeries) {
+    const holdingsForSeries = seriesHoldingsRef.current.holdings;
+    if (holdingsForSeries.length === 0 || hasCompleteSnapshotSeries) {
       setEstimatedAssetSeries(null);
       setLoadingEstimated(false);
       return;
@@ -202,7 +242,7 @@ export function Dashboard() {
 
     const loadEstimatedSeries = async () => {
       try {
-        const valuedHoldings = seriesHoldings
+        const valuedHoldings = holdingsForSeries
           .map((holding) => ({
             holding,
             currentValueCny: toCNY(holding.quantity * holding.currentPrice, holding.currency),
@@ -225,38 +265,68 @@ export function Dashboard() {
           contributionCounts.set(date, 0);
         }
 
+        const addFlatFallback = (currentValueCny: number) => {
+          for (const date of targetDates) {
+            totals.set(date, (totals.get(date) ?? 0) + currentValueCny);
+            contributionCounts.set(date, (contributionCounts.get(date) ?? 0) + 1);
+          }
+        };
+
         const results = await mapWithConcurrency(
           valuedHoldings,
           4,
           async ({ holding, currentValueCny }) => {
-            const chart = await fetchRecentDailyChart(holding.symbol, holding.market, SERIES_DISPLAY_POINTS + 10);
-            const validPoints = chart.points
-              .filter((point) => point.price > 0 && point.timestamp)
-              .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
-            if (validPoints.length < 2) return false;
-            const latestPrice = validPoints[validPoints.length - 1]?.price || holding.currentPrice;
-            if (!(latestPrice > 0)) return false;
-
-            let cursor = 0;
-            let lastPrice: number | null = null;
-            for (const date of targetDates) {
-              const dayEnd = snapshotToTime(date) + 24 * 60 * 60 * 1000 - 1;
-              while (cursor < validPoints.length && (validPoints[cursor]?.timestamp ?? 0) <= dayEnd) {
-                lastPrice = validPoints[cursor]?.price ?? lastPrice;
-                cursor += 1;
+            try {
+              const chart = await fetchRecentDailyChart(holding.symbol, holding.market, SERIES_DISPLAY_POINTS + 10);
+              const validPoints = chart.points
+                .filter((point) => point.price > 0 && point.timestamp)
+                .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
+              if (validPoints.length < 2) {
+                addFlatFallback(currentValueCny);
+                return false;
               }
-              if (lastPrice == null) continue;
-              const price = lastPrice;
-              const estimatedValue = currentValueCny * (price / latestPrice);
-              totals.set(date, (totals.get(date) ?? 0) + estimatedValue);
-              contributionCounts.set(date, (contributionCounts.get(date) ?? 0) + 1);
+              const latestPrice = validPoints[validPoints.length - 1]?.price || holding.currentPrice;
+              if (!(latestPrice > 0)) {
+                addFlatFallback(currentValueCny);
+                return false;
+              }
+
+              let cursor = 0;
+              let lastPrice: number | null = null;
+              const contributedDates = new Set<string>();
+              const datedPoints = validPoints.map((point) => ({
+                ...point,
+                marketDate: ymdFromTimeZone(point.timestamp ?? 0, holding.market),
+              }));
+              for (const date of targetDates) {
+                while (cursor < datedPoints.length && (datedPoints[cursor]?.marketDate ?? "") <= date) {
+                  lastPrice = datedPoints[cursor]?.price ?? lastPrice;
+                  cursor += 1;
+                }
+                if (lastPrice == null) continue;
+                const price = lastPrice;
+                const estimatedValue = currentValueCny * (price / latestPrice);
+                totals.set(date, (totals.get(date) ?? 0) + estimatedValue);
+                contributionCounts.set(date, (contributionCounts.get(date) ?? 0) + 1);
+                contributedDates.add(date);
+              }
+
+              for (const date of targetDates) {
+                if (contributedDates.has(date)) continue;
+                totals.set(date, (totals.get(date) ?? 0) + currentValueCny);
+                contributionCounts.set(date, (contributionCounts.get(date) ?? 0) + 1);
+              }
+              return contributedDates.size > 0;
+            } catch (error) {
+              console.warn("Failed to load estimated asset series for holding", holding.symbol, error);
+              addFlatFallback(currentValueCny);
+              return false;
             }
-            return true;
           },
         );
 
-        const hasAnyChart = results.some((result) => result.status === "fulfilled" && result.value === true);
-        if (!hasAnyChart || cancelled) return;
+        const hasAnyContribution = results.some((result) => result.status === "fulfilled");
+        if (!hasAnyContribution || cancelled) return;
 
         const points = targetDates.map((date, index) => ({
           date: dateLabelFromYMD(date),
@@ -269,6 +339,8 @@ export function Dashboard() {
           writeCachedAssetSeries(seriesCacheKey, points);
           if (!cancelled) setEstimatedAssetSeries({ key: seriesCacheKey, points });
         }
+      } catch (error) {
+        console.warn("Failed to load estimated asset series", error);
       } finally {
         if (!cancelled) setLoadingEstimated(false);
       }
@@ -278,7 +350,7 @@ export function Dashboard() {
     return () => {
       cancelled = true;
     };
-  }, [freshCachedAssetSeries, staleCachedAssetSeries, hasCompleteSnapshotSeries, seriesHoldings, seriesCacheKey]);
+  }, [freshCachedAssetSeries, staleCachedAssetSeries, hasCompleteSnapshotSeries, seriesCacheKey]);
 
   const assetSeries = useMemo(() => {
     if (hasCompleteSnapshotSeries) return snapshotSeries;
@@ -294,7 +366,7 @@ export function Dashboard() {
   const cumulColor = profitColor(stats.unrealizedPnl);
   const realizedColor = profitColor(stats.realizedPnl);
   const totalColor = profitColor(stats.totalInvestmentPnl);
-  const costBasis  = stats.totalAsset - stats.unrealizedPnl;
+  const costBasis  = stats.costBasis;
 
   /* ── asset allocation by holding group, same as Holdings page ── */
   const alloc = useMemo(() => {
@@ -327,6 +399,13 @@ export function Dashboard() {
       .map(([market]) => ({ market, ...getMarketBadge(market, language) }));
   }, [holdings, language]);
 
+  useEffect(() => {
+    if (assetFilter === "ALL") return;
+    if (!marketTabs.some((tab) => tab.market === assetFilter)) {
+      setAssetFilter("ALL");
+    }
+  }, [assetFilter, marketTabs]);
+
   const topMovers = useMemo(() => {
     const filtered = assetFilter === "ALL" ? holdings : holdings.filter((h) => h.market === assetFilter);
     const sorted = [...filtered].sort((a, b) => {
@@ -336,7 +415,7 @@ export function Dashboard() {
       if (pnlSort === "loss") return av - bv;          // 亏损多的在前
       return Math.abs(bv) - Math.abs(av);              // 波动大的在前
     });
-    return sorted;
+    return sorted.slice(0, 20);
   }, [holdings, pnlSort, assetFilter]);
 
   const dashboardRefreshing = isRefreshing || manualRefreshing;
@@ -351,35 +430,7 @@ export function Dashboard() {
     void refresh();
   }, [refresh, dashboardRefreshing]);
 
-  const isSidePanel = getExtensionViewMode() === "sidepanel";
-  const switchTitle = isSidePanel
-    ? (language === "en" ? "Switch to popup" : "切换为弹窗")
-    : (language === "en" ? "Switch to side panel" : "切换为右侧面板");
-  const handleSwitchView = useCallback(() => {
-    const mode: ExtensionOpenMode = isSidePanel ? "popup" : "sidepanel";
-    // Persist as the default open mode so the chosen view sticks for next time.
-    setDefaultOpenMode(mode);
-    if (isSidePanel) {
-      // Side panel → popup: just close the side panel. Don't call openPopup
-      // (it opens a popup that immediately loses focus and closes). The
-      // default mode is now popup, so the user gets the popup next time they
-      // click the toolbar icon.
-      void syncExtensionOpenMode(mode).finally(() => {
-        if (typeof window !== "undefined") {
-          try { window.close(); } catch { /* ignore */ }
-        }
-      });
-    } else {
-      // Popup → side panel: open the side panel then close the popup.
-      void openExtensionMode(mode).then(() => {
-        if (typeof window !== "undefined") {
-          window.setTimeout(() => {
-            try { window.close(); } catch { /* ignore */ }
-          }, 150);
-        }
-      });
-    }
-  }, [isSidePanel, setDefaultOpenMode]);
+  const { isSidePanel, switchTitle, toggleView: handleSwitchView } = useViewSwitcher();
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
@@ -393,7 +444,7 @@ export function Dashboard() {
           <span className="text-tp text-sm font-semibold tracking-tight">{text.appName}</span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-tm text-[11px]">{lastRefreshed}</span>
+          <span className="text-tm text-[11px]">{lastRefreshError || lastRefreshed}</span>
           <button onClick={togglePrivacy} className="flex items-center justify-center rounded-lg size-[30px] bg-app-card">
             {privacyMode ? <EyeOff size={14} color="var(--text-secondary)" /> : <Eye size={14} color="var(--text-secondary)" />}
           </button>
@@ -681,7 +732,7 @@ export function Dashboard() {
                       </div>
                       <div className="text-right">
                         <span style={{ color: c, fontSize: 12, fontWeight: 600, whiteSpace: "nowrap" }}>
-                          {item.todayPnl >= 0 ? "+" : "-"}
+                          {item.todayPnl > 0 ? "+" : item.todayPnl < 0 ? "-" : ""}
                           {privacyMode ? "--" : formatExactMoney(Math.abs(todayPnlCny), "CNY", 2)}
                         </span>
                         <span style={{ color: c, fontSize: 10, marginLeft: 4, whiteSpace: "nowrap" }}>

@@ -89,6 +89,9 @@ export const FX: FxRateMap = {
   ...FX_DEFAULTS,
   ...readStoredFxRates(),
 };
+FX.USDT = FX.USD;
+FX.USDC = FX.USD;
+FX.CNY = 1;
 
 function syncFxRatesFromStorage() {
   applyFxRates(readStoredFxRates());
@@ -239,11 +242,11 @@ function normalTradeStatusFromSource(source: LivePrice["source"]): Pick<HoldingL
 
 async function eastMoneyFundLive(code: string): Promise<LivePrice | null> {
   try {
-    const estimate = await fetchCnFundEstimate(code);
-    const [officialNav, history] = await Promise.all([
-      fetchCnFundOfficialNav(code),
+    const [estimate, history] = await Promise.all([
+      fetchCnFundEstimate(code),
       fetchCnFundOfficialHistory(code, 10),
     ]);
+    const officialNav = await fetchCnFundOfficialNav(code, { estimate, history });
     const sortedHistory = [...history].sort((a, b) => b.date.localeCompare(a.date));
     const gsz = estimate?.estimatedNav ?? 0;
     const dwjz = estimate?.officialNav ?? 0;
@@ -299,7 +302,11 @@ const COINGECKO_IDS: Record<string, string> = {
 };
 
 async function fetchCrypto(symbol: string): Promise<LivePrice | null> {
-  const binance = await fetchBinanceCryptoQuote(symbol);
+  const [binanceResult, okxResult] = await Promise.allSettled([
+    fetchBinanceCryptoQuote(symbol),
+    fetchOkxCryptoQuote(symbol),
+  ]);
+  const binance = binanceResult.status === "fulfilled" ? binanceResult.value : null;
   if (binance) {
     return {
       price: binance.price,
@@ -313,7 +320,7 @@ async function fetchCrypto(symbol: string): Promise<LivePrice | null> {
       source: "binance",
     };
   }
-  const okx = await fetchOkxCryptoQuote(symbol);
+  const okx = okxResult.status === "fulfilled" ? okxResult.value : null;
   if (okx) {
     return {
       price: okx.price,
@@ -529,12 +536,12 @@ async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSi
   await refreshFxRates();
   if (signal.aborted) return {};
   const eastMoneyTargets = targets.filter((h) => h.market === "A" || h.market === "HK");
-  const eastMoneyQuotes = eastMoneyTargets.length
-    ? await fetchEastMoneyQuotesBySymbols(eastMoneyTargets.map((h) => ({ symbol: h.symbol, market: h.market }))).catch(() => [])
-    : [];
-  const eastMoneyStatuses = eastMoneyTargets.length
-    ? await fetchEastMoneyTradeStatusesBySymbols(eastMoneyTargets.map((h) => ({ symbol: h.symbol, market: h.market }))).catch(() => [])
-    : [];
+  const [eastMoneyQuotes, eastMoneyStatuses] = eastMoneyTargets.length
+    ? await Promise.all([
+      fetchEastMoneyQuotesBySymbols(eastMoneyTargets.map((h) => ({ symbol: h.symbol, market: h.market }))).catch(() => []),
+      fetchEastMoneyTradeStatusesBySymbols(eastMoneyTargets.map((h) => ({ symbol: h.symbol, market: h.market }))).catch(() => []),
+    ])
+    : [[], []];
   const eastMoneyMap = new Map(
     eastMoneyQuotes.map((quote) => [`${quote.market}:${quote.symbol}`, toLivePriceFromEastMoneyQuote(quote)])
   );

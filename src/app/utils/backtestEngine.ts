@@ -18,6 +18,8 @@ export type BacktestPricePoint = {
   price: number;
   /** Cash dividend per share/unit on the ex-dividend date. */
   dividend?: number;
+  /** Share multiplier applied before same-day buys, e.g. 2 for a 2-for-1 split. */
+  splitRatio?: number;
   /** Price is already adjusted for dividends/splits, so dividends must not be added again. */
   adjusted?: boolean;
 };
@@ -26,6 +28,7 @@ export type BacktestPoint = {
   date: string;
   price: number;
   dividend: number;
+  splitRatio: number;
   adjusted: boolean;
   dividendCash: number;
   cashDividends: number;
@@ -44,6 +47,9 @@ export type BacktestResult = {
   totalPnl: number;
   totalReturn: number;
   annualizedReturn: number;
+  /** Drawdown of market value only, excluding accumulated cash dividends. */
+  marketMaxDrawdown: number;
+  /** Drawdown of total value including accumulated cash dividends. */
   maxDrawdown: number;
   totalDividends: number;
   priceMode: "adjusted" | "cash_dividend";
@@ -73,6 +79,49 @@ function normalizeAmount(value: number) {
   return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
+function xnpv(rate: number, cashFlows: Array<{ date: string; amount: number }>) {
+  if (!cashFlows.length) return 0;
+  const first = new Date(`${cashFlows[0]!.date}T00:00:00Z`).getTime();
+  return cashFlows.reduce((sum, flow) => {
+    const time = new Date(`${flow.date}T00:00:00Z`).getTime();
+    if (!Number.isFinite(time) || !Number.isFinite(first)) return sum;
+    const years = (time - first) / 31_536_000_000;
+    return sum + flow.amount / ((1 + rate) ** years);
+  }, 0);
+}
+
+function calculateXirr(cashFlows: Array<{ date: string; amount: number }>) {
+  const hasPositive = cashFlows.some((flow) => flow.amount > 0);
+  const hasNegative = cashFlows.some((flow) => flow.amount < 0);
+  if (!hasPositive || !hasNegative) return 0;
+  const firstDate = dateKey(cashFlows[0]?.date ?? "");
+  if (!firstDate || cashFlows.every((flow) => dateKey(flow.date) === firstDate)) return 0;
+
+  let low = -0.9999;
+  let high = 10;
+  let lowValue = xnpv(low, cashFlows);
+  let highValue = xnpv(high, cashFlows);
+  while (lowValue * highValue > 0 && high < 1_000_000) {
+    high *= 10;
+    highValue = xnpv(high, cashFlows);
+  }
+  if (lowValue * highValue > 0) return 0;
+
+  for (let i = 0; i < 100; i += 1) {
+    const mid = (low + high) / 2;
+    const value = xnpv(mid, cashFlows);
+    if (Math.abs(value) < 1e-7) return mid;
+    if (lowValue * value <= 0) {
+      high = mid;
+      highValue = value;
+    } else {
+      low = mid;
+      lowValue = value;
+    }
+  }
+  return (low + high) / 2;
+}
+
 function buyShares(amount: number, price: number, feeRate: number) {
   const gross = normalizeAmount(amount);
   if (gross <= 0 || price <= 0) return 0;
@@ -100,6 +149,7 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
       date: dateKey(point.date),
       price: Number(point.price),
       dividend: Number.isFinite(point.dividend) ? Math.max(0, Number(point.dividend)) : 0,
+      splitRatio: Number.isFinite(point.splitRatio) && Number(point.splitRatio) > 0 ? Number(point.splitRatio) : 1,
       adjusted: point.adjusted === true,
     }))
     .filter((point) => point.date && Number.isFinite(point.price) && point.price > 0)
@@ -119,9 +169,16 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
   let cashDividends = 0;
   let lastInvestmentPeriod = "";
   let peakValue = 0;
+  let peakMarketValue = 0;
   let maxDrawdown = 0;
+  let marketMaxDrawdown = 0;
+  const cashFlows: Array<{ date: string; amount: number }> = [];
 
   const points = prices.map((point, index) => {
+    if (point.splitRatio > 0 && point.splitRatio !== 1) {
+      shares *= point.splitRatio;
+    }
+
     // Ex-dividend cash belongs only to shares already held before this date.
     // Buy orders for the same date are applied after the dividend credit.
     const dividendCash = priceMode === "adjusted" ? 0 : shares * point.dividend;
@@ -130,6 +187,7 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
     if (input.strategy === "lump_sum" && index === 0 && initialAmount > 0) {
       shares += buyShares(initialAmount, point.price, feeRate);
       invested += initialAmount;
+      cashFlows.push({ date: point.date, amount: -initialAmount });
     }
 
     if (isDcaStrategy(input.strategy)) {
@@ -139,10 +197,12 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
       if (index === 0 && initialAmount > 0) {
         shares += buyShares(initialAmount, point.price, feeRate);
         invested += initialAmount;
+        cashFlows.push({ date: point.date, amount: -initialAmount });
         lastInvestmentPeriod = currentPeriod;
       } else if (currentPeriod && currentPeriod !== lastInvestmentPeriod && recurringAmount > 0) {
         shares += buyShares(recurringAmount, point.price, feeRate);
         invested += recurringAmount;
+        cashFlows.push({ date: point.date, amount: -recurringAmount });
         lastInvestmentPeriod = currentPeriod;
       }
     }
@@ -153,11 +213,16 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
     if (peakValue > 0) {
       maxDrawdown = Math.max(maxDrawdown, (peakValue - value) / peakValue);
     }
+    if (marketValue > peakMarketValue) peakMarketValue = marketValue;
+    if (peakMarketValue > 0) {
+      marketMaxDrawdown = Math.max(marketMaxDrawdown, (peakMarketValue - marketValue) / peakMarketValue);
+    }
     const pnl = value - invested;
     return {
       date: point.date,
       price: point.price,
       dividend: point.dividend,
+      splitRatio: point.splitRatio,
       adjusted: point.adjusted,
       dividendCash,
       cashDividends,
@@ -171,21 +236,16 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
   });
 
   const finalPoint = points[points.length - 1];
-  const firstPrice = prices[0];
-  const lastPrice = prices[prices.length - 1];
-  if (!finalPoint || !firstPrice || !lastPrice) {
+  if (!finalPoint) {
     throw new Error("NO_PRICE_DATA");
   }
   const totalInvested = finalPoint.invested;
   const finalMarketValue = finalPoint.marketValue;
   const finalValue = finalPoint.value;
   const totalPnl = finalValue - totalInvested;
-  const firstTime = new Date(firstPrice.date).getTime();
-  const lastTime = new Date(lastPrice.date).getTime();
-  const elapsedDays = Math.max(1, (lastTime - firstTime) / 86_400_000);
   const totalReturn = totalInvested > 0 ? totalPnl / totalInvested : 0;
   const annualizedReturn = totalInvested > 0 && finalValue > 0
-    ? (finalValue / totalInvested) ** (365 / elapsedDays) - 1
+    ? calculateXirr([...cashFlows, { date: finalPoint.date, amount: finalValue }])
     : 0;
 
   return {
@@ -195,6 +255,7 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
     totalPnl,
     totalReturn,
     annualizedReturn,
+    marketMaxDrawdown,
     maxDrawdown,
     totalDividends: finalPoint.cashDividends,
     priceMode,

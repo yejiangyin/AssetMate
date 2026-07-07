@@ -192,7 +192,7 @@ export async function refreshTradingCalendar(force = false) {
   const payload = await task.finally(() => {
     if (remoteCalendarInFlight === task) remoteCalendarInFlight = null;
   });
-  return payload ? getTradingCalendarStatus() : remoteCalendarStatus;
+  return payload ? getTradingCalendarStatus() : null;
 }
 
 function nthWeekdayOfMonth(year: number, month: number, weekday: number, nth: number) {

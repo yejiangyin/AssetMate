@@ -31,12 +31,18 @@ export interface LiveResult {
   source:    "live" | "local";
 }
 
-interface FundEstimateSnapshot {
+export interface FundEstimateSnapshot {
   name?: string;
   officialDate?: string;
   officialNav: number;
   estimatedNav: number;
   estimatedChangePercent: number;
+}
+
+export interface FundOfficialHistoryItem {
+  date: string;
+  nav: number;
+  changePercent: number;
 }
 
 function formatChinaFundDate(timestamp: number): string {
@@ -135,7 +141,7 @@ export function resolveYahooUsPrice(meta: any, market: Market) {
   const marketState = String(meta?.marketState ?? "").toUpperCase();
   const prePrice = numberOrZero(meta?.preMarketPrice);
   const postPrice = numberOrZero(meta?.postMarketPrice);
-  const price = postPrice && (marketState.includes("POST") || marketState === "CLOSED")
+  const price = postPrice && marketState.includes("POST")
     ? postPrice
     : prePrice && marketState.includes("PRE")
       ? prePrice
@@ -192,6 +198,10 @@ export function parseFundBuyConfirmDays(text: string): number | undefined {
   return Number.isInteger(days) && days >= 0 && days <= 30 ? days : undefined;
 }
 
+export function parseFundPurchaseLimitText(text: string): string {
+  return text.match(/(?:单日累计购买上限|日累计申购限额)\s*((?:[0-9]+(?:\.[0-9]+)?\s*[万千百十]?[\s零]*)+\s*元?|---|不限|无限额)/)?.[1]?.trim() ?? "";
+}
+
 export async function fetchCnFundTradeStatus(code: string): Promise<{
   status: "normal" | "fund_limit" | "buy_disabled";
   note: string;
@@ -217,7 +227,7 @@ export async function fetchCnFundTradeStatus(code: string): Promise<{
       .trim();
     const purchase = text.match(/申购状态\s*(暂停申购|开放申购|限制大额申购|限大额|暂停|开放|不支持)/)?.[1] ?? "";
     const dca = text.match(/定投状态\s*(不支持|暂停|开放|支持)/)?.[1] ?? "";
-    const limit = text.match(/(?:单日累计购买上限|日累计申购限额)\s*([0-9.]+[万千百十]?元|---|不限|无限额)/)?.[1] ?? "";
+    const limit = parseFundPurchaseLimitText(text);
     const buyConfirmDays = parseFundBuyConfirmDays(text);
     const confirmPatch = buyConfirmDays !== undefined ? { buyConfirmDays } : {};
 
@@ -673,15 +683,18 @@ async function fetchYahooLivePrice(symbol: string, market: Market) {
   return fetchYahooLiveSecurity(symbol, market);
 }
 
-export async function fetchCnFundOfficialNav(code: string): Promise<number | null> {
-  const history = await fetchCnFundOfficialHistory(code, 1);
+export async function fetchCnFundOfficialNav(
+  code: string,
+  options: { history?: FundOfficialHistoryItem[]; estimate?: FundEstimateSnapshot | null } = {},
+): Promise<number | null> {
+  const history = options.history ?? await fetchCnFundOfficialHistory(code, 1);
   if (history[0]?.nav && history[0].nav > 0) return history[0].nav;
-  const estimate = await fetchCnFundEstimate(code);
+  const estimate = options.estimate !== undefined ? options.estimate : await fetchCnFundEstimate(code);
   if (estimate?.officialNav && estimate.officialNav > 0) return estimate.officialNav;
-  return history[0]?.nav && history[0].nav > 0 ? history[0].nav : null;
+  return null;
 }
 
-export async function fetchCnFundOfficialHistory(code: string, pageSize = 60) {
+export async function fetchCnFundOfficialHistory(code: string, pageSize = 60): Promise<FundOfficialHistoryItem[]> {
   const timeoutMs = pageSize >= 1000 ? 20000 : 10000;
   const [signal, clear] = mkAbort(timeoutMs);
   try {
@@ -745,7 +758,11 @@ export async function fetchCnFundOfficialHistory(code: string, pageSize = 60) {
 }
 
 export async function fetchCryptoPrice(symbol: string, coinId?: string) {
-  const binance = await fetchBinanceCryptoQuote(symbol);
+  const [binanceResult, okxResult] = await Promise.allSettled([
+    fetchBinanceCryptoQuote(symbol),
+    fetchOkxCryptoQuote(symbol),
+  ]);
+  const binance = binanceResult.status === "fulfilled" ? binanceResult.value : null;
   if (binance) {
     return {
       price: binance.price,
@@ -759,7 +776,7 @@ export async function fetchCryptoPrice(symbol: string, coinId?: string) {
     };
   }
 
-  const okx = await fetchOkxCryptoQuote(symbol);
+  const okx = okxResult.status === "fulfilled" ? okxResult.value : null;
   if (okx) {
     return {
       price: okx.price,
@@ -818,7 +835,11 @@ export async function fetchLivePrice(symbol: string, market: Market, coinId?: st
   }
 
   if (market === "A" || market === "HK") {
-    const eastMoney = await fetchEastMoneyQuoteBySymbol(symbol, market);
+    const [eastMoneyResult, tencentResult] = await Promise.allSettled([
+      fetchEastMoneyQuoteBySymbol(symbol, market),
+      fetchTencentQuote(symbol, market),
+    ]);
+    const eastMoney = eastMoneyResult.status === "fulfilled" ? eastMoneyResult.value : null;
     if (eastMoney) {
       return {
         price: eastMoney.price,
@@ -832,16 +853,20 @@ export async function fetchLivePrice(symbol: string, market: Market, coinId?: st
       };
     }
 
-    const tencent = await fetchTencentQuote(symbol, market);
+    const tencent = tencentResult.status === "fulfilled" ? tencentResult.value : null;
     if (tencent) return tencent;
 
     return fetchYahooLivePrice(symbol, market);
   }
 
   if (market === "FUND") {
+    let estimate: FundEstimateSnapshot | null = null;
+    let history: FundOfficialHistoryItem[] = [];
     try {
-      const estimate = await fetchCnFundEstimate(symbol);
-      const history = await fetchCnFundOfficialHistory(symbol, 2);
+      [estimate, history] = await Promise.all([
+        fetchCnFundEstimate(symbol),
+        fetchCnFundOfficialHistory(symbol, 2),
+      ]);
       const sortedHistory = [...history].sort((a, b) => b.date.localeCompare(a.date));
       const latestHistory = sortedHistory[0];
       const prevHistory = sortedHistory[1];
@@ -874,7 +899,7 @@ export async function fetchLivePrice(symbol: string, market: Market, coinId?: st
       // fall through to single-value fallback below
     }
 
-    const nav = await fetchCnFundOfficialNav(symbol);
+    const nav = await fetchCnFundOfficialNav(symbol, { estimate, history });
     if (nav && nav > 0) {
       return {
         price: nav,
@@ -908,6 +933,23 @@ function filterSearchResults(query: string, results: LiveResult[]) {
   });
 }
 
+async function mapWithLocalConcurrency<T>(
+  items: T[],
+  limit: number,
+  mapper: (item: T) => Promise<void>,
+) {
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (cursor < items.length) {
+      const item = items[cursor];
+      cursor += 1;
+      if (item === undefined) continue;
+      await mapper(item).catch(() => undefined);
+    }
+  }));
+}
+
 async function enrichSearchResults(query: string, results: LiveResult[]) {
   const enriched = results.map((item) => ({ ...item }));
   const pendingAOrH = enriched.filter((item) => item.price <= 0 && (item.market === "A" || item.market === "HK"));
@@ -931,14 +973,14 @@ async function enrichSearchResults(query: string, results: LiveResult[]) {
   }
 
   const stillPending = enriched.filter((item) => item.price <= 0);
-  await Promise.all(stillPending.map(async (item) => {
+  await mapWithLocalConcurrency(stillPending, 4, async (item) => {
     const quote = await fetchLivePrice(item.symbol, item.market, item.coinId);
     if (!quote?.price || quote.price <= 0) return;
     item.price = quote.price;
     item.priceReady = true;
     item.currency = quote.currency || item.currency;
     item.source = "live";
-  }));
+  });
 
   return filterSearchResults(query, enriched);
 }

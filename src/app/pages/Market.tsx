@@ -42,6 +42,15 @@ function hasSparklinePoints(points: ChartPoint[]) {
   return sparklineDataFromPoints(points).length > 1;
 }
 
+function indexDisplayName(entry: IndexEntry, language: string) {
+  return language === "en" ? entry.shortName ?? entry.name : entry.name;
+}
+
+function indexSecondaryName(entry: IndexEntry, language: string) {
+  const secondary = language === "en" ? entry.displaySymbol : entry.shortName;
+  return secondary && secondary !== indexDisplayName(entry, language) ? secondary : "";
+}
+
 function timeLabel(date = new Date()) {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
 }
@@ -241,6 +250,7 @@ let marketPageCache: MarketPageCache | null = null;
 
 const MARKET_PAGE_CACHE_KEY = "asset-helper:market-page-cache:v6";
 const FALLBACK_MARKET_PAGE_CACHE_TTL = 5 * 60 * 1000;
+const CLEAR_RUNTIME_CACHES_EVENT = "asset-helper:clear-runtime-caches";
 
 function isValidCachedIndexEntry(entry: unknown): entry is IndexEntry {
   const item = entry as Partial<IndexEntry>;
@@ -287,6 +297,14 @@ function writeMarketPageCache(cache: MarketPageCache) {
   } catch {
     // Cache write failures should not affect market data rendering.
   }
+}
+
+export function clearMarketPageRuntimeCache() {
+  marketPageCache = null;
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener(CLEAR_RUNTIME_CACHES_EVENT, clearMarketPageRuntimeCache);
 }
 
 function marketCacheTtl(refreshInterval: number) {
@@ -379,6 +397,8 @@ function IndexCard({ entry, catColor, onPress }: {
   const c  = profitColor(resolvedRate);
   const isUp = resolvedRate >= 0;
   const borderColor = hovered ? "rgba(79,156,249,0.25)" : "var(--border-sub)";
+  const displayName = indexDisplayName(entry, language);
+  const secondaryName = indexSecondaryName(entry, language);
 
   return (
     <motion.button
@@ -404,9 +424,9 @@ function IndexCard({ entry, catColor, onPress }: {
         {/* Left: name + value */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 mb-0.5">
-            <span style={{ color: "var(--text-primary)", fontSize: 12, fontWeight: 600 }}>{language === "en" ? entry.shortName ?? entry.name : entry.name}</span>
-            {entry.shortName && (
-              <span style={{ color: "var(--text-micro)", fontSize: 9 }}>{entry.shortName}</span>
+            <span style={{ color: "var(--text-primary)", fontSize: 12, fontWeight: 600 }}>{displayName}</span>
+            {secondaryName && (
+              <span style={{ color: "var(--text-micro)", fontSize: 9 }}>{secondaryName}</span>
             )}
           </div>
           <span style={{ color: "var(--text-primary)", fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
@@ -460,6 +480,7 @@ export function Market() {
   const lastSyncedRefreshRef = useRef<number>(initialMarketCache?.syncedAt ?? 0);
   const bootstrappedFromFreshCacheRef = useRef(isFreshMarketPageCache(initialMarketCache, refreshInterval));
   const indicesRef = useRef(indices);
+  const refreshSeqRef = useRef(0);
   useEffect(() => { indicesRef.current = indices; }, [indices]);
 
   // Display global refresh time when available, otherwise show local cache time
@@ -472,6 +493,7 @@ export function Market() {
     syncedAt = 0,
     showSpinner = false,
   ) => {
+    const refreshSeq = ++refreshSeqRef.current;
     if (showSpinner) setRefreshing(true);
     try {
       const source = current.length ? current : INDICES;
@@ -483,7 +505,7 @@ export function Market() {
           const nextValue = q.price > 0 ? q.price : null;
           const normalizedChange = Number.isFinite(q.change) ? q.change : null;
           const normalizedChangeRate = Number.isFinite(q.changePercent)
-            ? (normalizedChange != null && normalizedChange !== 0
+            ? (normalizedChange != null && Math.abs(normalizedChange) > 1e-9
               ? Math.abs(q.changePercent) * (normalizedChange >= 0 ? 1 : -1)
               : q.changePercent)
             : null;
@@ -513,16 +535,6 @@ export function Market() {
             detailPoints: hasChart ? chart.points : entry.detailPoints,
             chartAvailable: hasChart,
           };
-          setIndices((currentItems) => {
-            const nextItems = currentItems.map((item) => item.id === entry.id ? nextEntry : item);
-            writeMarketPageCache({
-              indices: nextItems,
-              lastRefreshed: timeLabel(),
-              syncedAt,
-              savedAt: Date.now(),
-            });
-            return nextItems;
-          });
           return nextEntry;
         } catch {
           return {
@@ -536,20 +548,26 @@ export function Market() {
           };
         }
       });
-      // mapWithConcurrency returns PromiseSettledResult<R>[] — keep only fulfilled
-      // results so a single rejection can't blank out the whole market grid.
-      const updated = settled
+      // Merge fulfilled results back into the current list so transient failures
+      // keep the previous entry instead of disappearing from the grid.
+      const refreshedById = new Map(settled
         .filter((result): result is PromiseFulfilledResult<IndexEntry> => result.status === "fulfilled")
-        .map((result) => result.value);
-      setIndices(updated);
-      writeMarketPageCache({
-        indices: updated,
-        lastRefreshed: timeLabel(),
-        syncedAt,
-        savedAt: Date.now(),
+        .map((result) => [result.value.id, result.value]));
+      if (refreshSeq !== refreshSeqRef.current) return;
+      setIndices((currentItems) => {
+        if (refreshSeq !== refreshSeqRef.current) return currentItems;
+        const baseItems = currentItems.length ? currentItems : source;
+        const nextItems = baseItems.map((item) => refreshedById.get(item.id) ?? item);
+        writeMarketPageCache({
+          indices: nextItems,
+          lastRefreshed: timeLabel(),
+          syncedAt,
+          savedAt: Date.now(),
+        });
+        return nextItems;
       });
     } finally {
-      if (showSpinner) setRefreshing(false);
+      if (showSpinner && refreshSeq === refreshSeqRef.current) setRefreshing(false);
     }
   }, []);
 
@@ -603,7 +621,7 @@ export function Market() {
         changed = true;
         const normalizedChange = Number.isFinite(payload.quote.change) ? payload.quote.change : entry.changeAmount;
         const normalizedChangeRate = Number.isFinite(payload.quote.changePercent)
-          ? (normalizedChange != null && normalizedChange !== 0
+          ? (normalizedChange != null && Math.abs(normalizedChange) > 1e-9
             ? Math.abs(payload.quote.changePercent) * (normalizedChange >= 0 ? 1 : -1)
             : payload.quote.changePercent)
           : entry.changeRate;
@@ -658,7 +676,7 @@ export function Market() {
     openDetail({
       yahooSymbol:   entry.yahooSymbol,
       displaySymbol: entry.displaySymbol,
-      name:          language === "en" ? entry.shortName ?? entry.name : entry.name,
+      name:          indexDisplayName(entry, language),
       assetType:     assetTypeForEntry(entry),
       market:        marketForEntry(entry),
       unit:          entry.unit,
@@ -678,11 +696,11 @@ export function Market() {
   /* summary stats for header */
   const activeMoves = indices
     .map((entry) => {
-      if (typeof entry.changeAmount === "number" && Number.isFinite(entry.changeAmount) && entry.changeAmount !== 0) {
-        return entry.changeAmount;
-      }
       if (typeof entry.changeRate === "number" && Number.isFinite(entry.changeRate) && entry.changeRate !== 0) {
         return entry.changeRate;
+      }
+      if (typeof entry.changeAmount === "number" && Number.isFinite(entry.changeAmount) && Math.abs(entry.changeAmount) > 1e-9) {
+        return entry.changeAmount > 0 ? 1 : -1;
       }
       return null;
     })

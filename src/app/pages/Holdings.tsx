@@ -6,16 +6,17 @@ import {
 } from "lucide-react";
 import { DCAPlan, HoldingAdjustmentInput, HoldingInput, useApp } from "../context/AppContext";
 import { Holding, Group, ClosedHolding } from "../data/mockData";
-import { searchSecuritiesLive, fetchLivePrice, fetchCnFundTradeStatus, LiveResult, Market } from "../services/securitiesApi";
+import { fetchLivePrice, fetchCnFundTradeStatus, LiveResult, Market } from "../services/securitiesApi";
 import { fetchTencentTradeStatus } from "../services/tencentQuote";
 import { toYahooSymbol } from "../services/quoteApi";
-import { FX, toCNY } from "../services/priceRefresher";
+import { FX } from "../services/priceRefresher";
 import { motion, AnimatePresence, LayoutGroup } from "motion/react";
 import { currencySymbol, formatExactMoney, formatExactNumber, formatPercent } from "../utils/numberFormat";
 import { resolveHoldingTradeStatus, tradeStatusLabel, cleanTradeSource, cleanTradeNote } from "../utils/tradeStatus";
 import { getMarketBadgeWithBg } from "../utils/marketBadge";
 import { normalizeHoldingSymbol, normalizeHoldingType } from "../utils/holdingHelpers";
 import { canSaveHoldingForm } from "../utils/holdingForm";
+import { useSecuritySearch } from "../utils/useSecuritySearch";
 import {
   assetTypeLabel,
   groupName,
@@ -88,12 +89,20 @@ function convertAmount(value: number, fromCurrency: string, toCurrency: string) 
   return value * sourceFx / targetFx;
 }
 
+function pnlSign(value: number) {
+  return value > 0 ? "+" : value < 0 ? "-" : "";
+}
+
 function quantityUnit(market: string, assetType: string, language: Language = "zh") {
   const units = t(language).holdings.units;
   if (market === "CRYPTO") return units.crypto;
   if (assetType === "fund" || market === "FUND") return units.fund;
   if (assetType === "bond") return units.bond;
   return units.stock;
+}
+
+function requiresWholeTradeQuantity(input: Pick<Holding, "market" | "assetType">) {
+  return input.market !== "CRYPTO" && !isFundLike(input);
 }
 
 function holdingMarketValue(h: Holding) {
@@ -168,9 +177,17 @@ function ClosedHoldingsView({
   onDelete: (id: string) => void;
   language: Language;
 }) {
+  const PAGE_SIZE = 80;
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const sorted = useMemo(() => {
     return [...items].sort((a, b) => `${b.closedAt}_${b.id}`.localeCompare(`${a.closedAt}_${a.id}`));
   }, [items]);
+  const visibleItems = sorted.slice(0, visibleCount);
+
+  useEffect(() => {
+    setVisibleCount((current) => Math.min(current, Math.max(PAGE_SIZE, sorted.length)));
+  }, [sorted.length]);
+
   const emptyText = language === "en" ? "No realized records yet" : "暂无已实现记录";
   const subtitle = language === "en"
     ? "Sell and close records keep realized P/L, including cash dividends when applicable."
@@ -188,7 +205,7 @@ function ClosedHoldingsView({
 
   return (
     <div className="flex flex-col gap-2 px-3 py-3">
-      {sorted.map((item) => {
+      {visibleItems.map((item) => {
         const pnl = convertAmount(item.realizedPnl, item.currency, baseCurrency);
         const proceeds = convertAmount(item.proceeds, item.currency, baseCurrency);
         const color = profitColor(pnl);
@@ -253,7 +270,7 @@ function ClosedHoldingsView({
                 )}
               </span>
               <span className="truncate" style={{ color, fontSize: 13, fontWeight: 800 }}>
-                {pnl >= 0 ? "+" : "-"}{privacyMode ? `${currencySymbol(baseCurrency)}--` : formatSummaryMoney(pnl, baseCurrency)}
+                {pnlSign(pnl)}{privacyMode ? `${currencySymbol(baseCurrency)}--` : formatSummaryMoney(pnl, baseCurrency)}
                 <span style={{ marginLeft: 6, fontSize: 11 }}>
                   {privacyMode ? "--" : formatPercent(item.realizedReturn)}
                 </span>
@@ -262,6 +279,17 @@ function ClosedHoldingsView({
           </div>
         );
       })}
+      {visibleCount < sorted.length && (
+        <button
+          onClick={() => setVisibleCount((count) => Math.min(count + PAGE_SIZE, sorted.length))}
+          className="rounded-xl py-2.5"
+          style={{ background: "var(--bg-card)", border: "1px solid var(--border-sub)", color: "#4F9CF9", fontSize: 12, fontWeight: 700 }}
+        >
+          {language === "en"
+            ? `Show more (${sorted.length - visibleCount})`
+            : `加载更多（剩余 ${sorted.length - visibleCount} 条）`}
+        </button>
+      )}
     </div>
   );
 }
@@ -317,44 +345,21 @@ function AutoInput({
 }) {
   const { language } = useApp();
   const text = t(language);
-  const [open,    setOpen]    = useState(false);
-  const [hits,    setHits]    = useState<LiveResult[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [apiOk,   setApiOk]   = useState<boolean | null>(null);
   const wrapRef  = useRef<HTMLDivElement>(null);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-
-  const doSearch = useCallback(async (q: string, filter?: Market) => {
-    if (!q.trim()) { setHits([]); setOpen(false); return; }
-    setLoading(true);
-    try {
-      const results = await searchSecuritiesLive(q, filter);
-      setHits(results); setOpen(results.length > 0);
-      if (results.length) setApiOk(results[0]?.source === "live");
-    } catch { setHits([]); setApiOk(false); }
-    finally { setLoading(false); }
-  }, []);
+  const { apiOk, hits, loading, open, setOpen, scheduleSearch } = useSecuritySearch(value, marketFilter);
 
   const handleChange = (v: string) => {
     onChange(v);
-    clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => doSearch(v, marketFilter), 350);
+    scheduleSearch(v, marketFilter);
   };
-
-  // Re-run search when the market filter changes so results stay in scope.
-  useEffect(() => {
-    if (!value.trim()) return;
-    void doSearch(value, marketFilter);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [marketFilter]);
 
   useEffect(() => {
     const close = (e: MouseEvent) => {
       if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
     };
     document.addEventListener("mousedown", close);
-    return () => { document.removeEventListener("mousedown", close); clearTimeout(timerRef.current); };
-  }, []);
+    return () => { document.removeEventListener("mousedown", close); };
+  }, [setOpen]);
 
   return (
     <div ref={wrapRef} style={{ position: "relative" }}>
@@ -437,12 +442,12 @@ function AutoInput({
 }
 
 /* ─── PnL preview strip ──────────────────────────────── */
-function PnLPreview({ form }: { form: HoldingInput }) {
+function PnLPreview({ form, cashDividendTotal = 0 }: { form: HoldingInput; cashDividendTotal?: number }) {
   const { profitColor, language } = useApp();
   const text = t(language).holdings;
   const mv   = form.quantity * form.currentPrice;
   const cost = form.quantity * form.costPrice;
-  const pnl  = mv - cost;
+  const pnl  = mv - cost + Math.max(0, Number.isFinite(cashDividendTotal) ? cashDividendTotal : 0);
   const rate = cost > 0 ? pnl / cost : 0;
   const col  = profitColor(pnl);
   return (
@@ -450,7 +455,7 @@ function PnLPreview({ form }: { form: HoldingInput }) {
       style={{ background: "rgba(79,156,249,0.05)", border: "1px solid rgba(79,156,249,0.12)" }}>
       {[
         { label: text.estimatedMarketValue, val: mv > 0 ? formatSummaryMoney(mv, form.currency) : "—", color: "var(--text-primary)" },
-        { label: text.cumulativePnl, val: cost > 0 ? `${pnl >= 0 ? "+" : "-"}${formatSummaryMoney(pnl, form.currency)}` : "—", color: cost > 0 ? col : "var(--text-muted)" },
+        { label: text.cumulativePnl, val: cost > 0 ? `${pnlSign(pnl)}${formatSummaryMoney(pnl, form.currency)}` : "—", color: cost > 0 ? col : "var(--text-muted)" },
         { label: text.returnRate,   val: cost > 0 ? formatPercent(rate) : "—", color: cost > 0 ? col : "var(--text-muted)" },
       ].map((it) => (
         <div key={it.label} className="flex-1">
@@ -463,9 +468,10 @@ function PnLPreview({ form }: { form: HoldingInput }) {
 }
 
 /* ─── Add / Edit form sheet ──────────────────────────── */
-function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
+function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal = 0 }: {
   initial: HoldingInput; groups: Group[];
   onSave: (h: HoldingInput) => void; onClose: () => void; isEdit: boolean;
+  cashDividendTotal?: number;
 }) {
   const { language } = useApp();
   const text = t(language);
@@ -480,6 +486,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
   const [marketScope, setMarketScope] = useState<Market | "">(() =>
     isEdit && (MARKET_SCOPE_OPTIONS as string[]).includes(initial.market) ? (initial.market as Market) : ""
   );
+  const requestSeqRef = useRef(0);
   const set = <K extends keyof HoldingInput>(k: K, v: HoldingInput[K]) =>
     setForm((f) => ({ ...f, [k]: v }));
 
@@ -512,6 +519,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
   ], [language, text.holdings.allMarkets]);
 
   const handleMarketScopeChange = (next: Market | "") => {
+    requestSeqRef.current += 1;
     setMarketScope(next);
     // Clear the previously selected security so stale cross-market data
     // doesn't get saved alongside the new scope.
@@ -530,6 +538,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
   };
 
   const handleSelect = (r: LiveResult) => {
+    const requestSeq = ++requestSeqRef.current;
     const normalizedType = normalizeHoldingType(r.symbol, r.name, r.market, r.assetType);
     const normalizedSymbol = normalizeHoldingSymbol(r.symbol, normalizedType.market);
     setSecurityQuery(`${r.name} (${r.symbol})`);
@@ -551,6 +560,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
     // value for immediate feedback, then always verify it through the live quote
     // path before the user saves the holding.
     void fetchLivePrice(r.symbol, r.market, r.coinId).then((quote) => {
+      if (requestSeq !== requestSeqRef.current) return;
       if (!quote || quote.price <= 0) return;
       setForm((f) => (
         f.symbol === normalizedSymbol && f.market === normalizedType.market
@@ -563,6 +573,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
     const sym = normalizedSymbol;
     if (market === "FUND") {
       void fetchCnFundTradeStatus(sym).then((status) => {
+        if (requestSeq !== requestSeqRef.current) return;
         if (!status) return;
         setForm((f) => f.symbol === sym && f.market === market
           ? { ...f, autoTradeStatus: status.status, autoTradeStatusNote: status.note, autoTradeStatusSource: "eastmoney", fundBuyConfirmDays: status.buyConfirmDays }
@@ -570,6 +581,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
       }).catch(() => null);
     } else if (market === "A" || market === "HK") {
       void fetchTencentTradeStatus(sym, market).then((status) => {
+        if (requestSeq !== requestSeqRef.current) return;
         if (!status) return;
         setForm((f) => f.symbol === sym && f.market === market
           ? { ...f, autoTradeStatus: status.status, autoTradeStatusNote: status.note, autoTradeStatusSource: status.source }
@@ -676,7 +688,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
             </Field>
           </div>
 
-          <PnLPreview form={form} />
+          <PnLPreview form={form} cashDividendTotal={isEdit ? cashDividendTotal : 0} />
 
           <button onClick={() => {
             if (!valid || saving) return;
@@ -716,11 +728,23 @@ function AdjustSheet({
   const [saving, setSaving] = useState(false);
   const maxSell = holding.quantity;
   const validPrice = Number(price);
+  const wholeQuantityRequired = requiresWholeTradeQuantity(holding);
   const rawQuantity = inputMode === "amount"
     ? Number(amount) / validPrice
     : Number(quantity);
-  const validQuantity = Number.isFinite(rawQuantity) ? rawQuantity : 0;
-  const validAmount = inputMode === "amount" ? Number(amount) : validQuantity * validPrice;
+  const normalizedQuantity = Number.isFinite(rawQuantity)
+    ? wholeQuantityRequired && inputMode === "amount"
+      ? Math.floor(rawQuantity + 1e-8)
+      : rawQuantity
+    : 0;
+  const wholeQuantityInvalid = wholeQuantityRequired
+    && inputMode === "quantity"
+    && normalizedQuantity > 0
+    && Math.abs(normalizedQuantity - Math.round(normalizedQuantity)) > 1e-8;
+  const validQuantity = wholeQuantityRequired && inputMode === "quantity" && !wholeQuantityInvalid
+    ? Math.round(normalizedQuantity)
+    : normalizedQuantity;
+  const validAmount = validQuantity * validPrice;
   const unit = quantityUnit(holding.market, holding.assetType, language);
   const currency = holding.currency;
   const maxSellAmount = maxSell * (validPrice > 0 ? validPrice : holding.currentPrice);
@@ -728,9 +752,34 @@ function AdjustSheet({
   const valid = validQuantity > 0
     && validPrice > 0
     && validAmount > 0
+    && !wholeQuantityInvalid
     && !exceedsSell;
   const estimatedQuantity = validPrice > 0 && Number.isFinite(validQuantity) ? validQuantity : 0;
   const estimatedAmount = validPrice > 0 && Number.isFinite(validAmount) ? validAmount : 0;
+  const sellShortcuts = [
+    { label: language === "en" ? "1/4" : "1/4仓", fraction: 0.25 },
+    { label: language === "en" ? "1/3" : "1/3仓", fraction: 1 / 3 },
+    { label: language === "en" ? "Half" : "半仓", fraction: 0.5 },
+    { label: language === "en" ? "All" : "清仓", fraction: 1 },
+  ];
+  const formatShortcutInput = (value: number) => {
+    if (!Number.isFinite(value) || value <= 0) return "";
+    const fixed = value.toFixed(8).replace(/\.?0+$/, "");
+    return fixed || "";
+  };
+  const sellShortcutQuantity = (fraction: number) => {
+    const rawNextQuantity = Math.min(maxSell, maxSell * fraction);
+    return wholeQuantityRequired
+      ? (fraction >= 1 ? Math.floor(maxSell + 1e-8) : Math.floor(rawNextQuantity + 1e-8))
+      : rawNextQuantity;
+  };
+  const applySellShortcut = (fraction: number) => {
+    const nextQuantity = sellShortcutQuantity(fraction);
+    if (!(nextQuantity > 0)) return;
+    const nextPrice = validPrice > 0 ? validPrice : holding.currentPrice;
+    setQuantity(formatShortcutInput(nextQuantity));
+    if (nextPrice > 0) setAmount(formatShortcutInput(nextQuantity * nextPrice));
+  };
 
   return (
     <motion.div
@@ -786,6 +835,34 @@ function AdjustSheet({
           <Field label={text.transactionPrice}>
             <Input type="number" value={price} onChange={setPrice} placeholder={text.inputTransactionPrice} />
           </Field>
+          {mode === "sell" && (
+            <div className="grid grid-cols-4 gap-2">
+              {sellShortcuts.map((item) => {
+                const shortcutQuantity = sellShortcutQuantity(item.fraction);
+                const disabled = !(shortcutQuantity > 0);
+                return (
+                  <button
+                    key={item.label}
+                    type="button"
+                    onClick={() => applySellShortcut(item.fraction)}
+                    disabled={disabled}
+                    className="rounded-lg py-2"
+                    style={{
+                      background: "var(--bg-card)",
+                      border: "1px solid var(--border)",
+                      color: disabled ? "var(--text-micro)" : item.fraction === 1 ? "#F24E4E" : "var(--text-secondary)",
+                      fontSize: 11,
+                      fontWeight: 700,
+                      cursor: disabled ? "not-allowed" : "pointer",
+                      opacity: disabled ? 0.55 : 1,
+                    }}
+                  >
+                    {item.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
           {inputMode === "quantity" ? (
             <Field label={mode === "buy" ? text.buyQuantity(unit) : text.sellQuantity(unit)}>
               <Input
@@ -822,6 +899,11 @@ function AdjustSheet({
           {exceedsSell && (
             <p style={{ color: "#F24E4E", fontSize: 11 }}>
               {inputMode === "amount" ? text.sellAmountError : text.sellQuantityError}
+            </p>
+          )}
+          {wholeQuantityInvalid && (
+            <p style={{ color: "#F24E4E", fontSize: 11 }}>
+              {text.wholeQuantityError(unit)}
             </p>
           )}
           <button
@@ -865,13 +947,14 @@ function HoldingCard({
   const totalC    = profitColor(totalPnl);
   const badge     = getSecurityBadge(h.market, h.assetType, language);
   const group     = groups.find((g) => g.id === h.groupId);
-  const sign      = (v: number) => v >= 0 ? "+" : "-";
+  const sign      = pnlSign;
   const borderColor = isSelected || hovered ? "rgba(79,156,249,0.2)" : "var(--border-sub)";
   const sym = currencySymbol(h.currency);
   const priceDecimals = holdingUnitPriceDecimals(h);
   const fmtMoney = (p: number) => sym + p.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const fmtUnitPrice = (p: number) => sym + p.toLocaleString("en-US", { minimumFractionDigits: priceDecimals, maximumFractionDigits: priceDecimals });
   const marketValueText = fmtMoney(holdingMarketValue(h));
+  const todayPnlText = fmtMoney(Math.abs(h.todayPnl));
   const tradeStatus = resolveHoldingTradeStatus(h);
   const tradeStatusColor = tradeStatus.status === "normal"
     ? "#31D08B"
@@ -974,7 +1057,7 @@ function HoldingCard({
               {privacyMode ? `${sym || h.currency}***` : marketValueText}
             </p>
             <p style={{ color: todayC, fontSize: 11, marginTop: 1 }}>
-              {sign(h.todayPnl)}¥{privacyMode ? "--" : Math.abs(toCNY(h.todayPnl, h.currency)).toLocaleString("zh-CN", { maximumFractionDigits: 0 })}
+              {sign(h.todayPnl)}{privacyMode ? `${sym || h.currency}--` : todayPnlText}
               &nbsp;<span style={{ fontSize: 10 }}>({privacyMode ? "--" : `${sign(h.todayPnlRate)}${(Number.isFinite(h.todayPnlRate) ? h.todayPnlRate * 100 : 0).toFixed(2)}%`})</span>
             </p>
             <p style={{ color: totalC, fontSize: 10, marginTop: 1 }}>
@@ -1070,13 +1153,25 @@ function GroupsView({ groups, holdings, dcaPlans, baseCurrency, selectedId, onSe
     return map;
   }, [groups, holdings]);
 
-  const totalAll = holdings.reduce((s, h) => s + convertAmount(holdingMarketValue(h), h.currency, baseCurrency), 0);
+  const totalAll = useMemo(
+    () => holdings.reduce((s, h) => s + convertAmount(holdingMarketValue(h), h.currency, baseCurrency), 0),
+    [baseCurrency, holdings],
+  );
 
-  const groupStats = (gHoldings: Holding[]) => ({
-    total:    gHoldings.reduce((s, h) => s + convertAmount(holdingMarketValue(h), h.currency, baseCurrency), 0),
-    todayPnl: gHoldings.reduce((s, h) => s + convertAmount(h.todayPnl, h.currency, baseCurrency), 0),
-    pct:      totalAll > 0 ? gHoldings.reduce((s, h) => s + convertAmount(holdingMarketValue(h), h.currency, baseCurrency), 0) / totalAll * 100 : 0,
-  });
+  const groupStatsById = useMemo(() => {
+    const stats = new Map<string, { total: number; todayPnl: number; pct: number }>();
+    const calculate = (gHoldings: Holding[]) => {
+      const total = gHoldings.reduce((s, h) => s + convertAmount(holdingMarketValue(h), h.currency, baseCurrency), 0);
+      const todayPnl = gHoldings.reduce((s, h) => s + convertAmount(h.todayPnl, h.currency, baseCurrency), 0);
+      return { total, todayPnl, pct: totalAll > 0 ? total / totalAll * 100 : 0 };
+    };
+    for (const group of groups) {
+      stats.set(group.id, calculate(grouped[group.id] ?? []));
+    }
+    stats.set("__ungrouped", calculate(grouped[""] ?? []));
+    return stats;
+  }, [baseCurrency, grouped, groups, totalAll]);
+
   const allocationGroups = [
     ...groups.map((group) => ({
       id: group.id,
@@ -1090,7 +1185,7 @@ function GroupsView({ groups, holdings, dcaPlans, baseCurrency, selectedId, onSe
       color: "var(--text-micro)",
       holdings: grouped[""] ?? [],
     },
-  ].filter((group) => group.holdings.length > 0 && groupStats(group.holdings).total > 0);
+  ].filter((group) => group.holdings.length > 0 && (groupStatsById.get(group.id)?.total ?? 0) > 0);
 
   return (
     <div className="flex flex-col gap-2 px-3">
@@ -1100,13 +1195,13 @@ function GroupsView({ groups, holdings, dcaPlans, baseCurrency, selectedId, onSe
           <p style={{ color: "var(--text-muted)", fontSize: 10, marginBottom: 6 }}>{text.groupAssetRatio}</p>
           <div className="flex rounded-full overflow-hidden gap-px" style={{ height: 6 }}>
             {allocationGroups.map((g) => {
-              const pct = groupStats(g.holdings).pct;
+              const pct = groupStatsById.get(g.id)?.pct ?? 0;
               return pct > 0 ? <div key={g.id} style={{ width: `${pct}%`, background: g.color, borderRadius: 99 }} /> : null;
             })}
           </div>
           <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2">
             {allocationGroups.map((g) => {
-              const { pct } = groupStats(g.holdings);
+              const { pct } = groupStatsById.get(g.id) ?? { pct: 0 };
               return (
                 <div key={g.id} className="flex items-center gap-1">
                   <div className="rounded-full" style={{ width: 6, height: 6, background: g.color }} />
@@ -1122,7 +1217,7 @@ function GroupsView({ groups, holdings, dcaPlans, baseCurrency, selectedId, onSe
       {/* Group cards */}
       {groups.map((g, i) => {
         const gHoldings = grouped[g.id] ?? [];
-        const stats     = groupStats(gHoldings);
+        const stats     = groupStatsById.get(g.id) ?? { total: 0, todayPnl: 0, pct: 0 };
         const isOpen    = expanded === g.id;
         const todayC    = profitColor(stats.todayPnl);
 
@@ -1167,7 +1262,7 @@ function GroupsView({ groups, holdings, dcaPlans, baseCurrency, selectedId, onSe
                   {privacyMode ? `${currencySymbol(baseCurrency)}***` : formatSummaryMoney(stats.total, baseCurrency)}
                 </p>
                 <p style={{ color: todayC, fontSize: 10 }}>
-                  {stats.todayPnl >= 0 ? "+" : "-"}{privacyMode ? `${currencySymbol(baseCurrency)}--` : formatSummaryMoney(stats.todayPnl, baseCurrency)}
+                  {pnlSign(stats.todayPnl)}{privacyMode ? `${currencySymbol(baseCurrency)}--` : formatSummaryMoney(stats.todayPnl, baseCurrency)}
                 </p>
               </div>
               <ChevronRight size={14} color="var(--text-muted)"
@@ -1335,7 +1430,7 @@ function NewGroupSheet({
 export function Holdings() {
   const { holdings, closedHoldings, groups, privacyMode, profitColor, currency,
     addHolding, updateHolding, adjustHolding, removeHolding, removeClosedHolding, addGroup, updateGroup, removeGroup,
-    openDetail, refresh, isRefreshing, lastRefreshed, lastRefreshAt, dcaPlans, openDCAPanel, togglePrivacy, language } = useApp();
+    openDetail, refresh, isRefreshing, lastRefreshed, lastRefreshAt, lastRefreshError, dcaPlans, openDCAPanel, togglePrivacy, language } = useApp();
   const text = t(language);
 
   const [viewMode,     setViewMode]     = useState<"current" | "closed">("current");
@@ -1368,6 +1463,17 @@ export function Holdings() {
 
   /* filtered + sorted holdings */
   const filtered = useMemo(() => {
+    const sortValue = (holding: Holding) => {
+      switch (sortKey) {
+        case "todayPnlRate":
+          return holdingTodayPnlRate(holding);
+        case "totalPnlRate":
+          return holdingTotalPnlRate(holding);
+        case "marketValue":
+        default:
+          return convertAmount(holdingMarketValue(holding), holding.currency, "CNY");
+      }
+    };
     return holdings
       .filter((h) => {
         if (activeGroup === "__ungrouped" && h.groupId) return false;
@@ -1377,14 +1483,8 @@ export function Holdings() {
         return true;
       })
       .sort((a, b) => {
-        const av = sortKey === "marketValue" ? convertAmount(holdingMarketValue(a), a.currency, "CNY")
-          : sortKey === "todayPnlRate" ? holdingTodayPnlRate(a)
-          : sortKey === "totalPnlRate" ? holdingTotalPnlRate(a)
-          : a[sortKey];
-        const bv = sortKey === "marketValue" ? convertAmount(holdingMarketValue(b), b.currency, "CNY")
-          : sortKey === "todayPnlRate" ? holdingTodayPnlRate(b)
-          : sortKey === "totalPnlRate" ? holdingTotalPnlRate(b)
-          : b[sortKey];
+        const av = sortValue(a);
+        const bv = sortValue(b);
         const diff = av - bv;
         return sortDesc ? -diff : diff;
       });
@@ -1394,17 +1494,29 @@ export function Holdings() {
     ? null
     : groups.find((group) => group.id === activeGroup) ?? null;
   const hasUngroupedHoldings = holdings.some((holding) => !holding.groupId);
+  const hasUngroupedClosedHoldings = closedHoldings.some((holding) => !holding.groupId);
 
   useEffect(() => {
     if (activeGroup === "ALL") return;
     if (activeGroup === "__ungrouped") {
-      if (!hasUngroupedHoldings) setActiveGroup("ALL");
+      const hasUngroupedInView = viewMode === "closed" ? hasUngroupedClosedHoldings : hasUngroupedHoldings;
+      if (!hasUngroupedInView) setActiveGroup("ALL");
       return;
     }
     if (!groups.some((group) => group.id === activeGroup)) {
       setActiveGroup("ALL");
     }
-  }, [activeGroup, groups, hasUngroupedHoldings]);
+  }, [activeGroup, groups, hasUngroupedClosedHoldings, hasUngroupedHoldings, viewMode]);
+
+  const filteredClosedHoldings = useMemo(() => {
+    return closedHoldings.filter((item) => {
+      if (activeGroup === "__ungrouped" && item.groupId) return false;
+      if (activeGroup !== "ALL" && activeGroup !== "__ungrouped" && item.groupId !== activeGroup) return false;
+      const query = search.trim().toLowerCase();
+      if (query && !item.symbol.toLowerCase().includes(query) && !item.name.toLowerCase().includes(query)) return false;
+      return true;
+    });
+  }, [activeGroup, closedHoldings, search]);
 
   /* ── strip stats: reflect current tab/filter context, all values in CNY ── */
   const stripStats = useMemo(() => {
@@ -1417,11 +1529,11 @@ export function Holdings() {
 
   /* ── closed-history strip stats: realized P/L, cost basis, proceeds ── */
   const closedStripStats = useMemo(() => {
-    const proceeds = closedHoldings.reduce((s, h) => s + convertAmount(h.proceeds, h.currency, currency), 0);
-    const cost     = closedHoldings.reduce((s, h) => s + convertAmount(h.costBasis, h.currency, currency), 0);
-    const pnl      = closedHoldings.reduce((s, h) => s + convertAmount(h.realizedPnl, h.currency, currency), 0);
+    const proceeds = filteredClosedHoldings.reduce((s, h) => s + convertAmount(h.proceeds, h.currency, currency), 0);
+    const cost     = filteredClosedHoldings.reduce((s, h) => s + convertAmount(h.costBasis, h.currency, currency), 0);
+    const pnl      = filteredClosedHoldings.reduce((s, h) => s + convertAmount(h.realizedPnl, h.currency, currency), 0);
     return { proceeds, cost, pnl };
-  }, [currency, closedHoldings]);
+  }, [currency, filteredClosedHoldings]);
 
   const stripTodayColor = profitColor(stripStats.todayPnl);
   const stripCumulColor = profitColor(stripStats.cumulPnl);
@@ -1485,7 +1597,9 @@ export function Holdings() {
           style={{ height: 50, borderBottom: "1px solid var(--border)" }}>
           <span style={{ color: "var(--text-primary)", fontSize: 14, fontWeight: 600 }}>{text.holdings.title}</span>
           <div className="flex items-center gap-2">
-            <span style={{ color: "var(--text-muted)", fontSize: 11 }}>{lastRefreshed}</span>
+            <span style={{ color: lastRefreshError ? "var(--danger)" : "var(--text-muted)", fontSize: 11 }}>
+              {lastRefreshError || lastRefreshed}
+            </span>
             <button onClick={togglePrivacy}
               className="flex items-center justify-center rounded-lg"
               aria-label={privacyMode ? (language === "en" ? "Show sensitive data" : "显示敏感数据") : (language === "en" ? "Hide sensitive data" : "隐藏敏感数据")}
@@ -1542,7 +1656,7 @@ export function Holdings() {
               <div className="flex-1 min-w-0">
                 <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.holdings.closedPnl}</p>
                 <p className="truncate" style={{ color: stripClosedPnlColor, fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
-                  {closedStripStats.pnl >= 0 ? "+" : "-"}{privacyMode ? `${currencySymbol(currency)}--` : formatSummaryMoney(closedStripStats.pnl, currency)}
+                  {pnlSign(closedStripStats.pnl)}{privacyMode ? `${currencySymbol(currency)}--` : formatSummaryMoney(closedStripStats.pnl, currency)}
                 </p>
               </div>
             </>
@@ -1558,14 +1672,14 @@ export function Holdings() {
               <div className="flex-1 min-w-0">
                 <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.holdings.todayPnl}</p>
                 <p className="truncate" style={{ color: stripTodayColor, fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
-                  {stripStats.todayPnl >= 0 ? "+" : "-"}{privacyMode ? `${currencySymbol(currency)}--` : formatSummaryMoney(stripStats.todayPnl, currency)}
+                  {pnlSign(stripStats.todayPnl)}{privacyMode ? `${currencySymbol(currency)}--` : formatSummaryMoney(stripStats.todayPnl, currency)}
                 </p>
               </div>
               <div style={{ width: 1, flexShrink: 0, background: "var(--bg-card)" }} />
               <div className="flex-1 min-w-0">
                 <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.holdings.cumulativePnl}</p>
                 <p className="truncate" style={{ color: stripCumulColor, fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}>
-                  {stripStats.cumulPnl >= 0 ? "+" : "-"}{privacyMode ? `${currencySymbol(currency)}--` : formatSummaryMoney(stripStats.cumulPnl, currency)}
+                  {pnlSign(stripStats.cumulPnl)}{privacyMode ? `${currencySymbol(currency)}--` : formatSummaryMoney(stripStats.cumulPnl, currency)}
                 </p>
               </div>
             </>
@@ -1589,7 +1703,7 @@ export function Holdings() {
                 fontWeight: 700,
               }}
             >
-              {item.label}{item.key === "closed" ? ` · ${closedHoldings.length}` : ""}
+              {item.label}{item.key === "closed" ? ` · ${filteredClosedHoldings.length}${filteredClosedHoldings.length !== closedHoldings.length ? `/${closedHoldings.length}` : ""}` : ""}
             </button>
           ))}
         </div>
@@ -1601,14 +1715,89 @@ export function Holdings() {
         style={{ scrollbarWidth: "none", overscrollBehaviorY: "contain", WebkitOverflowScrolling: "touch", paddingBottom: 16 }}
       >
         {viewMode === "closed" ? (
-          <ClosedHoldingsView
-            items={closedHoldings}
-            baseCurrency={currency}
-            privacyMode={privacyMode}
-            profitColor={profitColor}
-            onDelete={(id) => setDeleteClosedTarget(id)}
-            language={language}
-          />
+          <>
+            <div style={{ padding: "14px 12px 8px" }}>
+              <div className="flex items-center gap-2 rounded-xl px-3" style={{ background: "var(--bg-card)", height: 36, marginTop: 2 }}>
+                <Search size={14} color="var(--text-muted)" />
+                <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={text.holdings.searchPlaceholder}
+                  style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "var(--text-primary)", fontSize: 13 }} />
+                {search && <button onClick={() => setSearch("")} style={{ color: "var(--text-muted)", fontSize: 16 }}>×</button>}
+              </div>
+            </div>
+
+            <div className="px-3 mb-2">
+              <div className="flex items-center gap-1.5 overflow-x-auto" style={{ scrollbarWidth: "none" }}>
+                <button key="ALL" onClick={() => setActiveGroup("ALL")}
+                  className="rounded-full shrink-0 transition-all"
+                  style={{
+                    padding: "4px 12px", fontSize: 11, fontWeight: 500,
+                    background: activeGroup === "ALL" ? "#4F9CF9" : "var(--bg-card)",
+                    color:      activeGroup === "ALL" ? "#fff"    : "var(--text-muted)",
+                    border:     activeGroup === "ALL" ? "1px solid transparent" : "1px solid var(--border)",
+                  }}>
+                  {text.common.all}
+                </button>
+                {groups.map((group) => (
+                  <button
+                    key={group.id}
+                    onClick={() => setActiveGroup(group.id)}
+                    className="rounded-full shrink-0 transition-all flex items-center gap-1.5"
+                    style={{
+                      padding: "4px 12px",
+                      fontSize: 11,
+                      fontWeight: 500,
+                      background: activeGroup === group.id ? "rgba(79,156,249,0.15)" : "var(--bg-card)",
+                      color: activeGroup === group.id ? "#4F9CF9" : "var(--text-muted)",
+                      border: activeGroup === group.id ? "1px solid rgba(79,156,249,0.25)" : "1px solid var(--border)",
+                    }}
+                  >
+                    <span className="rounded-full" style={{ width: 6, height: 6, background: group.color, flexShrink: 0 }} />
+                    {groupName(group.id, group.name, language)}
+                  </button>
+                ))}
+                {hasUngroupedClosedHoldings && (
+                  <button
+                    onClick={() => setActiveGroup("__ungrouped")}
+                    className="rounded-full shrink-0 transition-all flex items-center gap-1.5"
+                    style={{
+                      padding: "4px 12px",
+                      fontSize: 11,
+                      fontWeight: 500,
+                      background: activeGroup === "__ungrouped" ? "rgba(79,156,249,0.15)" : "var(--bg-card)",
+                      color: activeGroup === "__ungrouped" ? "#4F9CF9" : "var(--text-muted)",
+                      border: activeGroup === "__ungrouped" ? "1px solid rgba(79,156,249,0.25)" : "1px solid var(--border)",
+                    }}
+                  >
+                    <span className="rounded-full" style={{ width: 6, height: 6, background: "var(--text-micro)", flexShrink: 0 }} />
+                    {text.common.notGrouped}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 px-3 mb-1">
+              <span style={{ color: "var(--text-muted)", fontSize: 11 }}>
+                {language === "en" ? `${filteredClosedHoldings.length} records` : `${filteredClosedHoldings.length} 条记录`}
+              </span>
+              <span style={{ color: "var(--text-micro)", fontSize: 10 }}>·</span>
+              <span style={{ color: "var(--text-micro)", fontSize: 10 }}>
+                {activeGroup === "__ungrouped"
+                  ? text.holdings.currentGroup(text.common.notGrouped)
+                  : activeGroupMeta
+                    ? text.holdings.currentGroup(groupName(activeGroupMeta.id, activeGroupMeta.name, language))
+                    : text.holdings.allGroups(groups.length)}
+              </span>
+            </div>
+
+            <ClosedHoldingsView
+              items={filteredClosedHoldings}
+              baseCurrency={currency}
+              privacyMode={privacyMode}
+              profitColor={profitColor}
+              onDelete={(id) => setDeleteClosedTarget(id)}
+              language={language}
+            />
+          </>
         ) : (
         <>
           {/* Search */}
@@ -1846,6 +2035,7 @@ export function Holdings() {
                 : blankForm()
             }
             groups={groups}
+            cashDividendTotal={sheetMode === "edit" ? editTarget?.cashDividendTotal ?? 0 : 0}
             onSave={handleSave}
             onClose={() => { setSheetMode(null); setEditTarget(null); }}
             isEdit={sheetMode === "edit"}

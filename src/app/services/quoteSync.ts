@@ -65,3 +65,7 @@ export function getLatestSyncedQuote(
   }
   return payload;
 }
+
+export function clearQuoteSyncCacheForTests() {
+  latestQuotePayloads.clear();
+}

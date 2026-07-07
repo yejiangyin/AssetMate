@@ -28,6 +28,13 @@ describe("canSaveHoldingForm", () => {
   test("rejects invalid or incomplete holding inputs", () => {
     assert.equal(canSaveHoldingForm(form({ currentPrice: -1 })), false);
     assert.equal(canSaveHoldingForm(form({ quantity: 0 })), false);
+    assert.equal(canSaveHoldingForm(form({ quantity: -1 })), false);
+    assert.equal(canSaveHoldingForm(form({ costPrice: 0 })), false);
+    assert.equal(canSaveHoldingForm(form({ costPrice: -1 })), false);
     assert.equal(canSaveHoldingForm(form({ symbol: "" })), false);
+    assert.equal(canSaveHoldingForm(form({ symbol: "   " })), false);
+    assert.equal(canSaveHoldingForm(form({ name: "" })), false);
+    assert.equal(canSaveHoldingForm(form({ assetType: "" })), false);
+    assert.equal(canSaveHoldingForm(form({ currency: "" })), false);
   });
 });

@@ -151,8 +151,8 @@ function aggregateNasdaqRows(points: Array<ChartPoint & { rawDate: string }>, ra
   }
 
   return Array.from(grouped.entries()).map(([key, bucket]) => {
-	    const first = bucket[0]!;
-	    const last = bucket[bucket.length - 1]!;
+    const first = bucket[0]!;
+    const last = bucket[bucket.length - 1]!;
     const highs = bucket.map((item) => item.high ?? item.close ?? item.price).filter((value) => value != null && value > 0) as number[];
     const lows = bucket.map((item) => item.low ?? item.close ?? item.price).filter((value) => value != null && value > 0) as number[];
     return {
@@ -179,19 +179,35 @@ function fmtApiDate(date: Date) {
 }
 
 async function fetchNasdaqJson(path: string) {
-  const ctrl = new AbortController();
-  const tid = setTimeout(() => ctrl.abort(), 7000);
-  try {
-    const res = await fetch(`${NASDAQ_HOST}${path}`, {
-      signal: ctrl.signal,
-      cache: "no-store",
-      headers: buildHeaders(),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
-  } finally {
-    clearTimeout(tid);
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 7000);
+    try {
+      const res = await fetch(`${NASDAQ_HOST}${path}`, {
+        signal: ctrl.signal,
+        cache: "no-store",
+        headers: buildHeaders(),
+      });
+      if (!res.ok) {
+        const retryable = res.status === 429 || res.status >= 500;
+        if (attempt === 0 && retryable) throw new Error(`HTTP ${res.status}`);
+        throw new Error(`HTTP ${res.status}`);
+      }
+      return await res.json();
+    } catch (error) {
+      lastError = error;
+      const retryable = /HTTP (429|5\d\d)/.test(error instanceof Error ? error.message : "");
+      if (attempt === 0 && retryable) {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      } else {
+        break;
+      }
+    } finally {
+      clearTimeout(tid);
+    }
   }
+  throw lastError instanceof Error ? lastError : new Error("Nasdaq request failed");
 }
 
 function buildQuoteFromInfo(symbol: string, assetClass: NasdaqAssetClass, data: any, rowHint?: any): QuoteInfo | null {
@@ -300,14 +316,21 @@ export async function fetchNasdaqQuote(symbol: string): Promise<QuoteInfo | null
   return null;
 }
 
-export async function fetchNasdaqExtendedQuote(symbol: string): Promise<Partial<QuoteInfo> | null> {
+function extendedSessionsForMarketState(marketState?: string): Array<"pre" | "post"> {
+  const normalized = String(marketState ?? "").toUpperCase();
+  if (normalized.includes("PRE")) return ["pre"];
+  if (normalized.includes("POST")) return ["post"];
+  return ["pre", "post"];
+}
+
+export async function fetchNasdaqExtendedQuote(symbol: string, marketState?: string): Promise<Partial<QuoteInfo> | null> {
   if (symbol.startsWith("^")) return null;
   const nasdaqSymbol = toNasdaqSymbol(symbol);
   const result: Partial<QuoteInfo> = {};
 
   for (const assetClass of candidateAssetClasses(symbol)) {
     let found = false;
-    const sessions = ["pre", "post"] as const;
+    const sessions = extendedSessionsForMarketState(marketState);
     const responses = await Promise.allSettled(
       sessions.map((session) => fetchNasdaqJson(
         `/api/quote/${encodeURIComponent(nasdaqSymbol)}/extended-trading?assetclass=${assetClass}&markettype=${session}`

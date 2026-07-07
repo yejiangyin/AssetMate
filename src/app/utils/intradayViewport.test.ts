@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { buildIntradayViewportPoints, filterLatestIntradayDay } from "./intradayViewport";
+import {
+  buildIntradayViewportPoints,
+  filterLatestIntradayDay,
+  pickDefaultUsSession,
+  usSessionHasData,
+} from "./intradayViewport";
 
 describe("buildIntradayViewportPoints", () => {
   test("uses zero-padded trading-day keys when selecting latest US session", () => {
@@ -68,5 +73,67 @@ describe("buildIntradayViewportPoints", () => {
     ], "US", "AAPL");
 
     assert.deepEqual(filtered.map((point) => point.price), [102, 103]);
+  });
+
+  test("filterLatestIntradayDay keeps only the latest FX calendar day", () => {
+    const filtered = filterLatestIntradayDay([
+      { time: "09:00", timestamp: new Date("2026-06-22T09:00:00+08:00").getTime(), price: 6.78 },
+      { time: "16:00", timestamp: new Date("2026-06-22T16:00:00+08:00").getTime(), price: 6.79 },
+      { time: "09:00", timestamp: new Date("2026-06-26T09:00:00+08:00").getTime(), price: 6.81 },
+      { time: "16:00", timestamp: new Date("2026-06-26T16:00:00+08:00").getTime(), price: 6.82 },
+    ], "FX", "JPYCNY=X");
+
+    assert.deepEqual(filtered.map((point) => point.price), [6.81, 6.82]);
+  });
+
+  test("detects and picks US sessions from available data", () => {
+    const regularPoints = [
+      { time: "21:30", timestamp: new Date("2026-06-22T21:30:00+08:00").getTime(), price: 100 },
+      { time: "22:00", timestamp: new Date("2026-06-22T22:00:00+08:00").getTime(), price: 101 },
+    ];
+    const prePoints = [
+      { time: "16:00", timestamp: new Date("2026-06-22T16:00:00+08:00").getTime(), price: 98 },
+      { time: "17:00", timestamp: new Date("2026-06-22T17:00:00+08:00").getTime(), price: 99 },
+    ];
+
+    assert.equal(usSessionHasData(regularPoints, "regular"), true);
+    assert.equal(usSessionHasData([{ time: "21:30", price: 100 }], "regular"), false);
+    assert.equal(pickDefaultUsSession([...prePoints, ...regularPoints]), "regular");
+    assert.equal(pickDefaultUsSession(prePoints), "pre");
+    assert.equal(pickDefaultUsSession([]), "full");
+  });
+
+  test("applies explicit US session parameters", () => {
+    const result = buildIntradayViewportPoints([
+      { time: "16:00", price: 98, timestamp: new Date("2026-06-22T16:00:00+08:00").getTime() },
+      { time: "17:00", price: 99, timestamp: new Date("2026-06-22T17:00:00+08:00").getTime() },
+      { time: "21:30", price: 100, timestamp: new Date("2026-06-22T21:30:00+08:00").getTime() },
+      { time: "22:00", price: 101, timestamp: new Date("2026-06-22T22:00:00+08:00").getTime() },
+    ], "US", "AAPL", "pre");
+
+    const realPrices = result.points
+      .map((point) => point.displayPrice)
+      .filter((price) => typeof price === "number");
+
+    assert.deepEqual(realPrices, [98, 99]);
+    assert.deepEqual(result.ticks, ["16:00", "17:30", "19:00", "20:30"]);
+  });
+
+  test("uses A-share and HK intraday viewport sessions", () => {
+    const aResult = buildIntradayViewportPoints([
+      { time: "09:30", price: 10 },
+      { time: "11:30", price: 11 },
+      { time: "13:00", price: 12 },
+      { time: "15:00", price: 13 },
+    ], "A", "600900");
+    const hkResult = buildIntradayViewportPoints([
+      { time: "09:30", price: 70 },
+      { time: "12:00", price: 71 },
+      { time: "13:00", price: 72 },
+      { time: "16:00", price: 73 },
+    ], "HK", "00700");
+
+    assert.deepEqual(aResult.ticks, ["09:30", "10:30", "11:30", "13:00", "14:00", "15:00"]);
+    assert.deepEqual(hkResult.ticks, ["09:30", "10:30", "11:30", "13:00", "14:00", "15:00", "16:00"]);
   });
 });

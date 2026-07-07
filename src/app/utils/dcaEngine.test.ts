@@ -2,7 +2,18 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { DCAExecution, DCAPlan } from "../context/AppContext";
 import type { Holding } from "../data/mockData";
-import { computeFundConfirmationDate, dedupeDCAExecutions, fundSettlementDays, repairDCAData, settleDueDCAPlans } from "./dcaEngine";
+import {
+  computeFundConfirmationDate,
+  computeNextExec,
+  dedupeDCAExecutions,
+  fundSettlementDays,
+  hydratePlans,
+  originalScheduledDate,
+  parseChineseMoneyLimit,
+  repairDCAData,
+  settleDueDCAPlans,
+  syncPlanWithHolding,
+} from "./dcaEngine";
 
 function plan(patch: Partial<DCAPlan> = {}): DCAPlan {
   return {
@@ -68,6 +79,139 @@ describe("fund settlement", () => {
     assert.equal(fundSettlementDays(custom), 3);
     assert.equal(computeFundConfirmationDate(custom, "2026-05-22"), "2026-05-28");
   });
+
+  test("handles T+0 and rejects invalid fund-specific confirmation days", () => {
+    assert.equal(fundSettlementDays(plan({ fundBuyConfirmDays: 0 })), 0);
+    assert.equal(computeFundConfirmationDate(plan({ fundBuyConfirmDays: 0 }), "2026-05-22"), "2026-05-22");
+    assert.equal(fundSettlementDays(plan({ fundBuyConfirmDays: 31 })), 2);
+    assert.equal(fundSettlementDays(plan({ fundBuyConfirmDays: -1 })), 2);
+  });
+});
+
+describe("computeNextExec", () => {
+  test("computes daily, weekly, and monthly execution dates", () => {
+    assert.equal(computeNextExec(plan({
+      market: "US",
+      frequency: "daily",
+      startDate: "2026-06-01",
+    }), new Date("2026-06-01T12:00:00Z"), true), "2026-06-01");
+
+    assert.equal(computeNextExec(plan({
+      market: "US",
+      frequency: "weekly",
+      dayOfWeek: 1,
+      startDate: "2026-06-01",
+    }), new Date("2026-06-02T12:00:00Z"), true), "2026-06-08");
+
+    assert.equal(computeNextExec(plan({
+      market: "US",
+      frequency: "monthly",
+      dayOfMonth: 15,
+      startDate: "2026-06-01",
+    }), new Date("2026-06-16T12:00:00Z"), true), "2026-07-15");
+  });
+
+  test("moves non-trading scheduled dates to the next open day", () => {
+    assert.equal(computeNextExec(plan({
+      market: "US",
+      frequency: "monthly",
+      dayOfMonth: 4,
+      startDate: "2026-07-01",
+    }), new Date("2026-07-01T12:00:00Z"), true), "2026-07-06");
+  });
+
+  test("supports weekend schedules for crypto plans", () => {
+    assert.equal(computeNextExec(plan({
+      market: "CRYPTO",
+      assetType: "crypto",
+      name: "Bitcoin",
+      frequency: "weekly",
+      dayOfWeek: 0,
+      startDate: "2026-06-01",
+    }), new Date("2026-06-07T12:00:00Z"), true), "2026-06-07");
+  });
+});
+
+describe("originalScheduledDate", () => {
+  test("reconstructs daily, weekly, and monthly scheduled dates", () => {
+    assert.equal(originalScheduledDate(plan({ frequency: "daily" }), "2026-02-03"), "2026-02-03");
+    assert.equal(originalScheduledDate(plan({ frequency: "weekly", dayOfWeek: 1 }), "2026-06-10"), "2026-06-08");
+    assert.equal(originalScheduledDate(plan({ frequency: "monthly", dayOfMonth: 31 }), "2026-02-28"), "2026-02-28");
+  });
+});
+
+describe("syncPlanWithHolding", () => {
+  test("syncs identity and keeps valid fund confirmation days only", () => {
+    const synced = syncPlanWithHolding(plan({ symbol: "OLD", market: "US", fundBuyConfirmDays: 3 }), holding({
+      id: "h2",
+      symbol: "006479",
+      name: "广发纳斯达克100ETF联接人民币(QDII)C",
+      market: "FUND",
+      assetType: "fund",
+      currency: "CNY",
+      fundBuyConfirmDays: 0,
+    }));
+    const invalid = syncPlanWithHolding(plan({ fundBuyConfirmDays: 3 }), holding({ fundBuyConfirmDays: 31 }));
+
+    assert.equal(synced.holdingId, "h2");
+    assert.equal(synced.symbol, "006479");
+    assert.equal(synced.market, "FUND");
+    assert.equal(synced.assetType, "fund");
+    assert.equal(synced.currency, "CNY");
+    assert.equal(synced.fundBuyConfirmDays, 0);
+    assert.equal(invalid.fundBuyConfirmDays, undefined);
+  });
+});
+
+describe("hydratePlans", () => {
+  test("recovers first due date for never-settled persisted plans", () => {
+    const hydrated = hydratePlans([plan({
+      id: "p-never",
+      market: "US",
+      assetType: "stock",
+      frequency: "daily",
+      startDate: "2026-01-05",
+      nextExecDate: "",
+      totalInvested: undefined as any,
+      execCount: undefined as any,
+    })], []);
+
+    assert.equal(hydrated[0]?.nextExecDate, "2026-01-05");
+    assert.equal(hydrated[0]?.totalInvested, 0);
+    assert.equal(hydrated[0]?.execCount, 0);
+  });
+
+  test("keeps existing next date for settled plans", () => {
+    const hydrated = hydratePlans([plan({
+      id: "p-settled",
+      nextExecDate: "2026-08-01",
+      totalInvested: 100,
+      execCount: 1,
+    })], [{ ...({} as DCAExecution), id: "e1", planId: "p-settled", holdingId: "h1", scheduledDate: "2026-07-01", actualDate: "2026-07-01", amount: 100, adjusted: false, status: "executed" }]);
+
+    assert.equal(hydrated[0]?.nextExecDate, "2026-08-01");
+  });
+});
+
+describe("parseChineseMoneyLimit", () => {
+  test("parses common Chinese RMB units", () => {
+    assert.equal(parseChineseMoneyLimit("限购 1万 元"), 10000);
+    assert.equal(parseChineseMoneyLimit("限购 1.5万元"), 15000);
+    assert.equal(parseChineseMoneyLimit("限购 2千元"), 2000);
+    assert.equal(parseChineseMoneyLimit("限购 3百元"), 300);
+    assert.equal(parseChineseMoneyLimit("限购 4十元"), 40);
+    assert.equal(parseChineseMoneyLimit("限购 100元"), 100);
+    assert.equal(parseChineseMoneyLimit("限购1万5千元"), 15000);
+    assert.equal(parseChineseMoneyLimit("限购1万零500元"), 10500);
+    assert.equal(parseChineseMoneyLimit("限购 0.5万元"), 5000);
+    assert.equal(parseChineseMoneyLimit("限购 100.5元"), 100.5);
+    assert.equal(parseChineseMoneyLimit("限购 1万"), 10000);
+  });
+
+  test("rejects missing or invalid limits", () => {
+    assert.equal(parseChineseMoneyLimit("不限额"), null);
+    assert.equal(parseChineseMoneyLimit("限购 0元"), null);
+  });
 });
 
 describe("dedupeDCAExecutions", () => {
@@ -129,6 +273,41 @@ describe("settleDueDCAPlans", () => {
     assert.deepEqual(settled.executions.map((item) => item.actualDate).sort(), ["2026-06-01", "2026-06-02"]);
     assert.equal(settled.executions.every((item) => item.status === "executed"), true);
     assert.equal(settled.plans[0]?.nextExecDate, "2026-06-03");
+  });
+
+  test("allows one-hour-old non-fund quotes but skips quotes older than one day", () => {
+    const previousNow = Date.now;
+    Date.now = () => Date.parse("2026-06-02T12:00:00Z");
+    try {
+      const duePlan = plan({
+        market: "US",
+        assetType: "stock",
+        symbol: "AAPL",
+        name: "Apple Inc.",
+        nextExecDate: "2026-06-01",
+        startDate: "2026-06-01",
+      });
+      const recent = settleDueDCAPlans(
+        [holding({ updatedAt: "2026-06-02T11:00:00Z" })],
+        [duePlan],
+        [],
+        new Date("2026-06-01T12:00:00Z"),
+        true,
+      );
+      const stale = settleDueDCAPlans(
+        [holding({ updatedAt: "2026-06-01T11:00:00Z" })],
+        [duePlan],
+        [],
+        new Date("2026-06-01T12:00:00Z"),
+        true,
+      );
+
+      assert.equal(recent.executions[0]?.status, "executed");
+      assert.equal(stale.executions[0]?.status, "skipped");
+      assert.match(stale.executions[0]?.reason ?? "", /报价未刷新/);
+    } finally {
+      Date.now = previousNow;
+    }
   });
 
   test("allows fund DCA when the amount is within the current purchase limit", () => {
@@ -460,13 +639,15 @@ describe("settleDueDCAPlans", () => {
       })],
       [weeklyPlan],
       [],
-      new Date("2026-06-16T12:00:00+08:00"),
+      new Date("2026-06-17T12:00:00+08:00"),
       true,
     );
 
     const missed = settled.executions.find((item) => item.actualDate === "2026-06-15");
     assert.equal(missed?.status, "executed");
     assert.equal(missed?.confirmedDate, "2026-06-16");
+    assert.equal(settled.executions.some((item) => item.actualDate === "2026-06-01"), false);
+    assert.equal(settled.executions.some((item) => item.actualDate === "2026-06-08"), false);
   });
 
   test("backfills missed monthly fund executions without using current limits as historical truth", () => {
@@ -488,7 +669,7 @@ describe("settleDueDCAPlans", () => {
         currency: "CNY",
         currentPrice: 1.1,
         priceDate: "2026-06-16",
-        fundNavHistory: [],
+        fundNavHistory: [{ date: "2026-06-15", nav: 1.1 }],
         fundBuyConfirmDays: 2,
         autoTradeStatus: "fund_limit",
         autoTradeStatusNote: "基金限购，10元",
@@ -496,13 +677,75 @@ describe("settleDueDCAPlans", () => {
       })],
       [monthlyPlan],
       [],
-      new Date("2026-06-16T12:00:00+08:00"),
+      new Date("2026-06-17T12:00:00+08:00"),
       true,
     );
 
     const missed = settled.executions.find((item) => item.actualDate === "2026-06-15");
-    assert.equal(missed?.status, "pending");
-    assert.match(missed?.reason ?? "", /补录待确认定投/);
+    assert.equal(missed?.status, "executed");
+    assert.equal(missed?.price, 1.1);
+    assert.equal(missed?.confirmedDate, "2026-06-17");
+  });
+
+  test("skips stale pending fund executions and recovers them when official NAV appears", () => {
+    const fundPlan = plan({
+      amount: 100,
+      nextExecDate: "2026-06-20",
+      startDate: "2026-05-01",
+      fundBuyConfirmDays: 2,
+    });
+    const pending: DCAExecution = {
+      id: "pending-stale-nav",
+      planId: "p1",
+      holdingId: "h1",
+        scheduledDate: "2026-06-01",
+        actualDate: "2026-06-01",
+      amount: 100,
+      adjusted: false,
+      status: "pending",
+    };
+
+    const skipped = settleDueDCAPlans(
+      [holding({
+        market: "FUND",
+        assetType: "fund",
+        symbol: "006479",
+        name: "广发纳斯达克100ETF联接人民币(QDII)C",
+        currency: "CNY",
+        priceDate: "2026-06-15",
+        fundBuyConfirmDays: 2,
+      })],
+      [fundPlan],
+      [pending],
+      new Date("2026-06-15T12:00:00+08:00"),
+      true,
+    );
+    const recoveredHolding = holding({
+        market: "FUND",
+        assetType: "fund",
+        symbol: "006479",
+        name: "广发纳斯达克100ETF联接人民币(QDII)C",
+        currency: "CNY",
+        priceDate: "2026-06-15",
+        fundNavHistory: [{ date: "2026-06-01", nav: 1.25 }],
+        fundBuyConfirmDays: 2,
+      });
+    const repaired = repairDCAData([recoveredHolding], [fundPlan], skipped.executions);
+    const recovered = settleDueDCAPlans(
+      repaired.holdings,
+      repaired.plans,
+      repaired.executions,
+      new Date("2026-06-15T12:00:00+08:00"),
+      true,
+    );
+
+    const skippedRecord = skipped.executions.find((item) => item.id === "pending-stale-nav");
+    const recoveredRecord = recovered.executions.find((item) => item.id === "pending-stale-nav");
+
+    assert.equal(skippedRecord?.status, "skipped");
+    assert.match(skippedRecord?.reason ?? "", /正式净值/);
+    assert.equal(recoveredRecord?.status, "executed");
+    assert.equal(recoveredRecord?.price, 1.25);
   });
 });
 
@@ -556,5 +799,48 @@ describe("repairDCAData fund limits", () => {
     assert.equal(repaired.holdings[0]?.quantity, 50);
     assert.equal(repaired.plans[0]?.execCount, 1);
     assert.equal(repaired.plans[0]?.totalInvested, 100);
+  });
+
+  test("scales reversal cost when repaired executions exceed the current holding quantity", () => {
+    const repaired = repairDCAData(
+      [holding({
+        market: "US",
+        assetType: "stock",
+        symbol: "AAPL",
+        name: "Apple Inc.",
+        quantity: 4,
+        costPrice: 100,
+        currentPrice: 120,
+        currency: "USD",
+      })],
+      [plan({
+        market: "US",
+        assetType: "stock",
+        symbol: "AAPL",
+        name: "Apple Inc.",
+        nextExecDate: "2026-06-08",
+        totalInvested: 1000,
+        execCount: 1,
+      })],
+      [{
+        id: "bad-exec",
+        planId: "p1",
+        holdingId: "h1",
+        scheduledDate: "2026-06-07",
+        actualDate: "2026-06-07",
+        amount: 1000,
+        adjusted: false,
+        status: "executed",
+        quantity: 10,
+        price: 100,
+      }],
+    );
+
+    assert.equal(repaired.changed, true);
+    assert.equal(repaired.executions[0]?.status, "skipped");
+    assert.equal(repaired.holdings[0]?.quantity, 0);
+    assert.equal(repaired.holdings[0]?.costPrice, 100);
+    assert.equal(repaired.plans[0]?.execCount, 0);
+    assert.equal(repaired.plans[0]?.totalInvested, 0);
   });
 });
