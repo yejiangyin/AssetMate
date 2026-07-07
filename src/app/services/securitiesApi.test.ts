@@ -384,8 +384,8 @@ describe("fund quote history", () => {
       json: async () => ({
         Data: {
           LSJZList: [
-            { FSRQ: "2026-01-02", DWJZ: "1.2", JZZZL: "0.1" },
-            { FSRQ: "2026-01-03", DWJZ: "1.3", JZZZL: "0.2" },
+            { FSRQ: "2026-01-02", DWJZ: "1.2", LJJZ: "1.5", JZZZL: "0.1" },
+            { FSRQ: "2026-01-03", DWJZ: "1.3", LJJZ: "1.6", JZZZL: "0.2" },
             { FSRQ: "", DWJZ: "9", JZZZL: "0" },
           ],
         },
@@ -395,6 +395,7 @@ describe("fund quote history", () => {
 
       assert.deepEqual(history.map((point) => point.date), ["2026-01-03", "2026-01-02"]);
       assert.deepEqual(history.map((point) => point.nav), [1.3, 1.2]);
+      assert.deepEqual(history.map((point) => point.totalNav), [1.6, 1.5]);
     });
   });
 
@@ -406,12 +407,46 @@ describe("fund quote history", () => {
       }
       return {
         ok: true,
-        text: async () => "var Data_netWorthTrend = [{\"x\":1767225600000,\"y\":1.1,\"equityReturn\":0.5}];",
+        text: async () => [
+          "var Data_netWorthTrend = [{\"x\":1767225600000,\"y\":1.1,\"equityReturn\":0.5}];",
+          "var Data_ACWorthTrend = [[1767225600000,1.4]];",
+        ].join("\n"),
       } as Response;
     }) as typeof fetch, async () => {
       const history = await fetchCnFundOfficialHistory("006479", 5);
 
-      assert.deepEqual(history, [{ date: "2026-01-01", nav: 1.1, changePercent: 0.5 }]);
+      assert.deepEqual(history, [{ date: "2026-01-01", nav: 1.1, totalNav: 1.4, changePercent: 0.5 }]);
+    });
+  });
+
+  test("uses pingzhongdata cumulative history when official history is shorter than requested", async () => {
+    await withMockFetch((async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/f10/lsjz")) {
+        return {
+          ok: true,
+          json: async () => ({
+            Data: { LSJZList: [{ FSRQ: "2026-01-03", DWJZ: "1.3", LJJZ: "1.6", JZZZL: "0.2" }] },
+          }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        text: async () => [
+          "var Data_netWorthTrend = [",
+          "{\"x\":1767225600000,\"y\":1.1,\"equityReturn\":0.5},",
+          "{\"x\":1767312000000,\"y\":1.2,\"equityReturn\":0.6}",
+          "];",
+          "var Data_ACWorthTrend = [[1767225600000,1.4],[1767312000000,1.5]];",
+        ].join(""),
+      } as Response;
+    }) as typeof fetch, async () => {
+      const history = await fetchCnFundOfficialHistory("006479", 2);
+
+      assert.deepEqual(history, [
+        { date: "2026-01-02", nav: 1.2, totalNav: 1.5, changePercent: 0.6 },
+        { date: "2026-01-01", nav: 1.1, totalNav: 1.4, changePercent: 0.5 },
+      ]);
     });
   });
 

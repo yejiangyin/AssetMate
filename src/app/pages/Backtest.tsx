@@ -137,6 +137,49 @@ function feeRateInput(value: number, onChange: (value: number) => void) {
   );
 }
 
+function backtestDataNote(market: string, priceMode: BacktestResult["priceMode"], isEn: boolean) {
+  if (market === "FUND") {
+    return priceMode === "adjusted"
+      ? (isEn
+        ? "Fund backtests use cumulative NAV when available, so distributions are already included."
+        : "基金回测优先使用累计净值，分红已计入口径，不再重复计入现金分红。")
+      : (isEn
+        ? "This fund source only returned unit NAV; distributions may be missing from the result."
+        : "该基金数据源仅返回单位净值，历史分红可能未完整计入。");
+  }
+  if (market === "BOND") {
+    return priceMode === "adjusted"
+      ? (isEn
+        ? "Bond backtests use adjusted close when available, but coupon, redemption, and conversion cash flows may still be incomplete."
+        : "债券回测优先使用复权收盘价，但票息、赎回和转股等现金流仍可能不完整。")
+      : (isEn
+        ? "Bond backtests are price based; coupon, redemption, and conversion cash flows may be incomplete."
+        : "债券回测以价格为主，票息、赎回和转股等现金流可能未完整计入。");
+  }
+  if (market === "INDEX") {
+    return isEn
+      ? "Index backtests use quoted index levels, not a total-return index unless the selected symbol itself is one."
+      : "指数回测使用点位价格，除非标的本身是全收益指数，否则不含成分股分红。";
+  }
+  if (["US", "HK", "A", "JP"].includes(market)) {
+    return priceMode === "adjusted"
+      ? (isEn
+        ? "Stocks and exchange-traded funds use adjusted close when available, so dividends and splits are already included."
+        : "股票和场内 ETF 优先使用复权收盘价，分红和拆股已计入口径。")
+      : (isEn
+        ? "Stocks and exchange-traded funds use daily prices plus available dividend and split events from the quote source."
+        : "股票和场内 ETF 使用日线价格，并计入数据源提供的分红和拆股事件。");
+  }
+  if (market === "CRYPTO" || market === "GOLD") {
+    return isEn
+      ? "This backtest is price based; no dividend cash flow is expected for this market."
+      : "该市场按价格回测，通常不存在分红现金流。";
+  }
+  return isEn
+    ? "Backtests use daily historical prices and available corporate action events."
+    : "回测使用日线历史价格及数据源可用的公司行动事件。";
+}
+
 function selectInput(value: string, onChange: (value: string) => void, options: { value: string; label: string }[]) {
   return (
     <div style={{ position: "relative" }}>
@@ -899,6 +942,9 @@ export function Backtest() {
                   );
                 }}
               />
+              <p style={{ color: "var(--text-muted)", fontSize: 10, fontWeight: 700, lineHeight: 1.45, marginTop: 8 }}>
+                {backtestDataNote(form.market, result.priceMode, isEn)}
+              </p>
             </div>
 
             <div className="grid grid-cols-2 gap-2">

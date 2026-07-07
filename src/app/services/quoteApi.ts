@@ -474,7 +474,15 @@ export async function fetchBacktestDailyPrices(symbol: string, market: string, s
   if (market === "FUND") {
     const history = await fetchCnFundOfficialHistory(symbol, 4000);
     return history
-      .map((point) => ({ date: point.date, price: point.nav }))
+      .map((point) => {
+        const totalNav = Number(point.totalNav);
+        const useAdjustedNav = Number.isFinite(totalNav) && totalNav > 0;
+        return {
+          date: point.date,
+          price: useAdjustedNav ? totalNav : point.nav,
+          adjusted: useAdjustedNav,
+        };
+      })
       .filter((point) => point.date && Number.isFinite(point.price) && point.price > 0)
       .sort((a, b) => a.date.localeCompare(b.date));
   }
@@ -508,6 +516,7 @@ export async function fetchBacktestDailyPrices(symbol: string, market: string, s
       const result = json?.chart?.result?.[0];
       const timestamps: number[] = result?.timestamp ?? [];
       const closes: Array<number | null> = result?.indicators?.quote?.[0]?.close ?? [];
+      const adjustedCloses: Array<number | null> = result?.indicators?.adjclose?.[0]?.adjclose ?? [];
       const dividendByDate = new Map<string, number>();
       const dividends = Object.values(result?.events?.dividends ?? {}) as YahooDividendEvent[];
       for (const item of dividends) {
@@ -529,6 +538,16 @@ export async function fetchBacktestDailyPrices(symbol: string, market: string, s
       const points = timestamps
         .map((timestamp, index) => {
           const date = new Date(timestamp * 1000).toISOString().slice(0, 10);
+          const adjustedClose = Number(adjustedCloses[index]);
+          if (Number.isFinite(adjustedClose) && adjustedClose > 0) {
+            return {
+              date,
+              price: adjustedClose,
+              dividend: 0,
+              splitRatio: 1,
+              adjusted: true,
+            };
+          }
           return {
             date,
             price: Number(closes[index]),
