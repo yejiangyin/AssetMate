@@ -54,6 +54,13 @@ describe("tradingCalendar", () => {
       assert.equal(isHalfTradingDay("HK", halfDay), true);
       assert.equal(isMarketOpenNow("HK", halfDay), true);
       assert.equal(isMarketOpenNow("HK", afternoon), false);
+
+      globalThis.fetch = (async () => {
+        throw new Error("network down");
+      }) as any;
+      const failedStatus = await refreshTradingCalendar(true);
+      assert.equal(failedStatus, null);
+      assert.equal(isHalfTradingDay("HK", halfDay), true);
     } finally {
       globalThis.window = previousWindow;
       globalThis.fetch = previousFetch;

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { BacktestInput, BacktestPricePoint, runBacktest } from "./backtestEngine";
+import { assertClose } from "../testUtils";
 
 const baseInput: BacktestInput = {
   symbol: "AAPL",
@@ -73,8 +74,8 @@ describe("runBacktest", () => {
     assert.equal(result.totalInvested, 300); // 3 weeks, 100 each
     assert.equal(result.points[0]?.shares, 10);
     assert.equal(result.points[1]?.shares, 10); // no new buy same week
-    assert.equal(result.points[2]?.shares, 10 + 100 / 12);
-    assert.equal(result.points[3]?.shares, 10 + 100 / 12 + 100 / 13);
+    assertClose(result.points[2]?.shares ?? 0, 10 + 100 / 12);
+    assertClose(result.points[3]?.shares ?? 0, 10 + 100 / 12 + 100 / 13);
   });
 
   test("daily DCA invests on every trading day", () => {
@@ -85,7 +86,7 @@ describe("runBacktest", () => {
 
     assert.equal(result.totalInvested, 400); // 4 trading days × 100
     assert.equal(result.points[0]?.shares, 10);
-    assert.equal(result.points[3]?.shares, 10 + 100 / 12 + 100 / 20 + 100 / 15);
+    assertClose(result.points[3]?.shares ?? 0, 10 + 100 / 12 + 100 / 20 + 100 / 15);
   });
 
   test("deducts fee from purchased shares while tracking gross invested amount", () => {
@@ -95,6 +96,25 @@ describe("runBacktest", () => {
     assert.equal(result.points[0]?.shares, 99);
     assert.equal(result.finalValue, 1485);
     assert.equal(result.totalPnl, 485);
+  });
+
+  test("treats negative fee rates as zero", () => {
+    const result = runBacktest({ ...baseInput, feeRate: -0.01 }, prices);
+
+    assert.equal(result.points[0]?.shares, 100);
+    assert.equal(result.finalValue, 1500);
+  });
+
+  test("applies fees to recurring DCA purchases", () => {
+    const result = runBacktest(
+      { ...baseInput, strategy: "monthly_dca", initialAmount: 0, monthlyAmount: 300, feeRate: 0.01 },
+      prices,
+    );
+
+    assert.equal(result.totalInvested, 900);
+    assertClose(result.points[0]?.shares ?? 0, 29.7);
+    assertClose(result.points[2]?.shares ?? 0, 29.7 + 297 / 20);
+    assertClose(result.points[3]?.shares ?? 0, 29.7 + 297 / 20 + 297 / 15);
   });
 
   test("credits cash dividends to shares held before the ex-dividend date", () => {
@@ -144,10 +164,48 @@ describe("runBacktest", () => {
     assert.equal(result.totalReturn, 1);
   });
 
+  test("applies split ratios before valuation and later buys", () => {
+    const result = runBacktest(baseInput, [
+      { date: "2026-01-02", price: 10 },
+      { date: "2026-01-05", price: 5, splitRatio: 2 },
+      { date: "2026-01-06", price: 6 },
+    ]);
+
+    assert.equal(result.points[0]?.shares, 100);
+    assert.equal(result.points[1]?.shares, 200);
+    assert.equal(result.points[1]?.marketValue, 1000);
+    assert.equal(result.finalMarketValue, 1200);
+    assert.equal(result.totalReturn, 0.2);
+    assert.equal(result.maxDrawdown, 0);
+    assert.equal(result.marketMaxDrawdown, 0);
+  });
+
   test("calculates max drawdown from the equity curve", () => {
     const result = runBacktest(baseInput, prices);
 
     assert.equal(result.maxDrawdown, 0.25);
+    assert.equal(result.marketMaxDrawdown, 0.25);
+  });
+
+  test("keeps market drawdown visible when cash dividends mask total drawdown", () => {
+    const result = runBacktest(baseInput, [
+      { date: "2026-01-02", price: 10 },
+      { date: "2026-01-05", price: 5, dividend: 6 },
+      { date: "2026-01-06", price: 5 },
+    ]);
+
+    assert.equal(result.maxDrawdown, 0);
+    assert.equal(result.marketMaxDrawdown, 0.5);
+  });
+
+  test("calculates annualized return from the selected date span", () => {
+    const result = runBacktest({ ...baseInput, endDate: "2027-01-01" }, [
+      { date: "2026-01-01", price: 10 },
+      { date: "2027-01-01", price: 11 },
+    ]);
+
+    assertClose(result.totalReturn, 0.1);
+    assertClose(result.annualizedReturn, 0.1, 1e-3);
   });
 
   test("throws a clear error when no usable price data exists", () => {
@@ -155,6 +213,23 @@ describe("runBacktest", () => {
       () => runBacktest(baseInput, [{ date: "2025-01-01", price: 0 }]),
       /NO_PRICE_DATA/,
     );
+    assert.throws(
+      () => runBacktest(baseInput, []),
+      /NO_PRICE_DATA/,
+    );
+    assert.throws(
+      () => runBacktest({ ...baseInput, startDate: "2026-04-01", endDate: "2026-03-31" }, prices),
+      /NO_PRICE_DATA/,
+    );
+  });
+
+  test("handles zero investment amounts without producing returns", () => {
+    const result = runBacktest({ ...baseInput, initialAmount: 0, monthlyAmount: 0 }, prices);
+
+    assert.equal(result.totalInvested, 0);
+    assert.equal(result.finalValue, 0);
+    assert.equal(result.totalReturn, 0);
+    assert.equal(result.annualizedReturn, 0);
   });
 
   test("keeps every daily point in the selected range", () => {

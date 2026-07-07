@@ -198,7 +198,7 @@ function corporateActionHistoryDays(range: TimeRange) {
 
 const DETAIL_INDEX_SYMBOLS = new Set(["000001", "399001", "000300", "399006", "000688", "HSI", "HSTECH", "HSCEI"]);
 
-function isIndexDetailTarget(target: DetailTarget) {
+export function isIndexDetailTarget(target: DetailTarget) {
   const symbol = (target.displaySymbol || target.yahooSymbol)
     .replace(/^\^/, "")
     .replace(/\.(SS|SZ|HK)$/i, "")
@@ -206,10 +206,10 @@ function isIndexDetailTarget(target: DetailTarget) {
   return target.market === "INDEX"
     || target.assetType === "index"
     || DETAIL_INDEX_SYMBOLS.has(symbol)
-    || /指数|成指|创业板指|科创\s*50|300|INDEX/i.test(target.name);
+    || /指数|成指|创业板指|科创\s*50|INDEX/i.test(target.name);
 }
 
-function buildDetailActionHolding(target: DetailTarget): Holding | null {
+export function buildDetailActionHolding(target: DetailTarget): Holding | null {
   if (["CRYPTO", "GOLD", "FX"].includes(target.market) || isIndexDetailTarget(target)) return null;
   const market = target.market as Holding["market"];
   if (!["US", "HK", "A", "JP", "FUND", "CRYPTO", "BOND", "GOLD"].includes(market)) return null;
@@ -405,9 +405,9 @@ function CompactMetricGrid({ items }: { items: MetricItem[] }) {
       className="grid grid-cols-3 mt-3 overflow-hidden"
       style={{
         borderRadius: 12,
-        background: "rgba(255,255,255,0.42)",
-        border: "1px solid rgba(148,163,184,0.22)",
-        boxShadow: "inset 0 1px 0 rgba(255,255,255,0.45)",
+        background: "var(--bg-surface)",
+        border: "1px solid var(--border-sub)",
+        boxShadow: "inset 0 1px 0 rgba(148,163,184,0.12)",
       }}
     >
       {visibleItems.map((item, index) => (
@@ -419,7 +419,7 @@ function CompactMetricGrid({ items }: { items: MetricItem[] }) {
             padding: "8px 10px",
             borderRight: (index + 1) % 3 === 0 ? "none" : "1px solid rgba(148,163,184,0.18)",
             borderTop: index < 3 ? "none" : "1px solid rgba(148,163,184,0.18)",
-            background: "rgba(255,255,255,0.12)",
+            background: "var(--bg-card)",
           }}
         >
           <div style={{ color: "var(--text-muted)", fontSize: 9.5, fontWeight: 700, lineHeight: 1 }}>
@@ -765,7 +765,7 @@ function CandlestickChart({
                 width={currentPriceLabelWidth}
                 height={15}
                 rx="4"
-                fill="rgba(255,255,255,0.98)"
+                fill="var(--bg-overlay)"
                 stroke="rgba(79,156,249,0.78)"
                 strokeWidth="1"
               />
@@ -803,8 +803,8 @@ function CandlestickChart({
                     width={hoveredYLabelWidth}
                     height={15}
                     rx="4"
-                    fill="rgba(255,255,255,0.98)"
-                    stroke="rgba(148,163,184,0.55)"
+                    fill="var(--bg-overlay)"
+                    stroke="var(--border)"
                     strokeWidth="1"
                   />
                   <text
@@ -1004,6 +1004,7 @@ function ChartNavigator({
     window.addEventListener("pointerup", stopDrag);
     window.addEventListener("pointercancel", stopDrag);
     return () => {
+      dragStateRef.current = null;
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", stopDrag);
       window.removeEventListener("pointercancel", stopDrag);
@@ -1194,7 +1195,7 @@ function ChartNavigator({
 function fallbackQuoteData(target: NonNullable<ReturnType<typeof useApp>["detailTarget"]>, language: Language): ChartData | null {
   const fallback = target.fallbackQuote;
   if (!fallback || !(fallback.price > 0)) return null;
-  const prevClose = fallback.changePercent
+  const prevClose = fallback.changePercent && fallback.changePercent > -1
     ? fallback.price / (1 + fallback.changePercent)
     : fallback.price - fallback.change;
   return {

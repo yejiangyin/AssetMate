@@ -118,6 +118,14 @@ const EASTMONEY_CHART_SECID_ALIASES: Record<string, string[]> = {
   "HK:HSTECH": ["124.HSTECH", "100.HSTECH"],
 };
 
+function chunk<T>(items: T[], size: number): T[][] {
+  const batches: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    batches.push(items.slice(i, i + size));
+  }
+  return batches;
+}
+
 function isLocalDev() {
   return isLocalDevHost();
 }
@@ -538,13 +546,14 @@ export async function fetchEastMoneyQuotes(secids: string[], marketHints?: Recor
   const uniqueSecids = [...new Set(secids.filter(Boolean))];
   if (!uniqueSecids.length) return [] as EastMoneyQuote[];
 
-  const data = await fetchWithFailover("push2delay", "/api/qt/ulist.np/get", {
+  const batches = chunk(uniqueSecids, 50);
+  const responses = await Promise.all(batches.map((batch) => fetchWithFailover("push2delay", "/api/qt/ulist.np/get", {
     fltt: 2,
     fields: "f2,f3,f4,f5,f6,f12,f13,f14,f15,f16,f17,f18",
-    secids: uniqueSecids.join(","),
-  });
+    secids: batch.join(","),
+  })));
 
-  const rows: any[] = data?.data?.diff ?? [];
+  const rows: any[] = responses.flatMap((data) => data?.data?.diff ?? []);
   return rows
     .map((row) => {
       const secid = `${row?.f13}.${row?.f12}`;
@@ -569,13 +578,14 @@ export async function fetchEastMoneyTradeStatuses(secids: string[], marketHints?
   const uniqueSecids = [...new Set(secids.filter(Boolean))];
   if (!uniqueSecids.length) return [] as EastMoneyTradeStatusSnapshot[];
 
-  const data = await fetchWithFailover("push2delay", "/api/qt/ulist.np/get", {
+  const batches = chunk(uniqueSecids, 50);
+  const responses = await Promise.all(batches.map((batch) => fetchWithFailover("push2delay", "/api/qt/ulist.np/get", {
     fltt: 2,
     fields: "f2,f12,f13,f14,f15,f16,f17,f18",
-    secids: uniqueSecids.join(","),
-  });
+    secids: batch.join(","),
+  })));
 
-  const rows: any[] = data?.data?.diff ?? [];
+  const rows: any[] = responses.flatMap((data) => data?.data?.diff ?? []);
   return rows
     .map((row) => {
       const secid = `${row?.f13}.${row?.f12}`;
@@ -645,7 +655,12 @@ function scaleEastMoneyPoints(points: EastMoneyChartPoint[], factor: number): Ea
   }));
 }
 
-export async function fetchEastMoneyChart(symbol: string, market: string, range: EastMoneyChartRange) {
+export async function fetchEastMoneyChart(
+  symbol: string,
+  market: string,
+  range: EastMoneyChartRange,
+  options: { preloadedQuote?: EastMoneyQuote | null } = {},
+) {
   const secids = toEastMoneyChartSecids(symbol, market);
   if (!secids.length) throw new Error(`EastMoney chart unsupported for ${market}:${symbol}`);
 
@@ -653,7 +668,9 @@ export async function fetchEastMoneyChart(symbol: string, market: string, range:
   // matches Yahoo's JPYCNY=X convention used throughout the app.
   const fxScale = isEastMoneyFxPer100(symbol, market) ? 1 / 100 : 1;
 
-  const quotePromise = fetchEastMoneyQuoteBySymbol(symbol, market).catch(() => null);
+  const quotePromise = options.preloadedQuote !== undefined
+    ? Promise.resolve(options.preloadedQuote)
+    : fetchEastMoneyQuoteBySymbol(symbol, market).catch(() => null);
   let points: EastMoneyChartPoint[] | null = null;
   let resolvedSecid = secids[0];
   let lastError: unknown = null;

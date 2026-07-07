@@ -217,6 +217,20 @@ function parseTencentKlineJson(text: string) {
   return JSON.parse(jsonText);
 }
 
+async function fetchTencentTextWithTimeout(url: string, timeoutMs = 6000): Promise<string | null> {
+  const ctrl = new AbortController();
+  const tid = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { cache: "no-store", signal: ctrl.signal });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(tid);
+  }
+}
+
 function formatTencentKlineTime(rawDate: string, range: string) {
   const [year = "", month = "", day = ""] = rawDate.split("-");
   if (!year || !month) return rawDate;
@@ -268,7 +282,16 @@ function parseTencentKlineRows(rows: any[], range: string): Array<TencentKlinePo
 }
 
 function parseTencentIntradayRows(rows: any[]): TencentIntradayPoint[] {
-  const todayLabel = new Date().toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
+  const now = new Date();
+  const shanghaiDateParts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(now);
+  const getPart = (type: string) => shanghaiDateParts.find((part) => part.type === type)?.value ?? "";
+  const datePrefix = `${getPart("year")}-${getPart("month")}-${getPart("day")}`;
+  const todayLabel = now.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric", timeZone: "Asia/Shanghai" });
   const points = rows
     .map((row) => {
       const parts = String(row ?? "").trim().split(/\s+/);
@@ -277,8 +300,6 @@ function parseTencentIntradayRows(rows: any[]): TencentIntradayPoint[] {
       const volume = parseFloat(parts[2] ?? "") || 0;
       if (!/^\d{4}$/.test(rawTime) || !(price > 0)) return null;
       const time = `${rawTime.slice(0, 2)}:${rawTime.slice(2)}`;
-      const now = new Date();
-      const datePrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
       return {
         time,
         timestamp: Date.parse(`${datePrefix}T${time}:00`),
@@ -308,8 +329,8 @@ function aggregateTencentCalendarPoints(points: Array<TencentKlinePoint & { rawD
   }
 
   return Array.from(grouped.entries()).map(([key, bucket]) => {
-	  const first = bucket[0]!;
-	  const last = bucket[bucket.length - 1]!;
+    const first = bucket[0]!;
+    const last = bucket[bucket.length - 1]!;
     const highs = bucket.map((item) => item.high ?? item.close ?? item.price).filter((value) => value != null && value > 0) as number[];
     const lows = bucket.map((item) => item.low ?? item.close ?? item.price).filter((value) => value != null && value > 0) as number[];
     return {
@@ -332,9 +353,9 @@ export async function fetchTencentKline(symbol: string, market: string, range: s
   const url = `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${qs},${period},,,${limit},qfq&_=${Date.now()}`;
 
   try {
-    const res = await fetch(url, { cache: "no-store" });
-    if (!res.ok) return null;
-    const json = parseTencentKlineJson(await res.text());
+    const text = await fetchTencentTextWithTimeout(url);
+    if (!text) return null;
+    const json = parseTencentKlineJson(text);
     const rows: any[] = json?.data?.[qs]?.[period] ?? json?.data?.[qs]?.[`qfq${period}`] ?? [];
     const rawPoints = parseTencentKlineRows(rows, range);
     if (!rawPoints.length) return null;
@@ -352,9 +373,9 @@ export async function fetchTencentIntraday(symbol: string, market: string): Prom
   const url = `https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=${qs}&_=${Date.now()}`;
 
   try {
-    const res = await fetch(url, { cache: "no-store" });
-    if (!res.ok) return null;
-    const json = parseTencentKlineJson(await res.text());
+    const text = await fetchTencentTextWithTimeout(url);
+    if (!text) return null;
+    const json = parseTencentKlineJson(text);
     const rows: any[] = json?.data?.[qs]?.data?.data ?? [];
     const points = parseTencentIntradayRows(rows);
     return points.length > 1 ? points : null;

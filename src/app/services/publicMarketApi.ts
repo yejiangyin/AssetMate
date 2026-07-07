@@ -82,9 +82,7 @@ function formatDateLabel(input: Date, range: PublicMarketTimeRange) {
     const mm = String(input.getMinutes()).padStart(2, "0");
     return `${hh}:${mm}`;
   }
-  if (range === "1mo" || range === "max") return `${year}/${month}`;
-  if (range === "3mo") return `${year}/Q${Math.floor((month - 1) / 3) + 1}`;
-  if (range === "1y") return String(input.getUTCFullYear());
+  if (range === "1mo" || range === "3mo" || range === "1y" || range === "max") return `${year}/${month}`;
   return `${year}/${month}/${day}`;
 }
 

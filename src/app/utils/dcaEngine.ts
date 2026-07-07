@@ -11,7 +11,7 @@ import { resolveHoldingTradeStatus } from "../utils/tradeStatus";
 import { normalizeHoldingType, normalizeHoldingSymbol, applyHoldingAdjustment, recomputeHoldingMetrics } from "./holdingHelpers";
 import { safeUUID } from "./safeId";
 
-const DCA_QUOTE_FRESHNESS_MS = 30 * 60 * 1000;
+const DCA_QUOTE_FRESHNESS_MS = 24 * 60 * 60 * 1000;
 
 /* ─── date helpers ──────────────────────────────────── */
 
@@ -42,7 +42,7 @@ export function todayYMD(date = new Date()) {
 
 /* ─── plan helpers ──────────────────────────────────── */
 
-function originalScheduledDate(plan: DCAPlan, adjustedDate: string): string {
+export function originalScheduledDate(plan: DCAPlan, adjustedDate: string): string {
   if (plan.frequency === "daily") return adjustedDate;
   const d = fromYMDLocal(adjustedDate);
   if (plan.frequency === "monthly" && plan.dayOfMonth) {
@@ -225,8 +225,10 @@ export function repairDCAData(
   const repairedHoldings = holdings.map((h) => {
     const rev = reversals.get(h.id);
     if (!rev || rev.quantity <= 0) return h;
-    const nextQuantity = Math.max(0, h.quantity - rev.quantity);
-    const remainingCostBasis = h.quantity * h.costPrice - rev.costAmount;
+    const effectiveRevQuantity = Math.min(rev.quantity, h.quantity);
+    const effectiveRevCost = rev.costAmount * (effectiveRevQuantity / rev.quantity);
+    const nextQuantity = Math.max(0, h.quantity - effectiveRevQuantity);
+    const remainingCostBasis = h.quantity * h.costPrice - effectiveRevCost;
     const nextCostPrice = nextQuantity > 0 ? remainingCostBasis / nextQuantity : h.costPrice;
     return recomputeHoldingMetrics(h, {
       quantity: nextQuantity,
@@ -285,18 +287,25 @@ export function hydratePlans(plans: DCAPlan[], executions: DCAExecution[] = []):
 /* ─── evaluation ────────────────────────────────────── */
 
 export function parseChineseMoneyLimit(text: string): number | null {
-  const match = text.match(/(?:人民币|RMB|¥)?\s*([0-9]+(?:\.[0-9]+)?)\s*([万千百十]?)\s*元/i);
+  const match = text.match(/(?:人民币|RMB|¥)?\s*((?:[0-9]+(?:\.[0-9]+)?\s*[万千百十]?[\s零]*)+)\s*(?:元|块)?/i);
   if (!match) return null;
-  const base = Number(match[1]);
-  if (!Number.isFinite(base) || base <= 0) return null;
-  const unit = match[2];
-  const multiplier =
+  const unitMultiplier = (unit: string) => (
     unit === "万" ? 10000 :
     unit === "千" ? 1000 :
     unit === "百" ? 100 :
     unit === "十" ? 10 :
-    1;
-  return base * multiplier;
+    1
+  );
+  let total = 0;
+  let matched = false;
+  const amountText = match[1] ?? "";
+  for (const part of amountText.matchAll(/([0-9]+(?:\.[0-9]+)?)\s*([万千百十]?)/g)) {
+    const base = Number(part[1]);
+    if (!Number.isFinite(base) || base <= 0) continue;
+    total += base * unitMultiplier(part[2] ?? "");
+    matched = true;
+  }
+  return matched && total > 0 ? total : null;
 }
 
 function fundLimitReason(note: string, amount?: number, limit?: number) {
@@ -407,6 +416,10 @@ function isFundNavDataSkip(exec: DCAExecution, plan?: DCAPlan) {
     reason.includes("正式净值") ||
     reason.includes("净值缓存")
   );
+}
+
+function isBackfilledPendingFundExecution(exec: DCAExecution) {
+  return exec.status === "pending" && (exec.reason ?? "").includes("补录待确认定投");
 }
 
 export function fundSettlementDays(plan: Pick<DCAPlan, "market" | "name"> & { assetType?: string; fundBuyConfirmDays?: number }): number {
@@ -534,7 +547,7 @@ function settlePendingFundExecutions(
       continue;
     }
 
-    if (plan && isFundHolding(holding, plan)) {
+    if (plan && isFundHolding(holding, plan) && !isBackfilledPendingFundExecution(execution)) {
       const evaluation = evaluateHoldingBuyStatus(holding, execution.amount, {
         requirePrice: false,
         requireFreshQuote: false,

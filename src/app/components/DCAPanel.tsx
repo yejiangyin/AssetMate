@@ -8,7 +8,7 @@ import { motion, AnimatePresence } from "motion/react";
 import { useApp, DCAExecution, DCAPlan } from "../context/AppContext";
 import { Holding } from "../data/mockData";
 import {
-  calcNextExecutions, isTradingDay, closureReason, effectiveDcaMarket,
+  calcNextExecutions, isTradingDay, closureReason, effectiveDcaMarket, marketDate,
   DCAFrequency, MarketType,
 } from "../services/tradingCalendar";
 import { formatFixedNumber } from "../utils/numberFormat";
@@ -31,6 +31,7 @@ import {
 const FREQ_OPTIONS: DCAFrequency[] = ["daily","weekly","monthly"];
 
 const WEEKDAY_OPTIONS = [1, 2, 3, 4, 5];
+const EVERYDAY_OPTIONS = [0, 1, 2, 3, 4, 5, 6];
 const CHECKER_MARKETS: MarketType[] = ["US", "HK", "UK", "DE", "IN", "VN", "A", "JP", "CRYPTO", "FUND", "BOND", "GOLD"];
 
 function dateLabel(d: string, language: Language): string {
@@ -89,7 +90,7 @@ function NextDateBadge({ plan, tc: _tc, language }: { plan: DCAPlan; tc: any; la
   if (!nextExecDate) return null;
   const text = t(language).dca;
 
-  const today = new Date();
+  const today = marketDate(effectiveDcaMarket(plan.market, plan.name), new Date());
   const exec  = new Date(nextExecDate);
   const diff  = Math.round((exec.getTime() - today.setHours(0,0,0,0)) / 86400000);
 
@@ -504,6 +505,21 @@ interface PlanFormData {
   dayOfWeek: number; dayOfMonth: number; startDate: string; note: string;
 }
 
+function localDateYMD(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function isValidYMD(value: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return false;
+  const parsed = new Date(year, month - 1, day);
+  return parsed.getFullYear() === year && parsed.getMonth() === month - 1 && parsed.getDate() === day;
+}
+
 const defaultForm = (): PlanFormData => ({
   holdingId: "",
   name: "",
@@ -511,7 +527,7 @@ const defaultForm = (): PlanFormData => ({
   currency: "",
   frequency: "monthly",
   dayOfWeek: 1, dayOfMonth: 15,
-  startDate: new Date().toISOString().split("T")[0] ?? "",
+  startDate: localDateYMD(),
   note: "",
 });
 
@@ -552,6 +568,7 @@ function PlanForm({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const selectedHolding = holdings.find((holding) => holding.id === form.holdingId);
+  const weekdayOptions = selectedHolding?.market === "CRYPTO" ? EVERYDAY_OPTIONS : WEEKDAY_OPTIONS;
   const previewBlockedStatus = dcaBlockedStatus(selectedHolding, form.amount, language);
   const relevantExecutions = useMemo(() => {
     if (existingPlanId) {
@@ -567,6 +584,7 @@ function PlanForm({
     setForm((current) => ({
       ...current,
       currency: selectedHolding.currency,
+      dayOfWeek: selectedHolding.market === "CRYPTO" || current.dayOfWeek >= 1 ? current.dayOfWeek : 1,
     }));
   }, [selectedHolding]);
 
@@ -578,6 +596,7 @@ function PlanForm({
     }
     if (!form.amount || isNaN(Number(form.amount)) || Number(form.amount) <= 0)
       e.amount = text.validateAmount;
+    if (!isValidYMD(form.startDate)) e.startDate = text.previewError;
     return e;
   };
 
@@ -672,7 +691,7 @@ function PlanForm({
         <div>
           <label style={labelStyle}>{text.weekday}</label>
           <div className="flex gap-1">
-            {WEEKDAY_OPTIONS.map((v) => (
+            {weekdayOptions.map((v) => (
               <button key={v} onClick={() => set("dayOfWeek")(v)}
                 className="flex-1 rounded-lg py-1 transition-all"
                 style={{
@@ -776,8 +795,8 @@ export function DCAPanel() {
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const autoNavigatedRef = useRef(false);
 
-  const totalInvested = dcaPlans.reduce((s, p) => s + p.totalInvested, 0);
-  const activeCount   = dcaPlans.filter((p) => p.enabled).length;
+  const totalInvested = useMemo(() => dcaPlans.reduce((s, p) => s + p.totalInvested, 0), [dcaPlans]);
+  const activeCount = useMemo(() => dcaPlans.filter((p) => p.enabled).length, [dcaPlans]);
   const holdingsById = useMemo(() => new Map(holdings.map((holding) => [holding.id, holding])), [holdings]);
   const latestExecutionByPlan = useMemo(() => {
     const map = new Map<string, DCAExecution>();

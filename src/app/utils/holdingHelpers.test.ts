@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { Holding } from "../data/mockData";
-import { applyCorporateAction, normalizeHolding } from "./holdingHelpers";
+import type { HoldingInput } from "../context/AppContext";
+import { applyCorporateAction, applyHoldingAdjustment, buildHolding, normalizeHolding } from "./holdingHelpers";
 
 function holding(patch: Partial<Holding> = {}): Holding {
   return {
@@ -83,11 +84,51 @@ describe("normalizeHolding", () => {
     assert.deepEqual(normalized.corporateActions, []);
   });
 
+  test("keeps implemented A-share dividends with an ex-dividend date", () => {
+    const normalized = normalizeHolding(holding({
+      market: "A",
+      symbol: "600900",
+      name: "长江电力",
+      assetType: "stock",
+      cashDividendTotal: 7.9,
+      corporateActions: [{
+        id: "eastmoney-stock:cash_dividend:600900:2026-06-04:0.79",
+        type: "cash_dividend",
+        date: "2026-06-04",
+        amount: 7.9,
+        source: "eastmoney-stock",
+        announcementDate: "2026-04-30",
+        recordDate: "2026-06-03",
+        exDate: "2026-06-04",
+      }],
+    }));
+
+    assert.equal(normalized.cashDividendTotal, 7.9);
+    assert.equal(normalized.corporateActions?.length, 1);
+    assert.equal(normalized.corporateActions?.[0]?.exDate, "2026-06-04");
+  });
+
   test("includes cash dividends in unrealized total P/L", () => {
     // 10 shares, cost 1, current 2 → price gain 10; dividends 5 → total 15
     const normalized = normalizeHolding(holding({ cashDividendTotal: 5 }));
     assert.equal(normalized.totalPnl, 15);
     assert.equal(normalized.totalPnlRate, 1.5); // 15 / 10
+  });
+
+  test("recomputes market metrics while preserving daily P/L fields", () => {
+    const normalized = normalizeHolding(holding({
+      quantity: 3,
+      costPrice: 4,
+      currentPrice: 5,
+      todayPnl: 1.5,
+      todayPnlRate: 0.02,
+    }));
+
+    assert.equal(normalized.marketValue, 15);
+    assert.equal(normalized.totalPnl, 3);
+    assert.equal(normalized.totalPnlRate, 0.25);
+    assert.equal(normalized.todayPnl, 1.5);
+    assert.equal(normalized.todayPnlRate, 0.02);
   });
 });
 
@@ -117,5 +158,74 @@ describe("applyCorporateAction", () => {
     assert.equal(adjusted.quantity, 12);
     assert.equal(adjusted.costPrice, 10 / 12);
     assert.equal(adjusted.quantity * adjusted.costPrice, 10);
+  });
+
+  test("applies split ratios while preserving invested cost", () => {
+    const adjusted = applyCorporateAction(holding(), {
+      type: "split",
+      date: "2026-06-04",
+      ratio: 2,
+    });
+
+    assert.equal(adjusted.quantity, 20);
+    assert.equal(adjusted.costPrice, 0.5);
+    assert.equal(adjusted.quantity * adjusted.costPrice, 10);
+    assert.equal(adjusted.corporateActions?.[0]?.ratio, 2);
+  });
+});
+
+describe("buildHolding", () => {
+  test("builds normalized holdings with computed metrics", () => {
+    const input: HoldingInput = {
+      groupId: "g1",
+      symbol: "700.HK",
+      name: "Tencent",
+      market: "HK",
+      assetType: "stock",
+      quantity: 2,
+      costPrice: 300,
+      currentPrice: 350,
+      currency: "HKD",
+      tradeStatus: "normal",
+      dividendReinvest: true,
+    };
+
+    const built = buildHolding(input, "new-id");
+
+    assert.equal(built.id, "new-id");
+    assert.equal(built.symbol, "00700");
+    assert.equal(built.marketValue, 700);
+    assert.equal(built.totalPnl, 100);
+    assert.equal(built.totalPnlRate, 100 / 600);
+    assert.equal(built.dividendReinvest, null);
+  });
+});
+
+describe("applyHoldingAdjustment", () => {
+  test("buys shares by recalculating weighted average cost", () => {
+    const adjusted = applyHoldingAdjustment(holding(), { type: "buy", quantity: 10, price: 3 });
+
+    assert.equal(adjusted?.quantity, 20);
+    assert.equal(adjusted?.costPrice, 2);
+    assert.equal(adjusted?.marketValue, 40);
+  });
+
+  test("sells shares without changing remaining average cost", () => {
+    const adjusted = applyHoldingAdjustment(holding(), { type: "sell", quantity: 4, price: 3 });
+
+    assert.equal(adjusted?.quantity, 6);
+    assert.equal(adjusted?.costPrice, 1);
+    assert.equal(adjusted?.marketValue, 12);
+  });
+
+  test("returns null when a sale closes the whole position", () => {
+    assert.equal(applyHoldingAdjustment(holding(), { type: "sell", quantity: 10, price: 3 }), null);
+    assert.equal(applyHoldingAdjustment(holding(), { type: "sell", quantity: 99, price: 3 }), null);
+  });
+
+  test("ignores invalid adjustment quantities or prices", () => {
+    const base = holding();
+    assert.equal(applyHoldingAdjustment(base, { type: "buy", quantity: 0, price: 3 }), base);
+    assert.equal(applyHoldingAdjustment(base, { type: "buy", quantity: 1, price: 0 }), base);
   });
 });

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { buildClosedHolding, loadInitialState } from "./AppContext";
+import { buildClosedHolding, computeStats, loadInitialState } from "./AppContext";
 import type { Holding } from "../data/mockData";
+import { createDCAPlan, createLocalStorageMock, withMockWindow } from "../testUtils";
 
 function holding(patch: Partial<Holding> = {}): Holding {
   return {
@@ -28,7 +29,7 @@ function holding(patch: Partial<Holding> = {}): Holding {
 }
 
 describe("loadInitialState", () => {
-  test("keeps compatible local data when storage version changes", () => {
+  test("loads persisted holdings from localStorage", () => {
     const previousWindow = globalThis.window;
     const saved = {
       version: 1,
@@ -141,6 +142,72 @@ describe("loadInitialState", () => {
       globalThis.window = previousWindow;
     }
   });
+
+  test("falls back to default state when persisted JSON is corrupt", async () => {
+    await withMockWindow({
+      localStorage: createLocalStorageMock({
+        "asset-helper:v2": "{bad json",
+      }).localStorage as unknown as Storage,
+    }, async () => {
+      const state = loadInitialState();
+      assert.ok(state.holdings.length > 0);
+      assert.ok(state.groups.length > 0);
+      assert.ok(state.closedHoldings.length > 0);
+    });
+  });
+
+  test("loads persisted groups, repairs DCA plans, and filters asset snapshots", async () => {
+    const snapshots = Array.from({ length: 181 }, (_, index) => ({
+      date: `2026-01-${String((index % 28) + 1).padStart(2, "0")}`,
+      totalAsset: index + 1,
+      todayPnl: index,
+      cumulativePnl: index * 2,
+    }));
+    const saved = {
+      groups: [{ id: "g_custom", name: "自选", color: "#123456", sort: 1, visible: true }],
+      holdings: [holding({
+        id: "h_dca",
+        groupId: "g_custom",
+        symbol: "600900",
+        name: "长江电力",
+        market: "A",
+        currency: "CNY",
+      })],
+      dcaPlans: [createDCAPlan({
+        id: "p_dca",
+        holdingId: "h_dca",
+        name: "旧名称",
+        symbol: "OLD",
+        market: "US",
+        currency: "USD",
+        nextExecDate: "",
+      })],
+      dcaExecutions: [],
+      assetSnapshots: [
+        { date: "", totalAsset: 999, todayPnl: 0, cumulativePnl: 0 },
+        { date: "2026-01-01", totalAsset: Number.NaN, todayPnl: 0, cumulativePnl: 0 },
+        ...snapshots,
+      ],
+    };
+
+    await withMockWindow({
+      localStorage: createLocalStorageMock({
+        "asset-helper:v2": JSON.stringify(saved),
+      }).localStorage as unknown as Storage,
+    }, async () => {
+      const state = loadInitialState();
+
+      assert.deepEqual(state.groups.map((group) => group.id), ["g_custom"]);
+      assert.equal(state.holdings[0]?.groupId, "g_custom");
+      assert.equal(state.dcaPlans[0]?.name, "长江电力");
+      assert.equal(state.dcaPlans[0]?.symbol, "600900");
+      assert.equal(state.dcaPlans[0]?.market, "A");
+      assert.ok(state.dcaPlans[0]?.nextExecDate);
+      assert.equal(state.assetSnapshots.length, 180);
+      assert.equal(state.assetSnapshots[0]?.totalAsset, 2);
+      assert.equal(state.assetSnapshots.at(-1)?.totalAsset, 181);
+    });
+  });
 });
 
 describe("buildClosedHolding", () => {
@@ -182,5 +249,25 @@ describe("buildClosedHolding", () => {
   test("uses closed date as openedAt fallback when holding has no timestamp", () => {
     const closed = buildClosedHolding(holding({ updatedAt: "" }), 130, "2026-07-01");
     assert.equal(closed.openedAt, "2026-07-01");
+  });
+});
+
+describe("computeStats", () => {
+  test("keeps cost basis independent from cash dividends", () => {
+    const stats = computeStats([
+      holding({
+        currency: "CNY",
+        quantity: 100,
+        costPrice: 40,
+        currentPrice: 50,
+        todayPnl: 0,
+        cashDividendTotal: 500,
+      }),
+    ]);
+
+    assert.equal(stats.totalAsset, 5000);
+    assert.equal(stats.costBasis, 4000);
+    assert.equal(stats.unrealizedPnl, 1500);
+    assert.equal(stats.unrealizedRate, 0.375);
   });
 });

@@ -5,7 +5,7 @@
  * and surface an explicit empty-chart state in the UI.
  */
 
-import { fetchCnFundEstimate, fetchCnFundOfficialHistory, fetchCnFundOfficialNav, fetchCryptoPrice } from "./securitiesApi";
+import { fetchCnFundEstimate, fetchCnFundOfficialHistory, fetchCnFundOfficialNav, fetchCryptoPrice, type FundEstimateSnapshot, type FundOfficialHistoryItem } from "./securitiesApi";
 import { fetchEastMoneyChart, fetchEastMoneyQuoteBySymbol, type EastMoneyChartRange } from "./eastMoneyApi";
 import { fetchNasdaqChart, fetchNasdaqExtendedQuote } from "./nasdaqApi";
 import { fetchTencentIntraday, fetchTencentKline, fetchTencentQuote, fetchTencentQuoteFromYahooSymbol } from "./tencentQuote";
@@ -51,6 +51,13 @@ type YahooDividendEvent = {
   amount?: number | string;
 };
 
+type YahooSplitEvent = {
+  date?: number | string;
+  splitRatio?: string;
+  numerator?: number | string;
+  denominator?: number | string;
+};
+
 function toEastMoneyChartRange(range: TimeRange): EastMoneyChartRange {
   return range === "fs" || range === "1d" || range === "5d" || range === "1mo" || range === "3mo" || range === "1y" || range === "max"
     ? range
@@ -61,6 +68,19 @@ function toPublicMarketTimeRange(range: TimeRange): PublicMarketTimeRange {
   return range === "fs" || range === "1d" || range === "5d" || range === "1mo" || range === "3mo" || range === "1y" || range === "max"
     ? range
     : "max";
+}
+
+function parseYahooSplitRatio(splitRatio?: string, numerator?: number | string, denominator?: number | string) {
+  if (typeof splitRatio === "string") {
+    const [leftRaw, rightRaw] = splitRatio.split(":");
+    const left = Number(leftRaw);
+    const right = Number(rightRaw);
+    if (Number.isFinite(left) && Number.isFinite(right) && right > 0) return left / right;
+  }
+  const num = Number(numerator);
+  const den = Number(denominator);
+  if (Number.isFinite(num) && Number.isFinite(den) && den > 0) return num / den;
+  return 1;
 }
 
 function yahooQuerySpec(range: TimeRange) {
@@ -154,6 +174,7 @@ export interface DailyPricePoint {
   date: string;
   price: number;
   dividend?: number;
+  splitRatio?: number;
   adjusted?: boolean;
 }
 
@@ -472,11 +493,15 @@ export async function fetchBacktestDailyPrices(symbol: string, market: string, s
         interval: "1d",
         period1: String(period1),
         period2: String(Math.max(period1 + 86_400, period2)),
-        events: "div",
+        events: "div,splits",
         includePrePost: "false",
       });
       const url = `https://${host}/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?${params.toString()}`;
-      const res = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
+      const res = await fetch(url, {
+        signal: ctrl.signal,
+        cache: "no-store",
+        headers: { Referer: "https://finance.yahoo.com/" },
+      });
       clearTimeout(tid);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
@@ -492,12 +517,25 @@ export async function fetchBacktestDailyPrices(symbol: string, market: string, s
         const date = new Date(ts * 1000).toISOString().slice(0, 10);
         dividendByDate.set(date, (dividendByDate.get(date) ?? 0) + amount);
       }
+      const splitByDate = new Map<string, number>();
+      const splits = Object.values(result?.events?.splits ?? {}) as YahooSplitEvent[];
+      for (const item of splits) {
+        const ts = Number(item?.date);
+        const ratio = parseYahooSplitRatio(item?.splitRatio, item?.numerator, item?.denominator);
+        if (!Number.isFinite(ts) || !(ratio > 0) || ratio === 1) continue;
+        const date = new Date(ts * 1000).toISOString().slice(0, 10);
+        splitByDate.set(date, (splitByDate.get(date) ?? 1) * ratio);
+      }
       const points = timestamps
-        .map((timestamp, index) => ({
-          date: new Date(timestamp * 1000).toISOString().slice(0, 10),
-          price: Number(closes[index]),
-          dividend: dividendByDate.get(new Date(timestamp * 1000).toISOString().slice(0, 10)) ?? 0,
-        }))
+        .map((timestamp, index) => {
+          const date = new Date(timestamp * 1000).toISOString().slice(0, 10);
+          return {
+            date,
+            price: Number(closes[index]),
+            dividend: dividendByDate.get(date) ?? 0,
+            splitRatio: splitByDate.get(date) ?? 1,
+          };
+        })
         .filter((point) => point.date && Number.isFinite(point.price) && point.price > 0)
         .sort((a, b) => a.date.localeCompare(b.date));
       if (points.length) return points;
@@ -721,15 +759,16 @@ function aggregateYahooCalendarPoints(
   });
 }
 
-async function fetchFundLatestQuote(code: string): Promise<QuoteInfo | null> {
+async function fetchFundLatestQuote(
+  code: string,
+  options: { estimate?: FundEstimateSnapshot | null; history?: FundOfficialHistoryItem[] } = {},
+): Promise<QuoteInfo | null> {
   const ctrl = new AbortController();
   const tid = setTimeout(() => ctrl.abort(), 7000);
   try {
-    const [estimate, officialNav] = await Promise.all([
-      fetchCnFundEstimate(code),
-      fetchCnFundOfficialNav(code),
-    ]);
-    const history = await fetchCnFundOfficialHistory(code, 2);
+    const estimate = options.estimate !== undefined ? options.estimate : await fetchCnFundEstimate(code);
+    const history = options.history ?? await fetchCnFundOfficialHistory(code, 2);
+    const officialNav = await fetchCnFundOfficialNav(code, { estimate, history });
     clearTimeout(tid);
 
     const dwjz = estimate?.officialNav ?? 0;
@@ -834,7 +873,10 @@ const inflightDetailRequests = new Map<string, Promise<ChartData>>();
 
 function getCached(key: string): ChartData | null {
   const e = chartCache.get(key);
-  return e && Date.now() - e.ts < CACHE_TTL ? e.data : null;
+  if (!e) return null;
+  if (Date.now() - e.ts < CACHE_TTL) return e.data;
+  chartCache.delete(key);
+  return null;
 }
 function setCached(key: string, data: ChartData) {
   if (chartCache.has(key)) chartCache.delete(key);
@@ -898,11 +940,27 @@ async function fetchFundChart(code: string, range: TimeRange, force = false): Pr
   const ctrl = new AbortController();
   const timeoutMs = (range === "max" || range === "fmax" || range === "f10y" || range === "f5y") ? 20000 : 10000;
   const tid = setTimeout(() => ctrl.abort(), timeoutMs);
+  let recoveredQuoteHistory: FundOfficialHistoryItem[] | undefined;
   try {
-    const [historyResult, quoteResult] = await Promise.allSettled([
-      fetchFundHistory(code, range, ctrl.signal),
-      fetchFundLatestQuote(code),
-    ]);
+    const historyResult = await Promise.resolve(fetchFundHistory(code, range, ctrl.signal))
+      .then((history) => ({ status: "fulfilled" as const, value: history }))
+      .catch((reason) => ({ status: "rejected" as const, reason }));
+    const quoteResult = historyResult.status === "fulfilled"
+      ? await fetchFundLatestQuote(code, {
+        history: (() => {
+          recoveredQuoteHistory = historyResult.value.slice(-2).reverse().map((row) => ({
+          date: row.date,
+          nav: row.nav,
+          changePercent: row.changePercent ?? 0,
+          }));
+          return recoveredQuoteHistory;
+        })(),
+      })
+        .then((value) => ({ status: "fulfilled" as const, value }))
+        .catch((reason) => ({ status: "rejected" as const, reason }))
+      : await fetchFundLatestQuote(code)
+        .then((value) => ({ status: "fulfilled" as const, value }))
+        .catch((reason) => ({ status: "rejected" as const, reason }));
     clearTimeout(tid);
 
     if (historyResult.status !== "fulfilled") throw historyResult.reason;
@@ -948,7 +1006,7 @@ async function fetchFundChart(code: string, range: TimeRange, force = false): Pr
     return data;
   } catch {
     clearTimeout(tid);
-    const fallbackQuote = await fetchFundLatestQuote(code);
+    const fallbackQuote = await fetchFundLatestQuote(code, { history: recoveredQuoteHistory });
     if (fallbackQuote) {
       if (persistedEntry?.data && hasRealChartPoints(persistedEntry.data.points)) {
         const data = mergeQuoteIntoChart(persistedEntry.data, fallbackQuote);
@@ -1145,12 +1203,13 @@ async function fetchYahooRecentDailyChart(yahooSymbol: string, days: number, for
   }
 
   const hosts = ["query2.finance.yahoo.com", "query1.finance.yahoo.com"];
+  const yahooRange = days <= 66 ? "3mo" : days <= 260 ? "1y" : "5y";
   let lastError: unknown = null;
   for (const host of hosts) {
     const ctrl = new AbortController();
     const tid = setTimeout(() => ctrl.abort(), 4500);
     try {
-      const url = `https://${host}/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1d&range=3mo&includePrePost=false`;
+      const url = `https://${host}/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1d&range=${yahooRange}&includePrePost=false`;
       const res = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
       clearTimeout(tid);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1221,7 +1280,8 @@ export async function fetchRecentDailyChart(symbol: string, market: string, days
   const fullRefresh = shouldFullRefresh(persistedEntry, DAILY_FULL_REFRESH_TTL);
 
   if (market === "FUND") {
-    const fundData = await fetchFundChart(symbol, "1mo", force);
+    const fundRange: TimeRange = days <= 22 ? "f1mo" : days <= 66 ? "f3mo" : "f1y";
+    const fundData = await fetchFundChart(symbol, fundRange, force);
     const data = { ...fundData, points: fundData.points.slice(-days) };
     setCached(key, data);
     setPersistentChart(key, data, fullRefresh);
@@ -1311,6 +1371,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     const rawSymbol = market === "HK"
       ? symbol.replace(/^\^/, "").replace(/\.HK$/i, "")
       : symbol.replace(/\.(SS|SZ)$/i, "");
+    let preloadedEastMoneyQuote: Awaited<ReturnType<typeof fetchEastMoneyQuoteBySymbol>> | null | undefined;
 
     if (market === "HK" && range === "fs") {
       // EastMoney HK trend can report a non-zero total with an empty trends array.
@@ -1321,6 +1382,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
       ]);
       const tencentPoints = tencentIntradayResult.status === "fulfilled" ? tencentIntradayResult.value : null;
       const emQuote = eastMoneyQuoteResult.status === "fulfilled" ? eastMoneyQuoteResult.value : null;
+      preloadedEastMoneyQuote = emQuote;
       const liveQuote = emQuote?.price && emQuote.price > 0
         ? {
           symbol: rawSymbol,
@@ -1347,7 +1409,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
 
       const isHkIndex = HK_INDEX_SYMBOLS.has(rawSymbol.toUpperCase());
       const [eastMoneyResult, yahooData] = await Promise.all([
-        fetchEastMoneyChart(rawSymbol, market, toEastMoneyChartRange(range)).catch(() => null),
+        fetchEastMoneyChart(rawSymbol, market, toEastMoneyChartRange(range), { preloadedQuote: emQuote }).catch(() => null),
         fetchChart(detailYahooSymbol(symbol, market), range, force).catch(() => null),
       ]);
 
@@ -1375,6 +1437,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
       const yahooData = yahooResult.status === "fulfilled" ? yahooResult.value : null;
       const emQuote = eastMoneyQuoteResult.status === "fulfilled" ? eastMoneyQuoteResult.value : null;
       const tencentPoints = tencentKlineResult.status === "fulfilled" ? tencentKlineResult.value : null;
+      preloadedEastMoneyQuote = emQuote;
       const liveQuote = emQuote?.price && emQuote.price > 0
         ? {
           symbol: rawSymbol, name: emQuote.name, price: emQuote.price,
@@ -1398,7 +1461,9 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     }
 
     try {
-      const result = await fetchEastMoneyChart(rawSymbol, market, toEastMoneyChartRange(range));
+      const result = await fetchEastMoneyChart(rawSymbol, market, toEastMoneyChartRange(range), {
+        preloadedQuote: preloadedEastMoneyQuote,
+      });
       const data = {
         quote: {
           symbol: result.quote.symbol,
@@ -1419,7 +1484,9 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
       };
       return storeDetailChart(data);
     } catch {
-      const eastMoneyQuote = await fetchEastMoneyQuoteBySymbol(rawSymbol, market).catch(() => null);
+      const eastMoneyQuote = preloadedEastMoneyQuote !== undefined
+        ? preloadedEastMoneyQuote
+        : await fetchEastMoneyQuoteBySymbol(rawSymbol, market).catch(() => null);
       const tencent = await fetchTencentQuote(rawSymbol, market).catch(() => null);
       const cachedDetail = getCached(detailChartKey);
       let yahooData: ChartData | null = null;

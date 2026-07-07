@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Calculator, CalendarDays, ChevronDown, ChevronLeft, ChevronRight,
   Loader2, RefreshCw, TrendingUp, Wifi, WifiOff,
@@ -6,12 +6,13 @@ import {
 import { AnimatePresence, motion } from "motion/react";
 import { useApp } from "../context/AppContext";
 import { fetchBacktestDailyPrices } from "../services/quoteApi";
-import { searchSecuritiesLive, type LiveResult, type Market } from "../services/securitiesApi";
+import type { LiveResult, Market } from "../services/securitiesApi";
 import { currencySymbol, formatExactMoney, formatPercent } from "../utils/numberFormat";
 import { BacktestInput, BacktestResult, BacktestStrategy, runBacktest } from "../utils/backtestEngine";
 import { SparklineChart } from "../components/SparklineChart";
 import { getMarketBadgeWithBg } from "../utils/marketBadge";
 import { normalizeHoldingSymbol, normalizeHoldingType } from "../utils/holdingHelpers";
+import { useSecuritySearch } from "../utils/useSecuritySearch";
 import { assetTypeLabel, marketLabel, t } from "../i18n";
 
 const marketOptions = [
@@ -24,19 +25,23 @@ const marketOptions = [
 ];
 
 function monthsAgoYMD(months: number) {
-  const date = new Date();
-  date.setMonth(date.getMonth() - months);
-  return date.toISOString().slice(0, 10);
+  const now = new Date();
+  const targetMonthIndex = now.getMonth() - months;
+  const targetYear = now.getFullYear() + Math.floor(targetMonthIndex / 12);
+  const targetMonth = ((targetMonthIndex % 12) + 12) % 12;
+  const lastDay = new Date(targetYear, targetMonth + 1, 0).getDate();
+  return dateToYMD(new Date(targetYear, targetMonth, Math.min(now.getDate(), lastDay)));
 }
 
 function yearsAgoYMD(years: number) {
-  const date = new Date();
-  date.setFullYear(date.getFullYear() - years);
-  return date.toISOString().slice(0, 10);
+  const now = new Date();
+  const targetYear = now.getFullYear() - years;
+  const lastDay = new Date(targetYear, now.getMonth() + 1, 0).getDate();
+  return dateToYMD(new Date(targetYear, now.getMonth(), Math.min(now.getDate(), lastDay)));
 }
 
 function todayYMD() {
-  return new Date().toISOString().slice(0, 10);
+  return dateToYMD(new Date());
 }
 
 function displayDate(value: string) {
@@ -46,7 +51,14 @@ function displayDate(value: string) {
 function parseYMD(value: string) {
   const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!match) return new Date();
-  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(year, month - 1, day);
+  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) {
+    return new Date();
+  }
+  return date;
 }
 
 function dateToYMD(date: Date) {
@@ -71,23 +83,57 @@ function currencyForMarket(market: string) {
   return "CNY";
 }
 
-function numberInput(value: number, onChange: (value: number) => void, placeholder?: string) {
+function numberInput(value: number, onChange: (value: number) => void, placeholder?: string, step = 1) {
+  const isInvalid = Number.isFinite(value) && value < 0;
   return (
     <input
       type="number"
+      min={0}
+      step={step}
       value={Number.isFinite(value) ? value : 0}
-      onChange={(event) => onChange(Number(event.target.value))}
+      onChange={(event) => onChange(Math.max(0, Number(event.target.value)))}
       placeholder={placeholder}
+      title={isInvalid ? "Value cannot be negative" : undefined}
       className="w-full rounded-xl px-3"
       style={{
         height: 38,
         background: "var(--bg-card)",
-        border: "1px solid var(--border)",
+        border: isInvalid ? "1px solid rgba(242,78,78,0.45)" : "1px solid var(--border)",
         color: "var(--text-primary)",
         fontSize: 13,
         outline: "none",
+        paddingRight: 34,
       }}
     />
+  );
+}
+
+function feeRateInput(value: number, onChange: (value: number) => void) {
+  const percentValue = Number.isFinite(value) ? Number((value * 100).toFixed(4)) : 0;
+  return (
+    <div className="relative">
+      {numberInput(
+        percentValue,
+        (nextPercent) => onChange(nextPercent / 100),
+        "0.10",
+        0.001,
+      )}
+      <span
+        aria-hidden="true"
+        style={{
+          position: "absolute",
+          right: 10,
+          top: "50%",
+          transform: "translateY(-50%)",
+          color: "var(--text-muted)",
+          fontSize: 12,
+          fontWeight: 800,
+          pointerEvents: "none",
+        }}
+      >
+        %
+      </span>
+    </div>
   );
 }
 
@@ -407,56 +453,21 @@ function SecuritySearchInput({
 }) {
   const { language } = useApp();
   const text = t(language);
-  const [open, setOpen] = useState(false);
-  const [hits, setHits] = useState<LiveResult[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [apiOk, setApiOk] = useState<boolean | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-
-  const doSearch = useCallback(async (query: string, filter?: Market) => {
-    if (!query.trim()) {
-      setHits([]);
-      setOpen(false);
-      return;
-    }
-    setLoading(true);
-    try {
-      const results = await searchSecuritiesLive(query, filter);
-      setHits(results);
-      setOpen(results.length > 0);
-      setApiOk(results.length ? results[0]?.source === "live" : false);
-    } catch {
-      setHits([]);
-      setApiOk(false);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const { apiOk, hits, loading, open, setOpen, scheduleSearch } = useSecuritySearch(value, marketFilter);
 
   const handleChange = (next: string) => {
     onChange(next);
-    clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => doSearch(next, marketFilter), 350);
+    scheduleSearch(next, marketFilter);
   };
-
-  useEffect(() => {
-    if (!value.trim()) return;
-    void doSearch(value, marketFilter);
-    // Re-run only when the market filter changes; typing is debounced in handleChange.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [doSearch, marketFilter]);
 
   useEffect(() => {
     const close = (event: MouseEvent) => {
       if (wrapRef.current && !wrapRef.current.contains(event.target as Node)) setOpen(false);
     };
     document.addEventListener("mousedown", close);
-    return () => {
-      document.removeEventListener("mousedown", close);
-      clearTimeout(timerRef.current);
-    };
-  }, []);
+    return () => document.removeEventListener("mousedown", close);
+  }, [setOpen]);
 
   return (
     <div ref={wrapRef} style={{ position: "relative" }}>
@@ -598,6 +609,7 @@ export function Backtest() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<BacktestResult | null>(null);
+  const runSeqRef = useRef(0);
 
   const chartColor = profitColor(result?.totalPnl ?? 0);
   const chartData = useMemo(() => {
@@ -649,6 +661,7 @@ export function Backtest() {
   };
 
   const run = async () => {
+    const runSeq = ++runSeqRef.current;
     const symbol = form.symbol.trim();
     if (!symbol) {
       setError(isEn ? "Enter a symbol first." : "请先输入标的代码。");
@@ -666,8 +679,10 @@ export function Backtest() {
         throw new Error(firstDate && lastDate ? `NO_PRICE_DATA:${firstDate}:${lastDate}` : "NO_PRICE_DATA");
       }
       const nextResult = runBacktest({ ...form, symbol }, prices);
+      if (runSeq !== runSeqRef.current) return;
       setResult(nextResult);
     } catch (err) {
+      if (runSeq !== runSeqRef.current) return;
       setResult(null);
       const errorMessage = err instanceof Error ? err.message : "";
       const coverage = errorMessage.startsWith("NO_PRICE_DATA:") ? errorMessage.split(":").slice(1) : [];
@@ -680,7 +695,7 @@ export function Backtest() {
         : (isEn ? "Backtest failed. Try another symbol or range." : "回测失败，请换一个标的或时间区间。");
       setError(message);
     } finally {
-      setLoading(false);
+      if (runSeq === runSeqRef.current) setLoading(false);
     }
   };
 
@@ -723,7 +738,7 @@ export function Backtest() {
                 setSecurityQuery("");
                 setResult(null);
                 setError("");
-                if (next) updateForm("market", next);
+                updateForm("market", next || "US");
               }, localizedMarketScopeOptions)}
             </label>
             <label className="flex-1 min-w-0">
@@ -759,8 +774,8 @@ export function Backtest() {
               />
             </label>
             <label style={{ minWidth: 0 }}>
-              <p style={{ color: "var(--text-muted)", fontSize: 10, marginBottom: 5 }}>{isEn ? "Fee Rate" : "手续费率"}</p>
-              {numberInput(form.feeRate, (value) => updateForm("feeRate", value), "0.001")}
+              <p style={{ color: "var(--text-muted)", fontSize: 10, marginBottom: 5 }}>{isEn ? "Fee Rate (%)" : "手续费率 (%)"}</p>
+              {feeRateInput(form.feeRate, (value) => updateForm("feeRate", value))}
             </label>
           </div>
 
@@ -845,9 +860,7 @@ export function Backtest() {
                     {formatPercent(result.totalReturn)}
                   </p>
                   <p style={{ color: "var(--text-muted)", fontSize: 9, fontWeight: 700, marginTop: 3 }}>
-                    {result.priceMode === "adjusted"
-                      ? (isEn ? "adjusted" : "复权口径")
-                      : (isEn ? "incl. dividends" : "含分红")}
+                    {isEn ? "incl. dividends/splits" : "含分红/拆股"}
                   </p>
                 </div>
               </div>
@@ -891,26 +904,23 @@ export function Backtest() {
             <div className="grid grid-cols-2 gap-2">
               <MetricCard label={isEn ? "Invested" : "投入本金"} value={privacyMode ? `${currencySymbol(quoteCurrency)}***` : formatExactMoney(result.totalInvested, quoteCurrency, 2)} />
               <MetricCard
-                label={result.priceMode === "adjusted" ? (isEn ? "Adjusted Value" : "复权期末值") : (isEn ? "Market Value" : "期末市值")}
+                label={isEn ? "Market Value" : "期末市值"}
                 value={privacyMode ? `${currencySymbol(quoteCurrency)}***` : formatExactMoney(result.finalMarketValue, quoteCurrency, 2)}
               />
-              {result.priceMode === "adjusted" ? (
-                <MetricCard label={isEn ? "Return Basis" : "收益口径"} value={isEn ? "Adjusted" : "前复权"} color={profitColor(result.totalPnl)} />
-              ) : (
-                <MetricCard
-                  label={isEn ? "Dividends" : "分红收入"}
-                  value={privacyMode ? `${currencySymbol(quoteCurrency)}***` : formatExactMoney(result.totalDividends, quoteCurrency, 2)}
-                  color={profitColor(result.totalDividends)}
-                />
-              )}
+              <MetricCard
+                label={isEn ? "Dividends" : "分红收入"}
+                value={privacyMode ? `${currencySymbol(quoteCurrency)}***` : formatExactMoney(result.totalDividends, quoteCurrency, 2)}
+                color={profitColor(result.totalDividends)}
+              />
               <MetricCard label={isEn ? "Ending Value" : "期末总值"} value={privacyMode ? `${currencySymbol(quoteCurrency)}***` : formatExactMoney(result.finalValue, quoteCurrency, 2)} />
               <MetricCard
-                label={result.priceMode === "adjusted" ? (isEn ? "Total P/L" : "总收益") : (isEn ? "Total P/L incl. Div." : "总收益(含分红)")}
+                label={isEn ? "Total P/L incl. Div." : "总收益(含分红)"}
                 value={`${result.totalPnl >= 0 ? "+" : "-"}${privacyMode ? `${currencySymbol(quoteCurrency)}--` : formatExactMoney(Math.abs(result.totalPnl), quoteCurrency, 2)}`}
                 color={profitColor(result.totalPnl)}
               />
               <MetricCard label={isEn ? "Annualized" : "年化收益"} value={formatPercent(result.annualizedReturn)} color={profitColor(result.annualizedReturn)} />
-              <MetricCard label={isEn ? "Max Drawdown" : "最大回撤"} value={formatPercent(-result.maxDrawdown)} color={profitColor(-result.maxDrawdown)} />
+              <MetricCard label={isEn ? "Price Drawdown" : "价格回撤"} value={formatPercent(-result.marketMaxDrawdown)} color={profitColor(-result.marketMaxDrawdown)} />
+              <MetricCard label={isEn ? "Total Drawdown" : "总值回撤"} value={formatPercent(-result.maxDrawdown)} color={profitColor(-result.maxDrawdown)} />
               <MetricCard label={isEn ? "Data Points" : "日线点数"} value={`${result.points.length}`} />
             </div>
           </div>

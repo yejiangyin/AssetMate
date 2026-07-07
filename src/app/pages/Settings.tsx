@@ -1,20 +1,25 @@
 import { useRef, useState, useEffect, useLayoutEffect } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { createPortal } from "react-dom";
+import type { LucideIcon } from "lucide-react";
 import {
   DollarSign, Clock, Eye, Download, Upload, Trash2,
   RefreshCw, Moon, Sun, Monitor, ChevronRight, Check, Shield,
   Zap, AlertCircle, CalendarClock, Languages, PanelRight,
 } from "lucide-react";
 import { useApp } from "../context/AppContext";
+import type { ThemeColors } from "../context/AppContext";
 import { motion, AnimatePresence } from "motion/react";
 import { BrandMark } from "../components/BrandMark";
-import { getExtensionViewMode, openExtensionMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
+import type { ExtensionOpenMode } from "../utils/extensionOpenMode";
+import { useViewSwitcher } from "../utils/useViewSwitcher";
 import { getTradingCalendarStatus, refreshTradingCalendar } from "../services/tradingCalendar";
 import { t, type AppCopy } from "../i18n";
 
 const refreshValues = [0, 1, 5, 15, 30, 60] as const;
+const MAX_IMPORT_FILE_BYTES = 10 * 1024 * 1024;
 type SettingsCopy = AppCopy["settings"];
+type ToastVariant = "success" | "error";
 
 function formatCalendarStatus(status: ReturnType<typeof getTradingCalendarStatus>, text: SettingsCopy) {
   if (!status) return text.calendarFallback;
@@ -24,12 +29,19 @@ function formatCalendarStatus(status: ReturnType<typeof getTradingCalendarStatus
   return text.calendarUpdated(date, years);
 }
 
+function localDateYMD(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 /* ─── SettingRow ─────────────────────────────────────── */
 function SettingRow({
   icon: Icon, label, description, children, iconColor = "#4F9CF9", tc,
 }: {
-  icon: any; label: string; description?: string;
-  children: ReactNode; iconColor?: string; tc: any;
+  icon: LucideIcon; label: string; description?: string;
+  children: ReactNode; iconColor?: string; tc: ThemeColors;
 }) {
   return (
     <div className="flex items-center px-3 py-3"
@@ -67,7 +79,7 @@ function Select<T extends string | number>({
   value, onChange, options, tc,
 }: {
   value: T; onChange: (v: T) => void;
-  options: { value: T; label: string }[]; tc: any;
+  options: { value: T; label: string }[]; tc: ThemeColors;
 }) {
   const [open, setOpen] = useState(false);
   const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
@@ -87,20 +99,21 @@ function Select<T extends string | number>({
       const belowSpace = window.innerHeight - rect.bottom;
       const aboveSpace = rect.top;
       const openBelow = belowSpace >= estimatedHeight + padding || belowSpace >= aboveSpace;
+      const availableHeight = Math.max(80, (openBelow ? belowSpace : aboveSpace) - padding - 4);
+      const menuHeight = Math.min(estimatedHeight, availableHeight, Math.max(80, window.innerHeight - padding * 2));
       const left = Math.min(
         Math.max(padding, rect.right - menuWidth),
         window.innerWidth - menuWidth - padding,
       );
-      const top = openBelow
-        ? Math.min(window.innerHeight - estimatedHeight - padding, rect.bottom + 4)
-        : Math.max(padding, rect.top - estimatedHeight - 4);
+      const unclampedTop = openBelow ? rect.bottom + 4 : rect.top - menuHeight - 4;
+      const top = Math.min(Math.max(padding, unclampedTop), window.innerHeight - menuHeight - padding);
 
       setMenuStyle({
         position: "fixed",
         top,
         left,
         minWidth: menuWidth,
-        maxHeight: 240,
+        maxHeight: menuHeight,
         overflowY: "auto",
         transformOrigin: openBelow ? "top right" : "bottom right",
       });
@@ -113,7 +126,7 @@ function Select<T extends string | number>({
       window.removeEventListener("resize", placeMenu);
       window.removeEventListener("scroll", placeMenu, true);
     };
-  }, [open, options.length]);
+  }, [open, options]);
 
   useEffect(() => {
     if (!open) return;
@@ -170,7 +183,7 @@ function Select<T extends string | number>({
 }
 
 /* ─── SectionCard ────────────────────────────────────── */
-function SectionCard({ children, tc }: { children: ReactNode; tc: any }) {
+function SectionCard({ children, tc }: { children: ReactNode; tc: ThemeColors }) {
   return (
     <div className="rounded-xl"
       style={{ background: tc.bgCard, border: `1px solid ${tc.border}` }}>
@@ -180,21 +193,19 @@ function SectionCard({ children, tc }: { children: ReactNode; tc: any }) {
 }
 
 /* ─── ThemePreview (small live preview dot row) ──────── */
-function ThemePreview({ tc }: { tc: any }) {
+function ThemePreview({ tc }: { tc: ThemeColors }) {
   const { language } = useApp();
   const text = t(language).settings;
   return (
     <div className="flex items-center gap-2 mt-1.5 mb-0.5">
-      {[tc.bg, tc.bgCard, tc.bgSurface, tc.border, tc.textPrimary, tc.textSecondary].map((c) => (
-        <div key={c} className="rounded-full border"
+      {[tc.bg, tc.bgCard, tc.bgSurface, tc.border, tc.textPrimary, tc.textSecondary].map((c, index) => (
+        <div key={`${c}-${index}`} className="rounded-full border"
           style={{ width: 12, height: 12, background: c, borderColor: tc.border, flexShrink: 0 }} />
       ))}
       <span style={{ color: tc.textMicro, fontSize: 9 }}>{text.themePreview}</span>
     </div>
   );
 }
-
-/* ─── AccentColorPicker ──────────────────────────────── */
 // (accent is always #4F9CF9 for now — future extension)
 
 /* ─── Main Settings ──────────────────────────────────── */
@@ -208,7 +219,7 @@ export function Settings() {
     refreshInterval, setRefreshInterval,
     tradeTimeOnly, setTradeTimeOnly,
     dividendReinvest, setDividendReinvest,
-    defaultOpenMode, setDefaultOpenMode,
+    defaultOpenMode,
     exportPortfolio, importPortfolio, clearLocalData,
     tc, dcaPlans, openDCAPanel,
   } = useApp();
@@ -216,16 +227,18 @@ export function Settings() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const toastTimerRef = useRef<number | null>(null);
   const [toastMessage, setToastMessage] = useState("");
+  const [toastVariant, setToastVariant] = useState<ToastVariant>("success");
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [calendarStatus, setCalendarStatus] = useState(() => getTradingCalendarStatus());
   const [calendarRefreshing, setCalendarRefreshing] = useState(false);
   const text = t(language).settings;
   const refreshOptions = refreshValues.map((value, index) => ({ value, label: text.refreshOptions[index] ?? String(value) }));
 
-  const showToast = (message: string) => {
+  const showToast = (message: string, variant: ToastVariant = "success") => {
     if (toastTimerRef.current != null) {
       window.clearTimeout(toastTimerRef.current);
     }
+    setToastVariant(variant);
     setToastMessage(message);
     toastTimerRef.current = window.setTimeout(() => {
       setToastMessage("");
@@ -237,35 +250,67 @@ export function Settings() {
     if (toastTimerRef.current != null) window.clearTimeout(toastTimerRef.current);
   }, []);
 
+  useEffect(() => {
+    const syncStatus = () => setCalendarStatus(getTradingCalendarStatus());
+    syncStatus();
+    const interval = window.setInterval(syncStatus, 60_000);
+    window.addEventListener("focus", syncStatus);
+    document.addEventListener("visibilitychange", syncStatus);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", syncStatus);
+      document.removeEventListener("visibilitychange", syncStatus);
+    };
+  }, []);
+
   const handleExport = () => {
-    const blob = new Blob([exportPortfolio()], { type: "application/json;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `asset-helper-${new Date().toISOString().slice(0, 10)}.json`;
-    a.style.display = "none";
-    document.body.appendChild(a);
-    a.click();
-    window.setTimeout(() => {
-      a.remove();
-      URL.revokeObjectURL(url);
-    }, 0);
-    showToast(text.exportOk);
+    try {
+      const blob = new Blob([exportPortfolio()], { type: "application/json;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `asset-helper-${localDateYMD(new Date())}.json`;
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      window.setTimeout(() => {
+        a.remove();
+        URL.revokeObjectURL(url);
+      }, 0);
+      showToast(text.exportOk);
+    } catch {
+      showToast(text.exportFail, "error");
+    }
   };
 
   const handleRefreshCalendar = async () => {
     setCalendarRefreshing(true);
-    const status = await refreshTradingCalendar(true);
-    setCalendarStatus(status);
-    setCalendarRefreshing(false);
-    showToast(status ? text.calendarOk : text.calendarFail);
+    try {
+      const status = await refreshTradingCalendar(true);
+      setCalendarStatus(status ?? getTradingCalendarStatus());
+      showToast(status ? text.calendarOk : text.calendarFail, status ? "success" : "error");
+    } catch {
+      setCalendarStatus(getTradingCalendarStatus());
+      showToast(text.calendarFail, "error");
+    } finally {
+      setCalendarRefreshing(false);
+    }
   };
 
   const handleImportFile = async (file?: File) => {
     if (!file) return;
-    const result = importPortfolio(await file.text());
-    showToast(result.ok ? text.importOk : result.error ?? text.importFail);
-    if (fileInputRef.current) fileInputRef.current.value = "";
+    try {
+      if (file.size > MAX_IMPORT_FILE_BYTES) {
+        showToast(text.importTooLarge, "error");
+        return;
+      }
+      const result = importPortfolio(await file.text());
+      showToast(result.ok ? text.importOk : result.error ?? text.importFail, result.ok ? "success" : "error");
+    } catch {
+      showToast(text.importFail, "error");
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
   };
 
   const THEME_BTNS = [
@@ -273,6 +318,7 @@ export function Settings() {
     { v: "system" as const, icon: Monitor, label: text.themeSystem },
     { v: "dark"  as const, icon: Moon,    label: text.themeDark },
   ];
+  const { switchToMode } = useViewSwitcher(() => showToast(text.openModeFail, "error"));
 
   return (
     <div className="relative h-full flex flex-col overflow-hidden" style={{ background: tc.bg }}>
@@ -321,30 +367,7 @@ export function Settings() {
               value={defaultOpenMode}
               onChange={(value) => {
                 const mode = value as ExtensionOpenMode;
-                setDefaultOpenMode(mode);
-                // Only switch if the target differs from the current view.
-                const currentView = getExtensionViewMode();
-                if (mode === currentView) return;
-                if (currentView === "sidepanel" && mode === "popup") {
-                  // Side panel → popup: just close the side panel. Don't
-                  // call openPopup (the popup would open and then immediately
-                  // lose focus and close). The default mode is now popup, so
-                  // the user gets the popup next time they click the icon.
-                  void syncExtensionOpenMode(mode).finally(() => {
-                    if (typeof window !== "undefined") {
-                      try { window.close(); } catch { /* ignore */ }
-                    }
-                  });
-                  return;
-                }
-                // Popup → side panel: open the side panel then close the popup.
-                void openExtensionMode(mode).then(() => {
-                  if (typeof window !== "undefined") {
-                    window.setTimeout(() => {
-                      try { window.close(); } catch { /* ignore */ }
-                    }, 150);
-                  }
-                });
+                switchToMode(mode);
               }}
               tc={tc}
               options={[
@@ -524,14 +547,24 @@ export function Settings() {
 
       {/* Export Toast */}
       <AnimatePresence>
-        {toastMessage && (
-          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}
-            className="absolute left-4 right-4 bottom-20 rounded-xl px-4 py-3 flex items-center gap-2"
-            style={{ background: tc.isDark ? "#1A2F1E" : "#F0FDF4", border: "1px solid rgba(49,208,139,0.3)", zIndex: 100 }}>
-            <Check size={14} color="#31D08B" />
-            <span style={{ color: "#31D08B", fontSize: 13 }}>{toastMessage}</span>
-          </motion.div>
-        )}
+        {toastMessage && (() => {
+          const isError = toastVariant === "error";
+          const Icon = isError ? AlertCircle : Check;
+          const color = isError ? "#F24E4E" : "#31D08B";
+          return (
+            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}
+              className="absolute left-4 right-4 rounded-xl px-4 py-3 flex items-center gap-2"
+              style={{
+                background: isError ? (tc.isDark ? "#331819" : "#FEF2F2") : (tc.isDark ? "#1A2F1E" : "#F0FDF4"),
+                border: `1px solid ${isError ? "rgba(242,78,78,0.32)" : "rgba(49,208,139,0.3)"}`,
+                bottom: "max(16px, env(safe-area-inset-bottom))",
+                zIndex: 100,
+              }}>
+              <Icon size={14} color={color} />
+              <span style={{ color, fontSize: 13 }}>{toastMessage}</span>
+            </motion.div>
+          );
+        })()}
       </AnimatePresence>
 
       {/* Clear Confirm */}

@@ -95,6 +95,14 @@ function pointOrder(point: TimestampedPoint) {
   return 0;
 }
 
+function mergeDefined<T extends TimestampedPoint>(base: T, incoming: T): T {
+  const merged = { ...base } as Record<string, unknown>;
+  for (const [key, value] of Object.entries(incoming)) {
+    if (value !== undefined && value !== null) merged[key] = value;
+  }
+  return merged as T;
+}
+
 export function mergePointSeries<T extends TimestampedPoint>(base: T[], incoming: T[], maxPoints = 6000): T[] {
   const map = new Map<string, T>();
   for (const point of base) {
@@ -103,7 +111,10 @@ export function mergePointSeries<T extends TimestampedPoint>(base: T[], incoming
   }
   for (const point of incoming) {
     const key = pointKey(point);
-    if (key) map.set(key, point);
+    if (key) {
+      const existing = map.get(key);
+      map.set(key, existing ? mergeDefined(existing, point) : point);
+    }
   }
   return [...map.values()]
     .sort((a, b) => pointOrder(a) - pointOrder(b))

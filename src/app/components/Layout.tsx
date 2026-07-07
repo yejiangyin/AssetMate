@@ -28,11 +28,11 @@ function LayoutInner() {
   const accent = "var(--app-accent, #4F9CF9)";
   const isSidePanel = getExtensionViewMode() === "sidepanel";
   const rootStyle = useMemo(() => ({
-    width: isSidePanel ? "100vw" : 400,
-    height: isSidePanel ? "100vh" : 600,
-    minWidth: isSidePanel ? 320 : 400,
-    minHeight: isSidePanel ? 0 : 600,
-    maxHeight: isSidePanel ? "100vh" : 600,
+    width: isSidePanel ? "100vw" : "min(400px, 100vw)",
+    height: isSidePanel ? "100vh" : "min(600px, 100vh)",
+    minWidth: isSidePanel ? 320 : "min(320px, 100vw)",
+    minHeight: isSidePanel ? 0 : "min(480px, 100vh)",
+    maxHeight: "100vh",
     background: tc.bg,
     fontFamily: "'Inter', system-ui, sans-serif",
     "--bg": tc.bg,

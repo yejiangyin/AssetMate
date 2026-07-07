@@ -368,8 +368,7 @@ async function fetchYahooCorporateActions(yahooSymbol: string, days = 45): Promi
     const windowDays = fullRefresh ? Math.max(days, 3650) : days;
     const period2 = Math.floor(Date.now() / 1000) + 86400;
     const period1 = period2 - windowDays * 86400;
-    const ctrl = new AbortController();
-    const tid = setTimeout(() => ctrl.abort(), 7000);
+    const hosts = ["query2.finance.yahoo.com", "query1.finance.yahoo.com"];
     try {
       const params = new URLSearchParams({
         interval: "1d",
@@ -378,11 +377,24 @@ async function fetchYahooCorporateActions(yahooSymbol: string, days = 45): Promi
         events: "div,splits",
         includePrePost: "false",
       });
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?${params.toString()}`;
-      const res = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
-      clearTimeout(tid);
-      if (!res.ok) throw new Error(`Yahoo actions HTTP ${res.status}`);
-      const json = await res.json();
+      let json: any = null;
+      let lastError: unknown = null;
+      for (const host of hosts) {
+        const ctrl = new AbortController();
+        const tid = setTimeout(() => ctrl.abort(), 7000);
+        try {
+          const url = `https://${host}/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?${params.toString()}`;
+          const res = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
+          if (!res.ok) throw new Error(`Yahoo actions HTTP ${res.status}`);
+          json = await res.json();
+          break;
+        } catch (error) {
+          lastError = error;
+        } finally {
+          clearTimeout(tid);
+        }
+      }
+      if (!json) throw lastError instanceof Error ? lastError : new Error("Yahoo actions unavailable");
       const events = json?.chart?.result?.[0]?.events ?? {};
       const dividends = Object.values(events.dividends ?? {}) as YahooDividendEvent[];
       const splits = Object.values(events.splits ?? {}) as YahooSplitEvent[];
@@ -420,7 +432,6 @@ async function fetchYahooCorporateActions(yahooSymbol: string, days = 45): Promi
       writePersistentActions(key, merged, { fullRefresh, previousFullRefreshAt: persistent?.lastFullRefreshAt });
       return merged;
     } catch {
-      clearTimeout(tid);
       return persistent?.data ?? [];
     } finally {
       inflight.delete(key);

@@ -32,6 +32,17 @@ function enumOr<T extends string | number>(value: unknown, allowed: Set<T>, fall
   return allowed.has(value as T) ? value as T : fallback;
 }
 
+function importPortfolioError(language: Language, key: "missingHoldings" | "invalidJson") {
+  if (language === "en") {
+    return key === "missingHoldings"
+      ? "Import file is missing holdings data"
+      : "JSON format could not be parsed";
+  }
+  return key === "missingHoldings"
+    ? "导入文件缺少 holdings 数据"
+    : "JSON 格式无法解析";
+}
+
 export type HoldingInput = {
   groupId:      string;
   symbol:       string;
@@ -97,6 +108,7 @@ export interface PortfolioStats {
   totalAsset:     number;
   holdingValue:   number;
   availableCash:  number;
+  costBasis:      number;
   todayPnl:       number;
   todayPnlRate:   number;
   cumulativePnl:  number;
@@ -238,7 +250,7 @@ function buildThemeColors(theme: Theme): ThemeColors {
 const initialDCAPlans: DCAPlan[] = [];
 
 /* ─── PortfolioStats ─────────────────────────────────── */
-function computeStats(holdings: Holding[], closedHoldings: ClosedHolding[] = []): PortfolioStats {
+export function computeStats(holdings: Holding[], closedHoldings: ClosedHolding[] = []): PortfolioStats {
   const totalMV    = holdings.reduce((s, h) => s + toCNY(h.quantity * h.currentPrice, h.currency), 0);
   const todayPnl   = holdings.reduce((s, h) => s + toCNY(h.todayPnl,    h.currency), 0);
   // Open-position P/L includes cash dividends received while holding — dividends
@@ -258,6 +270,7 @@ function computeStats(holdings: Holding[], closedHoldings: ClosedHolding[] = [])
     totalAsset:     totalMV,
     holdingValue:   totalMV,
     availableCash:  0,
+    costBasis,
     todayPnl,
     todayPnlRate:   prevMV  > 0 ? todayPnl  / prevMV   : 0,
     cumulativePnl:  totalPnl,
@@ -291,6 +304,7 @@ interface AppState {
   isRefreshing:    boolean;
   lastRefreshed:   string;
   lastRefreshAt:   number;
+  lastRefreshError: string;
   detailTarget:    DetailTarget | null;
   dcaPlans:        DCAPlan[];
   dcaExecutions:   DCAExecution[];
@@ -345,6 +359,7 @@ const STORAGE_VERSION = 2;
 const REFRESH_META_KEY = "asset-helper:portfolio-refresh-meta:v1";
 const REFRESH_RECENT_TTL = 45_000;
 const REFRESH_LOCK_TTL = 25_000;
+const CLEAR_RUNTIME_CACHES_EVENT = "asset-helper:clear-runtime-caches";
 const MAX_DCA_EXECUTIONS = 300;
 const MAX_DCA_EXECUTIONS_PER_PLAN = 24;
 const NON_CRITICAL_STORAGE_KEYS = [
@@ -706,6 +721,7 @@ function defaultState(): AppState {
     isRefreshing:    false,
     lastRefreshed:   "—",
     lastRefreshAt:   0,
+    lastRefreshError: "",
     detailTarget:    null,
     dcaPlans:        hydratePlans(initialDCAPlans),
     dcaExecutions:   [],
@@ -769,6 +785,7 @@ function buildPersistedState(state: AppState): PersistedState {
 
 function clearNonCriticalStorage() {
   if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent(CLEAR_RUNTIME_CACHES_EVENT));
   for (const key of NON_CRITICAL_STORAGE_KEYS) {
     try {
       window.localStorage.removeItem(key);
@@ -893,6 +910,7 @@ export function loadInitialState(): AppState {
       defaultOpenMode: normalizeOpenMode(saved.defaultOpenMode),
       isRefreshing: false,
       lastRefreshAt: 0,
+      lastRefreshError: "",
       detailTarget: null,
       dcaPanelOpen: false,
       dcaPanelHoldingId: null,
@@ -1022,7 +1040,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const coordinated = !options.forceCorporateActions && !options.bypassCoordination;
     if (coordinated && shouldSkipCoordinatedRefresh()) return;
     if (coordinated) writeRefreshMeta({ ...readRefreshMeta(), startedAt: Date.now() });
-    setState((s) => ({ ...s, isRefreshing: true }));
+    setState((s) => ({ ...s, isRefreshing: true, lastRefreshError: "" }));
     try {
       const priceMap = await refreshPrices(
         currentHoldings.map((h) => ({ id: h.id, symbol: h.symbol, market: h.market }))
@@ -1085,12 +1103,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           isRefreshing: false,
           lastRefreshed: t,
           lastRefreshAt: now.getTime(),
+          lastRefreshError: "",
         };
       });
       void runCorporateActionRefresh(currentHoldings, options.forceCorporateActions);
-    } catch {
+    } catch (error) {
       if (coordinated) writeRefreshMeta({ ...readRefreshMeta(), startedAt: 0 });
-      setState((s) => ({ ...s, isRefreshing: false }));
+      const message = error instanceof Error && error.message
+        ? error.message
+        : "行情刷新失败";
+      setState((s) => ({ ...s, isRefreshing: false, lastRefreshError: message }));
     }
   }, [applyDCAState, runCorporateActionRefresh]);
 
@@ -1158,6 +1180,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         isRefreshing: current.isRefreshing,
         lastRefreshed: current.lastRefreshed,
         lastRefreshAt: current.lastRefreshAt,
+        lastRefreshError: current.lastRefreshError,
         detailTarget: current.detailTarget,
         dcaPanelOpen: current.dcaPanelOpen,
         dcaPanelHoldingId: current.dcaPanelHoldingId,
@@ -1238,7 +1261,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const parsed = JSON.parse(raw);
       const data = parsed?.data ?? parsed;
       if (!Array.isArray(data?.holdings)) {
-        return { ok: false, error: "导入文件缺少 holdings 数据" };
+        return { ok: false, error: importPortfolioError(stateRef.current.language, "missingHoldings") };
       }
       const holdings = data.holdings.map(normalizeHolding);
       const current = stateRef.current;
@@ -1294,7 +1317,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       void runRefresh(dcaState.holdings, { forceCorporateActions: true, bypassCoordination: true });
       return { ok: true };
     } catch {
-      return { ok: false, error: "JSON 格式无法解析" };
+      return { ok: false, error: importPortfolioError(stateRef.current.language, "invalidJson") };
     }
   }, [applyDCAState, runRefresh]);
 
@@ -1471,7 +1494,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         holdings: dcaState.holdings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
-        closedHoldings: [buildClosedHolding(target), ...s.closedHoldings],
+        closedHoldings: target.quantity > 0 && target.costPrice > 0
+          ? [buildClosedHolding(target), ...s.closedHoldings]
+          : s.closedHoldings,
         assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings),
         dcaPanelHoldingId: s.dcaPanelHoldingId === id ? null : s.dcaPanelHoldingId,
       };
@@ -1563,7 +1588,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const nextPlans = s.dcaPlans.map((p) =>
         p.id === id ? { ...p, enabled: !p.enabled } : p
       );
-      const dcaState = applyDCAState(s.holdings, nextPlans, s.dcaExecutions);
+      const dcaState = applyDCAState(s.holdings, nextPlans, s.dcaExecutions, true);
       return {
         ...s,
         holdings: dcaState.holdings,
