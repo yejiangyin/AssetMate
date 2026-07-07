@@ -42,7 +42,68 @@ export interface FundEstimateSnapshot {
 export interface FundOfficialHistoryItem {
   date: string;
   nav: number;
+  totalNav?: number;
   changePercent: number;
+}
+
+type OfficialFundHistoryRow = {
+  FSRQ?: unknown;
+  DWJZ?: unknown;
+  LJJZ?: unknown;
+  JZZZL?: unknown;
+};
+
+function parseOfficialFundHistoryRows(rows: OfficialFundHistoryRow[]) {
+  return rows
+    .map((row) => {
+      const totalNav = parseFloat(String(row?.LJJZ ?? ""));
+      return {
+        date: String(row?.FSRQ ?? ""),
+        nav: parseFloat(String(row?.DWJZ ?? "")),
+        totalNav: Number.isFinite(totalNav) && totalNav > 0 ? totalNav : undefined,
+        changePercent: parseFloat(String(row?.JZZZL ?? "")),
+      };
+    })
+    .filter((row) => row.date && Number.isFinite(row.nav) && row.nav > 0)
+    .sort((a, b) => b.date.localeCompare(a.date));
+}
+
+function parseFundTrendHistory(text: string, pageSize: number): FundOfficialHistoryItem[] {
+  const netWorthMatch = text.match(/var\s+Data_netWorthTrend\s*=\s*(\[[\s\S]*?\]);/);
+  if (!netWorthMatch) return [];
+  const cumulativeMatch = text.match(/var\s+Data_ACWorthTrend\s*=\s*(\[[\s\S]*?\]);/);
+  const cumulativeByDate = new Map<string, number>();
+  if (cumulativeMatch) {
+    try {
+      const cumulativeRows = JSON.parse(cumulativeMatch[1]!) as Array<[number, number]>;
+      for (const row of cumulativeRows) {
+        const timestamp = Number(row?.[0] ?? 0);
+        const totalNav = Number(row?.[1] ?? 0);
+        const date = formatChinaFundDate(timestamp);
+        if (date && Number.isFinite(totalNav) && totalNav > 0) {
+          cumulativeByDate.set(date, totalNav);
+        }
+      }
+    } catch {
+      cumulativeByDate.clear();
+    }
+  }
+  try {
+    const rows = JSON.parse(netWorthMatch[1]!) as Array<{ x?: number; y?: number; equityReturn?: number }>;
+    return rows
+      .map((row) => {
+        const timestamp = Number(row?.x ?? 0);
+        const nav = Number(row?.y ?? 0);
+        const changePercent = Number(row?.equityReturn ?? 0);
+        const date = formatChinaFundDate(timestamp);
+        return { date, nav, totalNav: cumulativeByDate.get(date), changePercent };
+      })
+      .filter((row) => row.date && Number.isFinite(row.nav) && row.nav > 0)
+      .sort((a, b) => b.date.localeCompare(a.date))
+      .slice(0, pageSize);
+  } catch {
+    return [];
+  }
 }
 
 function formatChinaFundDate(timestamp: number): string {
@@ -697,6 +758,7 @@ export async function fetchCnFundOfficialNav(
 export async function fetchCnFundOfficialHistory(code: string, pageSize = 60): Promise<FundOfficialHistoryItem[]> {
   const timeoutMs = pageSize >= 1000 ? 20000 : 10000;
   const [signal, clear] = mkAbort(timeoutMs);
+  let officialRows: FundOfficialHistoryItem[] = [];
   try {
     const url =
       `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${encodeURIComponent(code)}` +
@@ -713,16 +775,9 @@ export async function fetchCnFundOfficialHistory(code: string, pageSize = 60): P
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const json = await res.json();
-    const rows: any[] = json?.Data?.LSJZList ?? [];
-    const parsed = rows
-      .map((row) => ({
-        date: String(row?.FSRQ ?? ""),
-        nav: parseFloat(String(row?.DWJZ ?? "")),
-        changePercent: parseFloat(String(row?.JZZZL ?? "")),
-      }))
-      .filter((row) => row.date && Number.isFinite(row.nav) && row.nav > 0);
-    const sorted = parsed.sort((a, b) => b.date.localeCompare(a.date));
-    if (sorted.length) return sorted;
+    const rows: OfficialFundHistoryRow[] = json?.Data?.LSJZList ?? [];
+    officialRows = parseOfficialFundHistoryRows(rows);
+    if (officialRows.length >= pageSize) return officialRows.slice(0, pageSize);
   } catch {
     clear();
   }
@@ -738,23 +793,12 @@ export async function fetchCnFundOfficialHistory(code: string, pageSize = 60): P
     if (!res.ok) return [];
 
     const text = await res.text();
-    const match = text.match(/var\s+Data_netWorthTrend\s*=\s*(\[[\s\S]*?\]);/);
-    if (!match) return [];
-    const rows = JSON.parse(match[1]!) as Array<{ x?: number; y?: number; equityReturn?: number }>;
-    return rows
-      .map((row) => {
-        const timestamp = Number(row?.x ?? 0);
-        const nav = Number(row?.y ?? 0);
-        const changePercent = Number(row?.equityReturn ?? 0);
-        return { date: formatChinaFundDate(timestamp), nav, changePercent };
-      })
-      .filter((row) => row.date && Number.isFinite(row.nav) && row.nav > 0)
-      .sort((a, b) => b.date.localeCompare(a.date))
-      .slice(0, pageSize);
+    const trendRows = parseFundTrendHistory(text, pageSize);
+    if (trendRows.length) return trendRows;
   } catch {
     fallbackClear();
-    return [];
   }
+  return officialRows.slice(0, pageSize);
 }
 
 export async function fetchCryptoPrice(symbol: string, coinId?: string) {

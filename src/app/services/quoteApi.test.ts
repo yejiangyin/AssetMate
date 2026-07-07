@@ -107,6 +107,74 @@ describe("Yahoo chart fetchers", () => {
     });
   });
 
+  test("fetchBacktestDailyPrices prefers Yahoo adjusted close when available", async () => {
+    await withMockFetch((async () => okJson({
+      chart: {
+        result: [{
+          timestamp: [1767225600, 1767312000],
+          indicators: {
+            quote: [{ close: [110, 120] }],
+            adjclose: [{ adjclose: [100, 112] }],
+          },
+          events: {
+            dividends: { d1: { date: 1767312000, amount: 1 } },
+            splits: { s1: { date: 1767312000, splitRatio: "2:1" } },
+          },
+        }],
+      },
+    })) as typeof fetch, async () => {
+      const prices = await fetchBacktestDailyPrices("AAPL", "US", "2026-01-01", "2026-01-02");
+
+      assert.deepEqual(prices, [
+        { date: "2026-01-01", price: 100, dividend: 0, splitRatio: 1, adjusted: true },
+        { date: "2026-01-02", price: 112, dividend: 0, splitRatio: 1, adjusted: true },
+      ]);
+    });
+  });
+
+  test("fetchBacktestDailyPrices uses cumulative NAV for fund backtests", async () => {
+    await withMockFetch((async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/f10/lsjz")) {
+        return okJson({ Data: null });
+      }
+      return {
+        ok: true,
+        text: async () => [
+          "var Data_netWorthTrend = [",
+          "{\"x\":1767312000000,\"y\":1.04,\"equityReturn\":0.1},",
+          "{\"x\":1767398400000,\"y\":1.05,\"equityReturn\":0.1}",
+          "];",
+          "var Data_ACWorthTrend = [[1767312000000,1.43],[1767398400000,1.44]];",
+        ].join(""),
+      } as Response;
+    }) as typeof fetch, async () => {
+      const prices = await fetchBacktestDailyPrices("003547", "FUND", "2026-01-02", "2026-01-03");
+
+      assert.deepEqual(prices, [
+        { date: "2026-01-02", price: 1.43, adjusted: true },
+        { date: "2026-01-03", price: 1.44, adjusted: true },
+      ]);
+    });
+  });
+
+  test("fetchBacktestDailyPrices falls back to fund unit NAV when cumulative NAV is absent", async () => {
+    await withMockFetch((async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/f10/lsjz")) {
+        return okJson({ Data: null });
+      }
+      return {
+        ok: true,
+        text: async () => "var Data_netWorthTrend = [{\"x\":1767398400000,\"y\":1.05,\"equityReturn\":0.1}];",
+      } as Response;
+    }) as typeof fetch, async () => {
+      const prices = await fetchBacktestDailyPrices("003547", "FUND", "2026-01-03", "2026-01-03");
+
+      assert.deepEqual(prices, [{ date: "2026-01-03", price: 1.05, adjusted: false }]);
+    });
+  });
+
   test("fetchChart parses quote and daily candle points", async () => {
     await withMockFetch((async () => okJson(yahooChartResponse())) as typeof fetch, async () => {
       const chart = await fetchChart("AAPL", "1d", true);
