@@ -1,5 +1,6 @@
 import type { Holding } from "../data/mockData";
 import { toYahooSymbol } from "./quoteApi";
+import { fetchCnFundOfficialHistory } from "./securitiesApi";
 import {
   readPersistentEntry,
   shouldFullRefresh,
@@ -14,6 +15,7 @@ export type CorporateActionEvent = {
   date: string;
   amount?: number;
   ratio?: number;
+  reinvestPrice?: number;
   recordDate?: string;
   exDate?: string;
   payDate?: string;
@@ -36,7 +38,7 @@ type YahooSplitEvent = {
 const cache = new Map<string, { ts: number; data: CorporateActionEvent[] }>();
 const inflight = new Map<string, Promise<CorporateActionEvent[]>>();
 const CACHE_TTL = 30 * 60 * 1000;
-const PERSISTENT_ACTION_STORAGE_KEY = "asset-helper:corporate-actions-cache:v3";
+const PERSISTENT_ACTION_STORAGE_KEY = "asset-helper:corporate-actions-cache:v4";
 const PERSISTENT_ACTION_MAX_ITEMS = 120;
 const PERSISTENT_ACTION_TTL = 24 * 60 * 60 * 1000;
 const ACTION_FULL_REFRESH_TTL = 7 * 24 * 60 * 60 * 1000;
@@ -120,16 +122,51 @@ function normalizeYMD(raw: unknown) {
   return match?.[0] ?? "";
 }
 
+async function enrichFundReinvestPrices(code: string, actions: CorporateActionEvent[]) {
+  const recentCutoff = new Date(Date.now() - 730 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const pendingDates = new Set(actions
+    .filter((action) => (
+      action.type === "cash_dividend" &&
+      !(Number(action.reinvestPrice) > 0) &&
+      (action.exDate || action.date) >= recentCutoff
+    ))
+    .map((action) => action.exDate || action.date));
+  if (!pendingDates.size) return actions;
+
+  const history = await fetchCnFundOfficialHistory(code, 500).catch(() => []);
+  if (!history.length) return actions;
+  const navByDate = new Map(history.map((row) => [row.date, row.nav]));
+  return actions.map((action) => {
+    const reinvestDate = action.exDate || action.date;
+    const reinvestPrice = navByDate.get(reinvestDate);
+    return action.type === "cash_dividend" && reinvestPrice && reinvestPrice > 0
+      ? { ...action, reinvestPrice }
+      : action;
+  });
+}
+
 async function fetchEastMoneyFundCorporateActions(symbol: string): Promise<CorporateActionEvent[]> {
   const code = normalizeFundCode(symbol);
   if (!/^\d{6}$/.test(code)) return [];
   const key = `eastmoney-fund-actions:${code}`;
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.ts < CACHE_TTL) return hit.data;
+  if (hit && Date.now() - hit.ts < CACHE_TTL) {
+    const enriched = await enrichFundReinvestPrices(code, hit.data);
+    cache.set(key, { ts: Date.now(), data: enriched });
+    return enriched;
+  }
   const persistentHit = getFreshPersistentActions(key);
   if (persistentHit) {
-    cache.set(key, { ts: Date.now(), data: persistentHit });
-    return persistentHit;
+    const enriched = await enrichFundReinvestPrices(code, persistentHit);
+    cache.set(key, { ts: Date.now(), data: enriched });
+    if (enriched !== persistentHit) {
+      const persistent = readPersistentActions(key);
+      writePersistentActions(key, enriched, {
+        fullRefresh: false,
+        previousFullRefreshAt: persistent?.lastFullRefreshAt,
+      });
+    }
+    return enriched;
   }
   const running = inflight.get(key);
   if (running) return running;
@@ -186,9 +223,10 @@ async function fetchEastMoneyFundCorporateActions(symbol: string): Promise<Corpo
       });
       const data = [...dividends, ...splits].filter(Boolean).sort((a, b) => a!.date.localeCompare(b!.date)) as CorporateActionEvent[];
       const merged = fullRefresh ? data : mergeCorporateActions(persistent?.data ?? [], data);
-      cache.set(key, { ts: Date.now(), data: merged });
-      writePersistentActions(key, merged, { fullRefresh, previousFullRefreshAt: persistent?.lastFullRefreshAt });
-      return merged;
+      const enriched = await enrichFundReinvestPrices(code, merged);
+      cache.set(key, { ts: Date.now(), data: enriched });
+      writePersistentActions(key, enriched, { fullRefresh, previousFullRefreshAt: persistent?.lastFullRefreshAt });
+      return enriched;
     } catch {
       clearTimeout(tid);
       return persistent?.data ?? [];

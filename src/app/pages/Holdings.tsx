@@ -5,7 +5,7 @@ import {
   ChevronRight, BarChart2, CalendarClock, Repeat2, Eye, EyeOff,
 } from "lucide-react";
 import { DCAPlan, HoldingAdjustmentInput, HoldingInput, useApp } from "../context/AppContext";
-import { Holding, Group, ClosedHolding } from "../data/mockData";
+import { Holding, Group, ClosedHolding, type TransactionCostProfile } from "../data/mockData";
 import { fetchLivePrice, fetchCnFundTradeStatus, LiveResult, Market } from "../services/securitiesApi";
 import { fetchTencentTradeStatus } from "../services/tencentQuote";
 import { toYahooSymbol } from "../services/quoteApi";
@@ -17,6 +17,7 @@ import { getMarketBadgeWithBg } from "../utils/marketBadge";
 import { normalizeHoldingSymbol, normalizeHoldingType } from "../utils/holdingHelpers";
 import { canSaveHoldingForm } from "../utils/holdingForm";
 import { useSecuritySearch } from "../utils/useSecuritySearch";
+import { estimateTransactionCosts, normalizeTransactionCostProfile } from "../utils/transactionCosts";
 import {
   assetTypeLabel,
   groupName,
@@ -57,11 +58,33 @@ const blankForm = (): HoldingInput => ({
   tradeStatus: "normal",
   tradeStatusNote: "",
   dividendReinvest: null,
+  transactionCostProfile: undefined,
 });
+
+function ratePercentValue(rate: number | undefined) {
+  return rate == null ? "" : String(Number((rate * 100).toFixed(6)));
+}
+
+function optionalRateFromPercent(value: string) {
+  if (!value.trim()) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 100 ? parsed / 100 : Number.NaN;
+}
+
+function optionalNonNegative(value: string) {
+  if (!value.trim()) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : Number.NaN;
+}
+
+function costInputValue(value: number) {
+  if (!(value > 0)) return "";
+  return String(Number(value.toFixed(6)));
+}
 
 function normalizeHoldingForm(input: HoldingInput): HoldingInput {
   const normalizedType = normalizeHoldingType(input.symbol, input.name, input.market, input.assetType);
-  const isFund = normalizedType.market === "FUND" || normalizedType.assetType === "fund";
+  const canReinvest = normalizedType.market === "FUND" && normalizedType.assetType === "fund";
   return {
     ...input,
     symbol: normalizeHoldingSymbol(input.symbol, normalizedType.market),
@@ -69,12 +92,17 @@ function normalizeHoldingForm(input: HoldingInput): HoldingInput {
     assetType: normalizedType.assetType,
     tradeStatus: "normal",
     tradeStatusNote: "",
-    dividendReinvest: isFund ? input.dividendReinvest ?? null : null,
+    dividendReinvest: canReinvest ? input.dividendReinvest ?? null : null,
+    transactionCostProfile: normalizeTransactionCostProfile(input.transactionCostProfile),
   };
 }
 
 function isFundLike(input: Pick<HoldingInput, "market" | "assetType"> | Pick<Holding, "market" | "assetType">) {
   return input.market === "FUND" || input.assetType === "fund";
+}
+
+function canConfigureDividendReinvest(input: Pick<HoldingInput, "market" | "assetType"> | Pick<Holding, "market" | "assetType">) {
+  return input.market === "FUND" && input.assetType === "fund";
 }
 
 function assetTypeSelectLabel(market: string, assetType: string, fallback: string, language: Language) {
@@ -109,8 +137,16 @@ function holdingMarketValue(h: Holding) {
   return h.quantity * h.currentPrice;
 }
 
+function holdingFeeTaxTotal(h: Holding) {
+  return (h.corporateActions ?? []).reduce((sum, action) => (
+    action.type === "fee" || action.type === "tax"
+      ? sum - Math.abs(Number.isFinite(action.amount) ? action.amount ?? 0 : 0)
+      : sum
+  ), 0);
+}
+
 function holdingTotalPnl(h: Holding) {
-  return h.quantity * (h.currentPrice - h.costPrice) + (h.cashDividendTotal ?? 0);
+  return h.quantity * (h.currentPrice - h.costPrice) + (h.cashDividendTotal ?? 0) + holdingFeeTaxTotal(h);
 }
 
 function holdingTotalPnlRate(h: Holding) {
@@ -126,9 +162,21 @@ function todayLocalYMD() {
   return `${y}-${m}-${d}`;
 }
 
-function todayCashDividendAmount(h: Holding, today = todayLocalYMD()) {
+function isValidYMD(value: string) {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return false;
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return date.getFullYear() === Number(match[1])
+    && date.getMonth() === Number(match[2]) - 1
+    && date.getDate() === Number(match[3]);
+}
+
+function todayDividendAmount(h: Holding, today = todayLocalYMD()) {
   return (h.corporateActions ?? [])
-    .filter((action) => action.type === "cash_dividend" && action.date === today)
+    .filter((action) => (
+      (action.type === "cash_dividend" || action.type === "dividend_reinvest") &&
+      action.date === today
+    ))
     .reduce((sum, action) => sum + (Number.isFinite(action.amount) ? Math.max(0, action.amount ?? 0) : 0), 0);
 }
 
@@ -265,7 +313,9 @@ function ClosedHoldingsView({
                 {language === "en" ? "Realized P/L" : "已实现收益"}
                 {(item.cashDividendTotal ?? 0) > 0 && (
                   <span style={{ marginLeft: 5, color: "var(--text-micro)" }}>
-                    {language === "en" ? "incl. dividend" : "含分红"}
+                    {item.dividendReinvest
+                      ? (language === "en" ? "incl. dividend (reinvested)" : "含分红（红利再投）")
+                      : (language === "en" ? "incl. dividend" : "含分红")}
                   </span>
                 )}
               </span>
@@ -304,11 +354,18 @@ function Field({ label, children, className }: { label: string; children: React.
   );
 }
 
-function Input({ value, onChange, placeholder, type = "text" }: {
-  value: string | number; onChange: (v: string) => void; placeholder?: string; type?: string;
+function Input({ value, onChange, placeholder, type = "text", step, min, max }: {
+  value: string | number;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  type?: string;
+  step?: string | number;
+  min?: string | number;
+  max?: string | number;
 }) {
   return (
     <input type={type} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder}
+      step={step} min={min} max={max}
       style={{
         width: "100%", height: 38, background: "var(--bg-card)",
         border: "1px solid var(--border)", borderRadius: 10, padding: "0 12px",
@@ -476,6 +533,13 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
   const { language } = useApp();
   const text = t(language);
   const [form, setForm] = useState<HoldingInput>(initial);
+  const [costProfileDraft, setCostProfileDraft] = useState(() => ({
+    buyFeeRate: ratePercentValue(initial.transactionCostProfile?.buyFeeRate),
+    sellFeeRate: ratePercentValue(initial.transactionCostProfile?.sellFeeRate),
+    minimumFee: initial.transactionCostProfile?.minimumFee == null ? "" : String(initial.transactionCostProfile.minimumFee),
+    buyTaxRate: ratePercentValue(initial.transactionCostProfile?.buyTaxRate),
+    sellTaxRate: ratePercentValue(initial.transactionCostProfile?.sellTaxRate),
+  }));
   const [saving, setSaving] = useState(false);
   const [securityQuery, setSecurityQuery] = useState(() =>
     initial.symbol && initial.name ? `${initial.name} (${initial.symbol})` : [initial.symbol, initial.name].filter(Boolean).join(" ")
@@ -490,7 +554,18 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
   const set = <K extends keyof HoldingInput>(k: K, v: HoldingInput[K]) =>
     setForm((f) => ({ ...f, [k]: v }));
 
-  const valid = canSaveHoldingForm(form);
+  const costProfileForSave = normalizeTransactionCostProfile({
+    buyFeeRate: optionalRateFromPercent(costProfileDraft.buyFeeRate),
+    sellFeeRate: optionalRateFromPercent(costProfileDraft.sellFeeRate),
+    minimumFee: optionalNonNegative(costProfileDraft.minimumFee),
+    buyTaxRate: optionalRateFromPercent(costProfileDraft.buyTaxRate),
+    sellTaxRate: optionalRateFromPercent(costProfileDraft.sellTaxRate),
+  });
+  const validCostProfile = Object.values(costProfileDraft).every((value) => (
+    !value.trim() || (Number.isFinite(Number(value)) && Number(value) >= 0)
+  )) && [costProfileDraft.buyFeeRate, costProfileDraft.sellFeeRate, costProfileDraft.buyTaxRate, costProfileDraft.sellTaxRate]
+    .every((value) => !value.trim() || Number(value) <= 100);
+  const valid = canSaveHoldingForm(form) && validCostProfile;
   const assetTypeSelectOptions = useMemo(() => [
     { value: "" as AssetType, label: text.holdings.selectAfterSecurity },
     ...assetTypeOptions.map((option) => ({
@@ -505,7 +580,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
     { value: "", label: text.holdings.noGroup },
     ...groups.map((g) => ({ value: g.id, label: groupName(g.id, g.name, language) })),
   ];
-  const showDividendMode = isFundLike(form);
+  const showDividendMode = canConfigureDividendReinvest(form);
   const dividendMode = form.dividendReinvest == null ? "inherit" : form.dividendReinvest ? "reinvest" : "cash";
   const dividendModeOptions = [
     { value: "inherit", label: text.holdings.dividendInherit },
@@ -550,7 +625,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
       assetType: normalizedType.assetType,
       currency: r.currency,
       currentPrice: r.price > 0 ? r.price : f.currentPrice,
-      dividendReinvest: isFundLike(normalizedType) ? f.dividendReinvest : null,
+      dividendReinvest: canConfigureDividendReinvest(normalizedType) ? f.dividendReinvest : null,
       autoTradeStatus: null,
       autoTradeStatusNote: "",
       autoTradeStatusSource: null,
@@ -646,7 +721,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
               <Sel value={form.assetType as AssetType} onChange={(v) => setForm((f) => ({
                 ...f,
                 assetType: v,
-                dividendReinvest: isFundLike({ ...f, assetType: v }) ? f.dividendReinvest : null,
+                dividendReinvest: canConfigureDividendReinvest({ ...f, assetType: v }) ? f.dividendReinvest : null,
               }))}
                 options={assetTypeSelectOptions} />
             </Field>
@@ -690,10 +765,36 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
 
           <PnLPreview form={form} cashDividendTotal={isEdit ? cashDividendTotal : 0} />
 
+          <div className="rounded-xl p-3" style={{ background: "var(--bg-card)", border: "1px solid var(--border)" }}>
+            <p style={{ color: "var(--text-primary)", fontSize: 12, fontWeight: 700 }}>{text.holdings.costProfile}</p>
+            <p style={{ color: "var(--text-micro)", fontSize: 10, lineHeight: 1.45, marginTop: 3, marginBottom: 10 }}>
+              {text.holdings.costProfileHint}
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              <Field label={text.holdings.buyFeeRate}>
+                <Input type="number" step="0.01" min="0" max="100" value={costProfileDraft.buyFeeRate} onChange={(value) => setCostProfileDraft((draft) => ({ ...draft, buyFeeRate: value }))} placeholder="0.03" />
+              </Field>
+              <Field label={text.holdings.sellFeeRate}>
+                <Input type="number" step="0.01" min="0" max="100" value={costProfileDraft.sellFeeRate} onChange={(value) => setCostProfileDraft((draft) => ({ ...draft, sellFeeRate: value }))} placeholder="0.03" />
+              </Field>
+              <Field label={text.holdings.buyTaxRate}>
+                <Input type="number" step="0.01" min="0" max="100" value={costProfileDraft.buyTaxRate} onChange={(value) => setCostProfileDraft((draft) => ({ ...draft, buyTaxRate: value }))} placeholder="0" />
+              </Field>
+              <Field label={text.holdings.sellTaxRate}>
+                <Input type="number" step="0.01" min="0" max="100" value={costProfileDraft.sellTaxRate} onChange={(value) => setCostProfileDraft((draft) => ({ ...draft, sellTaxRate: value }))} placeholder="0" />
+              </Field>
+            </div>
+            <div className="mt-2">
+              <Field label={text.holdings.minimumFee(form.currency)}>
+                <Input type="number" step="0.01" min="0" value={costProfileDraft.minimumFee} onChange={(value) => setCostProfileDraft((draft) => ({ ...draft, minimumFee: value }))} placeholder="0" />
+              </Field>
+            </div>
+          </div>
+
           <button onClick={() => {
             if (!valid || saving) return;
             setSaving(true);
-            onSave(normalizeHoldingForm(form));
+            onSave(normalizeHoldingForm({ ...form, transactionCostProfile: costProfileForSave }));
           }} disabled={!valid || saving} className="w-full rounded-xl py-3 flex items-center justify-center gap-2 shrink-0"
             style={{
               background: valid && !saving ? "linear-gradient(135deg, #2563EB 0%, #7C3AED 100%)" : "var(--bg-card)",
@@ -725,6 +826,17 @@ function AdjustSheet({
   const [quantity, setQuantity] = useState("");
   const [amount, setAmount] = useState("");
   const [price, setPrice] = useState(holding.currentPrice ? String(holding.currentPrice) : "");
+  const [date, setDate] = useState(todayLocalYMD());
+  const configuredFeeRate = mode === "buy" ? holding.transactionCostProfile?.buyFeeRate : holding.transactionCostProfile?.sellFeeRate;
+  const configuredTaxRate = mode === "buy" ? holding.transactionCostProfile?.buyTaxRate : holding.transactionCostProfile?.sellTaxRate;
+  const configuredMinimumFee = holding.transactionCostProfile?.minimumFee;
+  const hasConfiguredRule = configuredFeeRate != null || configuredTaxRate != null || configuredMinimumFee != null;
+  const [feeRate, setFeeRate] = useState(() => ratePercentValue(configuredFeeRate));
+  const [taxRate, setTaxRate] = useState(() => ratePercentValue(configuredTaxRate));
+  const [minimumFee, setMinimumFee] = useState(() => configuredMinimumFee == null ? "" : String(configuredMinimumFee));
+  const [feeOverride, setFeeOverride] = useState<string | null>(null);
+  const [taxOverride, setTaxOverride] = useState<string | null>(null);
+  const [rememberCostProfile, setRememberCostProfile] = useState(!hasConfiguredRule);
   const [saving, setSaving] = useState(false);
   const maxSell = holding.quantity;
   const validPrice = Number(price);
@@ -745,6 +857,25 @@ function AdjustSheet({
     ? Math.round(normalizedQuantity)
     : normalizedQuantity;
   const validAmount = validQuantity * validPrice;
+  const parsedFeeRate = optionalRateFromPercent(feeRate);
+  const parsedTaxRate = optionalRateFromPercent(taxRate);
+  const parsedMinimumFee = optionalNonNegative(minimumFee);
+  const costProfilePatch: TransactionCostProfile = mode === "buy"
+    ? { buyFeeRate: parsedFeeRate, buyTaxRate: parsedTaxRate, minimumFee: parsedMinimumFee }
+    : { sellFeeRate: parsedFeeRate, sellTaxRate: parsedTaxRate, minimumFee: parsedMinimumFee };
+  const costEstimate = estimateTransactionCosts(costProfilePatch, mode, validAmount);
+  const fee = feeOverride ?? costInputValue(costEstimate.fee);
+  const tax = taxOverride ?? costInputValue(costEstimate.tax);
+  const numericFee = fee === "" ? 0 : Number(fee);
+  const numericTax = tax === "" ? 0 : Number(tax);
+  const validRules = (!feeRate.trim() || Number.isFinite(parsedFeeRate))
+    && (!taxRate.trim() || Number.isFinite(parsedTaxRate))
+    && (!minimumFee.trim() || Number.isFinite(parsedMinimumFee));
+  const validCosts = validRules
+    && Number.isFinite(numericFee) && numericFee >= 0
+    && Number.isFinite(numericTax) && numericTax >= 0;
+  const validDate = isValidYMD(date);
+  const transactionCosts = validCosts ? numericFee + numericTax : 0;
   const unit = quantityUnit(holding.market, holding.assetType, language);
   const currency = holding.currency;
   const maxSellAmount = maxSell * (validPrice > 0 ? validPrice : holding.currentPrice);
@@ -753,9 +884,18 @@ function AdjustSheet({
     && validPrice > 0
     && validAmount > 0
     && !wholeQuantityInvalid
-    && !exceedsSell;
+    && !exceedsSell
+    && validCosts
+    && validDate;
   const estimatedQuantity = validPrice > 0 && Number.isFinite(validQuantity) ? validQuantity : 0;
   const estimatedAmount = validPrice > 0 && Number.isFinite(validAmount) ? validAmount : 0;
+  const estimatedSettlement = mode === "buy"
+    ? estimatedAmount + transactionCosts
+    : Math.max(0, estimatedAmount - transactionCosts);
+  const hasDraftRule = feeRate.trim() !== "" || taxRate.trim() !== "" || minimumFee.trim() !== "";
+  const profileChanged = parsedFeeRate !== configuredFeeRate
+    || parsedTaxRate !== configuredTaxRate
+    || parsedMinimumFee !== configuredMinimumFee;
   const sellShortcuts = [
     { label: language === "en" ? "1/4" : "1/4仓", fraction: 0.25 },
     { label: language === "en" ? "1/3" : "1/3仓", fraction: 1 / 3 },
@@ -796,7 +936,7 @@ function AdjustSheet({
         exit={{ y: "100%" }}
         transition={{ type: "spring", damping: 28, stiffness: 320 }}
         className="flex flex-col rounded-t-2xl"
-        style={{ background: "var(--bg-overlay)", border: "1px solid var(--border)" }}
+        style={{ background: "var(--bg-overlay)", border: "1px solid var(--border)", maxHeight: "92%" }}
       >
         <div className="flex items-center justify-between px-4 shrink-0" style={{ height: 50, borderBottom: "1px solid var(--border)" }}>
           <span style={{ color: "var(--text-primary)", fontSize: 15, fontWeight: 600 }}>
@@ -804,7 +944,7 @@ function AdjustSheet({
           </span>
           <button onClick={onClose}><X size={18} color="var(--text-muted)" /></button>
         </div>
-        <div className="px-4 py-4 flex flex-col gap-3">
+        <div className="overflow-y-auto px-4 py-4 flex flex-col gap-3" style={{ scrollbarWidth: "none" }}>
           <div className="rounded-xl px-3 py-2.5" style={{ background: "var(--bg-card)", border: "1px solid var(--border)" }}>
             <p style={{ color: "var(--text-primary)", fontSize: 13, fontWeight: 700 }}>{holding.name}</p>
             <p style={{ color: "var(--text-secondary)", fontSize: 11 }}>{holding.symbol} · {language === "en" ? "Current" : "当前持仓"} {formatHoldingQuantity(holding.quantity)} {unit}</p>
@@ -832,9 +972,17 @@ function AdjustSheet({
               );
             })}
           </div>
-          <Field label={text.transactionPrice}>
-            <Input type="number" value={price} onChange={setPrice} placeholder={text.inputTransactionPrice} />
-          </Field>
+          <div className="grid grid-cols-2 gap-2">
+            <Field label={text.transactionDate}>
+              <Input value={date} onChange={setDate} placeholder={text.inputTransactionDate} />
+            </Field>
+            <Field label={text.transactionPrice}>
+              <Input type="number" value={price} onChange={setPrice} placeholder={text.inputTransactionPrice} />
+            </Field>
+          </div>
+          {!validDate && (
+            <p style={{ color: "#F24E4E", fontSize: 11 }}>{text.transactionDateError}</p>
+          )}
           {mode === "sell" && (
             <div className="grid grid-cols-4 gap-2">
               {sellShortcuts.map((item) => {
@@ -882,12 +1030,70 @@ function AdjustSheet({
               />
             </Field>
           )}
+          <div>
+            <p style={{ color: "var(--text-muted)", fontSize: 11, marginBottom: 6 }}>{text.transactionCosts}</p>
+            <div className="grid grid-cols-2 gap-2">
+              <Field label={text.currentFeeRate}>
+                <Input type="number" step="0.01" min="0" max="100" value={feeRate} onChange={(value) => { setFeeRate(value); setFeeOverride(null); }} placeholder="0.03" />
+              </Field>
+              <Field label={text.currentTaxRate}>
+                <Input type="number" step="0.01" min="0" max="100" value={taxRate} onChange={(value) => { setTaxRate(value); setTaxOverride(null); }} placeholder="0" />
+              </Field>
+            </div>
+            <div className="mt-2">
+              <Field label={text.minimumFee(currency)}>
+                <Input type="number" step="0.01" min="0" value={minimumFee} onChange={(value) => { setMinimumFee(value); setFeeOverride(null); }} placeholder="0" />
+              </Field>
+            </div>
+            <div className="grid grid-cols-2 gap-2 mt-2">
+              <Field label={text.actualFee(currency)}>
+                <Input type="number" step="0.01" min="0" value={fee} onChange={setFeeOverride} placeholder="0" />
+              </Field>
+              <Field label={text.actualTax(currency)}>
+                <Input type="number" step="0.01" min="0" value={tax} onChange={setTaxOverride} placeholder="0" />
+              </Field>
+            </div>
+            {(feeOverride != null || taxOverride != null) && (
+              <button
+                type="button"
+                onClick={() => { setFeeOverride(null); setTaxOverride(null); }}
+                style={{ color: "#4F9CF9", fontSize: 10, fontWeight: 700, marginTop: 6 }}
+              >
+                {text.resetCostEstimate}
+              </button>
+            )}
+            {validAmount > 0 && hasDraftRule && (
+              <p style={{ color: "var(--text-micro)", fontSize: 10, marginTop: 5 }}>
+                {text.costEstimateDetail(formatExactMoney(costEstimate.fee + costEstimate.tax, currency))}
+              </p>
+            )}
+            <p style={{ color: "var(--text-micro)", fontSize: 10, marginTop: 5, lineHeight: 1.45 }}>{text.transactionCostsHint}</p>
+            {hasDraftRule && profileChanged && (
+              <button
+                type="button"
+                role="checkbox"
+                aria-checked={rememberCostProfile}
+                onClick={() => setRememberCostProfile((value) => !value)}
+                className="flex items-center gap-2 mt-2 text-left"
+                style={{ color: rememberCostProfile ? "#4F9CF9" : "var(--text-secondary)", fontSize: 11, fontWeight: 600 }}
+              >
+                <span className="flex items-center justify-center rounded" style={{ width: 16, height: 16, border: `1px solid ${rememberCostProfile ? "#4F9CF9" : "var(--border)"}`, background: rememberCostProfile ? "rgba(79,156,249,0.14)" : "var(--bg-card)" }}>
+                  {rememberCostProfile && <Check size={12} />}
+                </span>
+                {hasConfiguredRule ? text.updateCostProfile : text.saveCostProfile}
+              </button>
+            )}
+          </div>
           {(estimatedQuantity > 0 || estimatedAmount > 0) && (
             <div className="rounded-xl px-3 py-2" style={{ background: "rgba(79,156,249,0.08)", border: "1px solid rgba(79,156,249,0.14)" }}>
               <p style={{ color: "var(--text-secondary)", fontSize: 11 }}>
                 {text.estimatedTrade(mode, formatHoldingQuantity(estimatedQuantity), unit)}
                 <span style={{ color: "var(--text-micro)" }}> · </span>
                 {formatExactMoney(estimatedAmount, currency)}
+              </p>
+              <p style={{ color: "var(--text-secondary)", fontSize: 10, marginTop: 2 }}>
+                {text.estimatedSettlement(mode)} {formatExactMoney(estimatedSettlement, currency)}
+                {transactionCosts > 0 && ` · ${text.costsIncluded(formatExactMoney(transactionCosts, currency))}`}
               </p>
               {mode === "sell" && estimatedQuantity > 0 && (
                 <p style={{ color: "var(--text-micro)", fontSize: 10, marginTop: 2 }}>
@@ -910,7 +1116,21 @@ function AdjustSheet({
             onClick={() => {
               if (!valid || saving) return;
               setSaving(true);
-              onSave({ type: mode, quantity: validQuantity, price: validPrice });
+              onSave({
+                type: mode,
+                quantity: validQuantity,
+                price: validPrice,
+                date,
+                fee: numericFee,
+                tax: numericTax,
+                costProfilePatch,
+                rememberCostProfile: hasDraftRule && profileChanged && rememberCostProfile,
+                feeRateUsed: Number.isFinite(parsedFeeRate) ? parsedFeeRate : undefined,
+                taxRateUsed: Number.isFinite(parsedTaxRate) ? parsedTaxRate : undefined,
+                minimumFeeUsed: Number.isFinite(parsedMinimumFee) ? parsedMinimumFee : undefined,
+                estimatedFee: costEstimate.fee,
+                estimatedTax: costEstimate.tax,
+              });
             }}
             disabled={!valid || saving}
             className="w-full rounded-xl py-3"
@@ -943,7 +1163,7 @@ function HoldingCard({
   const todayC    = profitColor(h.todayPnl);
   const totalPnl  = holdingTotalPnl(h);
   const totalRate = holdingTotalPnlRate(h);
-  const todayDividend = todayCashDividendAmount(h);
+  const todayDividend = todayDividendAmount(h);
   const totalC    = profitColor(totalPnl);
   const badge     = getSecurityBadge(h.market, h.assetType, language);
   const group     = groups.find((g) => g.id === h.groupId);
@@ -1042,7 +1262,7 @@ function HoldingCard({
                 </span>
               </div>
             )}
-            {isFundLike(h) && typeof h.dividendReinvest === "boolean" && (
+            {canConfigureDividendReinvest(h) && typeof h.dividendReinvest === "boolean" && (
               <div className="mt-0.5">
                 <span style={{ color: "var(--text-micro)", fontSize: 9 }}>
                   {h.dividendReinvest
@@ -2031,7 +2251,8 @@ export function Holdings() {
                     autoTradeStatusNote: editTarget.autoTradeStatusNote,
                     autoTradeStatusSource: editTarget.autoTradeStatusSource,
                     fundBuyConfirmDays: editTarget.fundBuyConfirmDays,
-                    dividendReinvest: editTarget.dividendReinvest ?? null }
+                    dividendReinvest: editTarget.dividendReinvest ?? null,
+                    transactionCostProfile: editTarget.transactionCostProfile }
                 : blankForm()
             }
             groups={groups}

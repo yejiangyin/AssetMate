@@ -5,6 +5,7 @@ import { appText } from "./i18n";
 
 const Dashboard = lazy(() => import("./pages/Dashboard").then((module) => ({ default: module.Dashboard })));
 const Holdings = lazy(() => import("./pages/Holdings").then((module) => ({ default: module.Holdings })));
+const Returns = lazy(() => import("./pages/Returns").then((module) => ({ default: module.Returns })));
 const Market = lazy(() => import("./pages/Market").then((module) => ({ default: module.Market })));
 const Backtest = lazy(() => import("./pages/Backtest").then((module) => ({ default: module.Backtest })));
 const Settings = lazy(() => import("./pages/Settings").then((module) => ({ default: module.Settings })));
@@ -79,6 +80,7 @@ export const appRoutes = [
     children: [
       { index: true,      Component: withSuspense(Dashboard) },
       { path: "holdings", Component: withSuspense(Holdings)  },
+      { path: "returns",  Component: withSuspense(Returns)   },
       { path: "market",   Component: withSuspense(Market)    },
       { path: "backtest", Component: withSuspense(Backtest)  },
       { path: "settings", Component: withSuspense(Settings)  },

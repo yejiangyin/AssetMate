@@ -16,7 +16,7 @@ describe("appRoutes", () => {
 
     const children = root?.children ?? [];
     assert.ok(children.some((route) => route.index === true));
-    for (const path of ["holdings", "market", "backtest", "settings"]) {
+    for (const path of ["holdings", "returns", "market", "backtest", "settings"]) {
       assert.ok(children.some((route) => route.path === path), `missing ${path} route`);
     }
   });

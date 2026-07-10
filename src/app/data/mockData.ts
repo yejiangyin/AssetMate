@@ -7,6 +7,14 @@ export type Group = {
   visible: boolean;
 };
 
+export type TransactionCostProfile = {
+  buyFeeRate?: number;
+  sellFeeRate?: number;
+  minimumFee?: number;
+  buyTaxRate?: number;
+  sellTaxRate?: number;
+};
+
 export type Holding = {
   id:           string;
   groupId:      string;          // group this holding belongs to (empty = ungrouped)
@@ -24,11 +32,12 @@ export type Holding = {
   totalPnl:     number;
   totalPnlRate: number;
   cashDividendTotal?: number;
+  transactionCostProfile?: TransactionCostProfile;
   dividendReinvest?: boolean | null;
   autoCorporateActionSince?: string;
   corporateActions?: Array<{
     id: string;
-    type: "cash_dividend" | "share_dividend" | "split";
+    type: "cash_dividend" | "dividend_reinvest" | "share_dividend" | "split" | "interest" | "bond_coupon" | "fee" | "tax";
     date: string;
     amount?: number;
     shares?: number;
@@ -41,6 +50,9 @@ export type Holding = {
     source?: string;
     note?: string;
     description?: string;
+    rateUsed?: number;
+    minimumFeeUsed?: number;
+    estimatedAmount?: number;
   }>;
   tradeStatus:  "normal" | "suspended" | "fund_limit" | "buy_disabled";
   tradeStatusNote?: string;
@@ -71,6 +83,8 @@ export type ClosedHolding = {
   realizedPnl:     number;
   realizedReturn:  number;
   cashDividendTotal: number;
+  /** True when dividends were reinvested (红利再投) instead of paid as cash. */
+  dividendReinvest?: boolean;
   currency:        string;
   openedAt:        string;
   closedAt:        string;
