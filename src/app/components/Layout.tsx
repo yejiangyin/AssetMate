@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useLocation } from "react-router";
-import { LayoutDashboard, BarChart2, Settings, Globe, Calculator } from "lucide-react";
+import { LayoutDashboard, BarChart2, Settings, Globe, Calculator, TrendingUp } from "lucide-react";
 import { AnimatePresence } from "motion/react";
 import { useEffect, useMemo, useRef } from "react";
 import type { CSSProperties } from "react";
@@ -14,6 +14,7 @@ import { getExtensionViewMode } from "../utils/extensionOpenMode";
 const tabs = [
   { to: "/",         key: "dashboard" as const, icon: LayoutDashboard },
   { to: "/holdings", key: "holdings" as const, icon: BarChart2 },
+  { to: "/returns",  key: "returns" as const, icon: TrendingUp },
   { to: "/market",   key: "market" as const, icon: Globe },
   { to: "/backtest", key: "backtest" as const, icon: Calculator },
   { to: "/settings", key: "settings" as const, icon: Settings },

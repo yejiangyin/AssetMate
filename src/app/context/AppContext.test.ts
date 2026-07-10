@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { buildClosedHolding, computeStats, loadInitialState } from "./AppContext";
+import {
+  applyAutomaticCorporateActions,
+  buildClosedHolding,
+  computeStats,
+  loadInitialState,
+  resolveFundDividendReinvestPrice,
+} from "./AppContext";
 import type { Holding } from "../data/mockData";
+import type { PortfolioEvent } from "../services/portfolioEvents";
 import { createDCAPlan, createLocalStorageMock, withMockWindow } from "../testUtils";
 
 function holding(patch: Partial<Holding> = {}): Holding {
@@ -27,6 +34,87 @@ function holding(patch: Partial<Holding> = {}): Holding {
     ...patch,
   };
 }
+
+describe("automatic corporate actions", () => {
+  const fundHolding = (patch: Partial<Holding> = {}) => holding({
+    symbol: "006479",
+    name: "测试基金",
+    market: "FUND",
+    assetType: "fund",
+    currency: "CNY",
+    quantity: 10,
+    costPrice: 1,
+    currentPrice: 3,
+    marketValue: 30,
+    cashDividendTotal: 0,
+    dividendReinvest: true,
+    autoCorporateActionSince: "2026-06-01",
+    corporateActions: [],
+    fundNavHistory: [{ date: "2026-06-05", nav: 2 }],
+    ...patch,
+  });
+
+  const dividend = {
+    id: "fund-dividend-1",
+    source: "eastmoney-fund" as const,
+    type: "cash_dividend" as const,
+    date: "2026-06-05",
+    exDate: "2026-06-05",
+    payDate: "2026-06-08",
+    amount: 0.4,
+  };
+
+  test("waits until pay date and reinvests with the ex-date official NAV", () => {
+    const beforePayDate = applyAutomaticCorporateActions(
+      [fundHolding()],
+      new Map([["h1", [dividend]]]),
+      false,
+      "2026-06-07",
+    );
+    assert.equal(beforePayDate.holdings[0]?.quantity, 10);
+    assert.equal(beforePayDate.portfolioEvents.length, 0);
+
+    const posted = applyAutomaticCorporateActions(
+      [fundHolding()],
+      new Map([["h1", [dividend]]]),
+      false,
+      "2026-06-08",
+    );
+    assert.equal(posted.holdings[0]?.quantity, 12);
+    assert.equal(posted.holdings[0]?.corporateActions?.[0]?.price, 2);
+    assert.equal(posted.holdings[0]?.corporateActions?.[0]?.date, "2026-06-08");
+    assert.equal(posted.portfolioEvents[0]?.type, "dividend_reinvest");
+  });
+
+  test("keeps reinvestment pending when no official ex-date NAV is available", () => {
+    const result = applyAutomaticCorporateActions(
+      [fundHolding({ fundNavHistory: [] })],
+      new Map([["h1", [dividend]]]),
+      true,
+      "2026-06-08",
+    );
+    assert.equal(result.holdings[0]?.quantity, 10);
+    assert.equal(result.holdings[0]?.cashDividendTotal, 0);
+    assert.equal(result.portfolioEvents.length, 0);
+  });
+
+  test("does not apply the open-end fund reinvest preference to listed funds", () => {
+    const listedFund = fundHolding({ market: "A", assetType: "fund", dividendReinvest: true });
+    const result = applyAutomaticCorporateActions(
+      [listedFund],
+      new Map([["h1", [{ ...dividend, source: "eastmoney-stock" as const }]]]),
+      true,
+      "2026-06-08",
+    );
+    assert.equal(result.holdings[0]?.quantity, 10);
+    assert.equal(result.holdings[0]?.cashDividendTotal, 4);
+    assert.equal(result.portfolioEvents[0]?.type, "cash_dividend");
+  });
+
+  test("prefers the source reinvestment price over local short history", () => {
+    assert.equal(resolveFundDividendReinvestPrice(fundHolding(), { ...dividend, reinvestPrice: 1.8 }), 1.8);
+  });
+});
 
 describe("loadInitialState", () => {
   test("loads persisted holdings from localStorage", () => {
@@ -203,15 +291,15 @@ describe("loadInitialState", () => {
       assert.equal(state.dcaPlans[0]?.symbol, "600900");
       assert.equal(state.dcaPlans[0]?.market, "A");
       assert.ok(state.dcaPlans[0]?.nextExecDate);
-      assert.equal(state.assetSnapshots.length, 180);
-      assert.equal(state.assetSnapshots[0]?.totalAsset, 2);
+      assert.equal(state.assetSnapshots.length, 181);
+      assert.equal(state.assetSnapshots[0]?.totalAsset, 1);
       assert.equal(state.assetSnapshots.at(-1)?.totalAsset, 181);
     });
   });
 });
 
 describe("buildClosedHolding", () => {
-  test("archives a holding with realized return and dividends", () => {
+  test("archives a holding with pure trading realized return and retained dividend metadata", () => {
     const closed = buildClosedHolding(holding(), 130, "2026-07-01");
 
     assert.equal(closed.sourceHoldingId, "h1");
@@ -238,6 +326,15 @@ describe("buildClosedHolding", () => {
     assert.equal(closed.realizedReturn, 0.30);
     assert.equal(closed.cashDividendTotal, 0);
     assert.equal(closed.isPartial, true);
+  });
+
+  test("deducts transaction fees and taxes from realized sale return", () => {
+    const closed = buildClosedHolding(holding(), 130, "2026-07-01", 4, 8);
+
+    assert.equal(closed.proceeds, 520);
+    assert.equal(closed.costBasis, 400);
+    assert.equal(closed.realizedPnl, 112);
+    assert.equal(closed.realizedReturn, 0.28);
   });
 
   test("explicit full-quantity close is not marked partial", () => {
@@ -267,7 +364,58 @@ describe("computeStats", () => {
 
     assert.equal(stats.totalAsset, 5000);
     assert.equal(stats.costBasis, 4000);
-    assert.equal(stats.unrealizedPnl, 1500);
-    assert.equal(stats.unrealizedRate, 0.375);
+    assert.equal(stats.unrealizedPnl, 1000);
+    assert.equal(stats.unrealizedRate, 0.25);
+  });
+
+  test("splits dividends and trading gains out of unrealized P/L", () => {
+    const events: PortfolioEvent[] = [{
+      id: "div1",
+      date: "2026-07-01",
+      holdingId: "h1",
+      symbol: "AAPL",
+      name: "Apple Inc.",
+      market: "US",
+      assetType: "stock",
+      type: "cash_dividend",
+      amount: 500,
+      amountInBase: 500,
+      currency: "CNY",
+      source: "manual",
+      createdAt: "2026-07-01T00:00:00.000Z",
+    }, {
+      id: "sell1",
+      date: "2026-07-02",
+      holdingId: "h1",
+      symbol: "AAPL",
+      name: "Apple Inc.",
+      market: "US",
+      assetType: "stock",
+      type: "sell",
+      amount: 200,
+      amountInBase: 200,
+      currency: "CNY",
+      source: "manual",
+      costBasisAtEvent: 1000,
+      proceeds: 1200,
+      createdAt: "2026-07-02T00:00:00.000Z",
+    }];
+    const stats = computeStats([
+      holding({
+        currency: "CNY",
+        quantity: 100,
+        costPrice: 40,
+        currentPrice: 50,
+        todayPnl: 0,
+        cashDividendTotal: 500,
+      }),
+    ], [], events);
+
+    assert.equal(stats.unrealizedPnl, 1000);
+    assert.equal(stats.dividendPnl, 500);
+    assert.equal(stats.realizedTradingPnl, 200);
+    assert.equal(stats.realizedPnl, 700);
+    assert.equal(stats.realizedRate, 0.7);
+    assert.equal(stats.totalInvestmentPnl, 1700);
   });
 });

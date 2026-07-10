@@ -6,6 +6,7 @@
 import type { Holding } from "../data/mockData";
 import type { HoldingInput, HoldingAdjustmentInput, HoldingCorporateActionInput } from "../context/AppContext";
 import { safeUUID } from "./safeId";
+import { normalizeTransactionCostProfile } from "./transactionCosts";
 
 /* ─── normalize helpers ─────────────────────────────── */
 
@@ -30,7 +31,15 @@ export function normalizeHoldingSymbol(symbol: string, market: string) {
 }
 
 function canConfigureDividendReinvest(market: string, assetType: string) {
-  return market === "FUND" || assetType === "fund";
+  return market === "FUND" && assetType === "fund";
+}
+
+function holdingFeeTaxTotal(actions: Holding["corporateActions"]) {
+  return (actions ?? []).reduce((sum, action) => (
+    action.type === "fee" || action.type === "tax"
+      ? sum - Math.abs(Number.isFinite(action.amount) ? action.amount ?? 0 : 0)
+      : sum
+  ), 0);
 }
 
 export function normalizeHolding(h: Holding): Holding {
@@ -68,9 +77,9 @@ export function normalizeHolding(h: Holding): Holding {
   const fundBuyConfirmDays = Number.isInteger(h.fundBuyConfirmDays) && h.fundBuyConfirmDays! >= 0 && h.fundBuyConfirmDays! <= 30
     ? h.fundBuyConfirmDays
     : undefined;
-  // totalPnl includes cash dividends received while holding — dividends are
-  // realized income even if the position is still open.
-  const totalPnlWithDividend = totalPnl + cashDividendTotal;
+  // Holding-level totalPnl remains total return for backward-compatible views;
+  // portfolio stats split dividends out of unrealized P/L.
+  const totalPnlWithDividend = totalPnl + cashDividendTotal + holdingFeeTaxTotal(corporateActions);
   return {
     ...h,
     symbol: normalizedSymbol,
@@ -88,6 +97,7 @@ export function normalizeHolding(h: Holding): Holding {
     dividendReinvest: canConfigureDividendReinvest(normalizedType.market, normalizedType.assetType) && typeof h.dividendReinvest === "boolean" ? h.dividendReinvest : null,
     autoCorporateActionSince: h.autoCorporateActionSince ?? "",
     corporateActions,
+    transactionCostProfile: normalizeTransactionCostProfile(h.transactionCostProfile),
     marketValue,
     totalPnl: totalPnlWithDividend,
     totalPnlRate: costBasis > 0 ? totalPnlWithDividend / costBasis : 0,
@@ -104,8 +114,9 @@ export function recomputeHoldingMetrics(
   const marketValue = next.quantity * next.currentPrice;
   const costBasis = next.quantity * next.costPrice;
   const cashDividendTotal = Number.isFinite(next.cashDividendTotal) ? Math.max(0, next.cashDividendTotal ?? 0) : 0;
-  // totalPnl includes cash dividends received while holding.
-  const totalPnl = marketValue - costBasis + cashDividendTotal;
+  // Holding-level totalPnl remains total return for backward-compatible views;
+  // portfolio stats split dividends out of unrealized P/L.
+  const totalPnl = marketValue - costBasis + cashDividendTotal + holdingFeeTaxTotal(next.corporateActions);
   return {
     ...next,
     cashDividendTotal,
@@ -144,6 +155,7 @@ export function buildHolding(input: HoldingInput, id: string): Holding {
     totalPnlRate: costBasis > 0 ? totalPnl / costBasis : 0,
     cashDividendTotal: 0,
     dividendReinvest: canConfigureDividendReinvest(normalizedType.market, normalizedType.assetType) && typeof input.dividendReinvest === "boolean" ? input.dividendReinvest : null,
+    transactionCostProfile: normalizeTransactionCostProfile(input.transactionCostProfile),
     corporateActions: [],
     tradeStatus:  input.tradeStatus ?? "normal",
     tradeStatusNote: input.tradeStatusNote?.trim() || "",
@@ -170,6 +182,9 @@ export function applyCorporateAction(current: Holding, input: HoldingCorporateAc
     source: input.source,
     note: input.note?.trim() || "",
     description: input.description,
+    rateUsed: Number.isFinite(input.rateUsed) && (input.rateUsed ?? 0) >= 0 ? input.rateUsed : undefined,
+    minimumFeeUsed: Number.isFinite(input.minimumFeeUsed) && (input.minimumFeeUsed ?? 0) >= 0 ? input.minimumFeeUsed : undefined,
+    estimatedAmount: Number.isFinite(input.estimatedAmount) && (input.estimatedAmount ?? 0) >= 0 ? input.estimatedAmount : undefined,
   };
 
   if (input.type === "cash_dividend") {
@@ -180,6 +195,52 @@ export function applyCorporateAction(current: Holding, input: HoldingCorporateAc
       corporateActions: [
         ...(current.corporateActions ?? []),
         { ...baseAction, amount },
+      ].slice(-60),
+    });
+  }
+
+  if (input.type === "interest" || input.type === "bond_coupon") {
+    const amount = Number(input.amount);
+    if (!(amount > 0)) return current;
+    return recomputeHoldingMetrics(current, {
+      cashDividendTotal: (current.cashDividendTotal ?? 0) + amount,
+      corporateActions: [
+        ...(current.corporateActions ?? []),
+        { ...baseAction, amount },
+      ].slice(-60),
+    });
+  }
+
+  if (input.type === "fee" || input.type === "tax") {
+    const amount = Number(input.amount);
+    if (!(amount > 0)) return current;
+    return recomputeHoldingMetrics(current, {
+      corporateActions: [
+        ...(current.corporateActions ?? []),
+        { ...baseAction, amount: -Math.abs(amount) },
+      ].slice(-60),
+    });
+  }
+
+  if (input.type === "dividend_reinvest") {
+    const amount = Number(input.amount);
+    const shares = Number(input.shares);
+    if (!(amount > 0) || !(shares > 0)) return current;
+    const nextQuantity = current.quantity + shares;
+    const nextCostBasis = currentCostBasis + amount;
+    const nextCostPrice = nextQuantity > 0 ? nextCostBasis / nextQuantity : current.costPrice;
+    return recomputeHoldingMetrics(current, {
+      quantity: nextQuantity,
+      costPrice: nextCostPrice,
+      cashDividendTotal: (current.cashDividendTotal ?? 0) + amount,
+      corporateActions: [
+        ...(current.corporateActions ?? []),
+        {
+          ...baseAction,
+          shares,
+          amount,
+          price: Number.isFinite(input.price) && (input.price ?? 0) > 0 ? input.price : undefined,
+        },
       ].slice(-60),
     });
   }
@@ -204,6 +265,7 @@ export function applyCorporateAction(current: Holding, input: HoldingCorporateAc
     });
   }
 
+  if (input.type !== "split") return current;
   const ratio = Number(input.ratio);
   if (!(ratio > 0)) return current;
   const nextQuantity = current.quantity * ratio;

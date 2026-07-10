@@ -51,6 +51,13 @@ describe("normalizeHolding", () => {
   test("keeps dividend reinvest preference only for fund holdings", () => {
     assert.equal(normalizeHolding(holding({ dividendReinvest: true })).dividendReinvest, true);
     assert.equal(normalizeHolding(holding({
+      symbol: "510300",
+      name: "沪深300ETF",
+      market: "A",
+      assetType: "fund",
+      dividendReinvest: true,
+    })).dividendReinvest, null);
+    assert.equal(normalizeHolding(holding({
       symbol: "AAPL",
       name: "Apple Inc.",
       market: "US",
@@ -108,11 +115,23 @@ describe("normalizeHolding", () => {
     assert.equal(normalized.corporateActions?.[0]?.exDate, "2026-06-04");
   });
 
-  test("includes cash dividends in unrealized total P/L", () => {
+  test("keeps holding-level total return including cash dividends for compatibility", () => {
     // 10 shares, cost 1, current 2 → price gain 10; dividends 5 → total 15
     const normalized = normalizeHolding(holding({ cashDividendTotal: 5 }));
     assert.equal(normalized.totalPnl, 15);
     assert.equal(normalized.totalPnlRate, 1.5); // 15 / 10
+  });
+
+  test("normalizes a reusable transaction cost profile", () => {
+    const normalized = normalizeHolding(holding({
+      transactionCostProfile: {
+        buyFeeRate: 0.0003,
+        sellFeeRate: -1,
+        minimumFee: 5,
+      },
+    }));
+
+    assert.deepEqual(normalized.transactionCostProfile, { buyFeeRate: 0.0003, minimumFee: 5 });
   });
 
   test("recomputes market metrics while preserving daily P/L fields", () => {
@@ -160,6 +179,70 @@ describe("applyCorporateAction", () => {
     assert.equal(adjusted.quantity * adjusted.costPrice, 10);
   });
 
+  test("records dividend reinvestment as dividend income plus new cost basis", () => {
+    const adjusted = applyCorporateAction(holding(), {
+      type: "dividend_reinvest",
+      date: "2026-06-04",
+      amount: 4,
+      shares: 2,
+      price: 2,
+    });
+
+    assert.equal(adjusted.quantity, 12);
+    assert.equal(adjusted.cashDividendTotal, 4);
+    assert.equal(adjusted.quantity * adjusted.costPrice, 14);
+    assert.equal(adjusted.totalPnl, 14);
+    assert.equal(adjusted.corporateActions?.[0]?.type, "dividend_reinvest");
+  });
+
+  test("records fees and taxes as negative events without increasing dividends", () => {
+    const withFee = applyCorporateAction(holding({ cashDividendTotal: 3 }), {
+      type: "fee",
+      date: "2026-06-04",
+      amount: 1.2,
+    });
+    const withTax = applyCorporateAction(withFee, {
+      type: "tax",
+      date: "2026-06-05",
+      amount: 0.8,
+    });
+
+    assert.equal(withTax.cashDividendTotal, 3);
+    assert.equal(withTax.corporateActions?.[0]?.amount, -1.2);
+    assert.equal(withTax.corporateActions?.[1]?.amount, -0.8);
+    // Price gain 10 + dividends 3 - fee/tax 2 = total return 11.
+    assert.equal(withTax.totalPnl, 11);
+    assert.equal(withTax.totalPnlRate, 1.1);
+  });
+
+  test("snapshots the rule used for an actual transaction fee", () => {
+    const adjusted = applyCorporateAction(holding(), {
+      type: "fee",
+      date: "2026-07-10",
+      amount: 6,
+      rateUsed: 0.0003,
+      minimumFeeUsed: 5,
+      estimatedAmount: 5,
+    });
+
+    assert.deepEqual(adjusted.corporateActions?.[0], {
+      id: adjusted.corporateActions?.[0]?.id,
+      type: "fee",
+      date: "2026-07-10",
+      recordDate: undefined,
+      exDate: undefined,
+      payDate: undefined,
+      announcementDate: undefined,
+      source: undefined,
+      note: "",
+      description: undefined,
+      rateUsed: 0.0003,
+      minimumFeeUsed: 5,
+      estimatedAmount: 5,
+      amount: -6,
+    });
+  });
+
   test("applies split ratios while preserving invested cost", () => {
     const adjusted = applyCorporateAction(holding(), {
       type: "split",
@@ -188,6 +271,7 @@ describe("buildHolding", () => {
       currency: "HKD",
       tradeStatus: "normal",
       dividendReinvest: true,
+      transactionCostProfile: { buyFeeRate: 0.0003, minimumFee: 5 },
     };
 
     const built = buildHolding(input, "new-id");
@@ -198,6 +282,7 @@ describe("buildHolding", () => {
     assert.equal(built.totalPnl, 100);
     assert.equal(built.totalPnlRate, 100 / 600);
     assert.equal(built.dividendReinvest, null);
+    assert.deepEqual(built.transactionCostProfile, { buyFeeRate: 0.0003, minimumFee: 5 });
   });
 });
 

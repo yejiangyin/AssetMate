@@ -100,3 +100,34 @@ test("falls back from Yahoo query2 to query1 for corporate actions", async () =>
     assert.equal(actions[0]?.amount, 0.5);
   });
 });
+
+test("attaches the official ex-date NAV used for fund dividend reinvestment", async () => {
+  await withMockFetch((async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.includes("fundf10.eastmoney.com/fhsp_123456.html")) {
+      return {
+        ok: true,
+        text: async () => `
+          <table class="cfxq"><tbody>
+            <tr><td>1</td><td>2026-06-04</td><td>2026-06-05</td><td>每份派现金0.40元</td><td>2026-06-08</td></tr>
+          </tbody></table>
+        `,
+      } as Response;
+    }
+    if (url.includes("api.fund.eastmoney.com/f10/lsjz")) {
+      return {
+        ok: true,
+        json: async () => ({ Data: { LSJZList: [{ FSRQ: "2026-06-05", DWJZ: "2.0000", JZZZL: "0" }] } }),
+      } as Response;
+    }
+    return { ok: true, text: async () => "" } as Response;
+  }) as typeof fetch, async () => {
+    const actions = await fetchCorporateActions(createHolding({
+      symbol: "123456",
+      market: "FUND",
+      assetType: "fund",
+    }));
+    assert.equal(actions[0]?.type, "cash_dividend");
+    assert.equal(actions[0]?.reinvestPrice, 2);
+  });
+});
