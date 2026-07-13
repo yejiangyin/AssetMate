@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useId, useState, useCallback, useRef } from "react";
-import { RefreshCw, Eye, EyeOff, TrendingUp, PanelRightClose, PanelRightOpen } from "lucide-react";
+import { Bell, ChevronDown, ChevronUp, Eye, EyeOff, PanelRightClose, PanelRightOpen, RefreshCw, X } from "lucide-react";
 import { useApp } from "../context/AppContext";
 import { motion } from "motion/react";
 import { AreaChart, Area, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
@@ -10,6 +10,12 @@ import { BrandMark } from "../components/BrandMark";
 import { formatExactMoney, formatPercent } from "../utils/numberFormat";
 import { useViewSwitcher } from "../utils/useViewSwitcher";
 import { getMarketBadge } from "../utils/marketBadge";
+import {
+  getRecentCorporateActionNotices,
+  mergeDismissedCorporateActionNoticeKeys,
+  readDismissedCorporateActionNoticeKeys,
+  writeDismissedCorporateActionNoticeKeys,
+} from "../utils/corporateActionNotices";
 import { groupName, t } from "../i18n";
 
 const UNGROUPED = { id: "", name: "未分组", color: "var(--text-micro)" };
@@ -147,7 +153,7 @@ function writeCachedAssetSeries(cacheKey: string, points: AssetSeriesPoint[]) {
 }
 
 export function Dashboard() {
-  const { stats, holdings, groups, privacyMode, togglePrivacy, refresh, isRefreshing, lastRefreshed, lastRefreshError, profitColor, openDetail, tc, assetSnapshots, language } = useApp();
+  const { stats, holdings, groups, privacyMode, togglePrivacy, refresh, isRefreshing, lastRefreshed, lastRefreshError, profitColor, openDetail, tc, assetSnapshots, portfolioEvents, language } = useApp();
   const text = t(language);
   const navigate = useNavigate();
   const heroGradId = useId().replace(/:/g, "");
@@ -156,6 +162,8 @@ export function Dashboard() {
   const [assetFilter, setAssetFilter] = useState("ALL");
   const [estimatedAssetSeries, setEstimatedAssetSeries] = useState<EstimatedAssetSeries | null>(null);
   const [loadingEstimated, setLoadingEstimated] = useState(false);
+  const [noticesExpanded, setNoticesExpanded] = useState(false);
+  const [dismissedNoticeKeys, setDismissedNoticeKeys] = useState(readDismissedCorporateActionNoticeKeys);
 
   const rankBadgeStyle = (index: number) => {
     if (index === 0) {
@@ -419,6 +427,21 @@ export function Dashboard() {
   }, [holdings, pnlSort, assetFilter]);
 
   const dashboardRefreshing = isRefreshing || manualRefreshing;
+  const dismissedNoticeKeySet = useMemo(() => new Set(dismissedNoticeKeys), [dismissedNoticeKeys]);
+  const corporateActionNotices = useMemo(
+    () => getRecentCorporateActionNotices(portfolioEvents, new Date(), 30, dismissedNoticeKeySet),
+    [dismissedNoticeKeySet, portfolioEvents],
+  );
+
+  const corporateActionLabel = useCallback((type: (typeof corporateActionNotices)[number]["type"]) => {
+    if (type === "cash_dividend") return text.dashboard.actionCashDividend;
+    if (type === "dividend_reinvest") return text.dashboard.actionDividendReinvest;
+    if (type === "share_dividend") return text.dashboard.actionShareDividend;
+    if (type === "split") return text.dashboard.actionSplit;
+    if (type === "interest") return text.dashboard.actionInterest;
+    if (type === "bond_coupon") return text.dashboard.actionBondCoupon;
+    return type;
+  }, [text.dashboard]);
 
   useEffect(() => {
     if (!isRefreshing) setManualRefreshing(false);
@@ -429,6 +452,13 @@ export function Dashboard() {
     setManualRefreshing(true);
     void refresh();
   }, [refresh, dashboardRefreshing]);
+
+  const dismissCorporateActionNotices = useCallback(() => {
+    const nextKeys = mergeDismissedCorporateActionNoticeKeys(dismissedNoticeKeys, corporateActionNotices);
+    writeDismissedCorporateActionNoticeKeys(nextKeys);
+    setDismissedNoticeKeys(nextKeys);
+    setNoticesExpanded(false);
+  }, [corporateActionNotices, dismissedNoticeKeys]);
 
   const { isSidePanel, switchTitle, toggleView: handleSwitchView } = useViewSwitcher();
 
@@ -474,6 +504,66 @@ export function Dashboard() {
         className="flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "none", overscrollBehaviorY: "contain", WebkitOverflowScrolling: "touch", paddingBottom: 16 }}
       >
+      {corporateActionNotices.length > 0 && (
+        <div className="mx-3 mt-3 rounded-xl border border-app-accent/20 bg-app-card overflow-hidden">
+          <div className="flex items-center">
+            <button
+              type="button"
+              className="min-w-0 flex-1 flex items-center gap-2.5 pl-3 pr-2 py-2.5 text-left"
+              onClick={() => setNoticesExpanded((current) => !current)}
+              aria-expanded={noticesExpanded}
+            >
+              <span className="size-8 shrink-0 rounded-lg bg-app-accent/10 flex items-center justify-center">
+                <Bell size={15} color="#4F9CF9" />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center gap-1.5">
+                  <span className="text-tp text-xs font-semibold">{text.dashboard.actionNoticeTitle}</span>
+                  <span className="rounded-full bg-app-accent/10 text-app-accent text-[9px] font-semibold px-1.5 py-0.5">
+                    {text.dashboard.actionNoticeCount(corporateActionNotices.length)}
+                  </span>
+                </span>
+                <span className="block truncate text-tm text-[10px] mt-0.5">
+                  {text.dashboard.actionNoticeSummary(
+                    corporateActionNotices[0]?.name || corporateActionNotices[0]?.symbol || text.dashboard.unknownHolding,
+                    corporateActionLabel(corporateActionNotices[0]!.type),
+                  )}
+                </span>
+              </span>
+              {noticesExpanded
+                ? <ChevronUp size={15} color="var(--text-muted)" />
+                : <ChevronDown size={15} color="var(--text-muted)" />}
+            </button>
+            <button
+              type="button"
+              className="size-8 mr-1 shrink-0 rounded-lg flex items-center justify-center hover:bg-app-control"
+              onClick={dismissCorporateActionNotices}
+              title={text.dashboard.actionNoticeDismiss}
+              aria-label={text.dashboard.actionNoticeDismiss}
+            >
+              <X size={14} color="var(--text-muted)" />
+            </button>
+          </div>
+          {noticesExpanded && (
+            <div className="border-t border-app-border px-3">
+              {corporateActionNotices.slice(0, 5).map((event) => (
+                <div key={event.id} className="flex items-center justify-between gap-3 py-2 border-b border-app-border last:border-b-0">
+                  <div className="min-w-0">
+                    <p className="text-ts text-[11px] font-medium truncate">{event.name || event.symbol || text.dashboard.unknownHolding}</p>
+                    <p className="text-tm text-[10px] mt-0.5">{corporateActionLabel(event.type)}</p>
+                  </div>
+                  <span className="text-tmi text-[10px] shrink-0">{event.date}</span>
+                </div>
+              ))}
+              {corporateActionNotices.length > 5 && (
+                <p className="text-tmi text-[10px] text-center py-2">
+                  {text.dashboard.actionNoticeMore(corporateActionNotices.length - 5)}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
       {/* Hero Card */}
       <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}
         className="mx-3 mt-3 rounded-2xl p-4 bg-app-surface border border-app-accent/15">
@@ -603,35 +693,6 @@ export function Dashboard() {
           </div>
         </div>
       )}
-
-      {/* Market Trends → replaced by Market page; show a compact entry banner */}
-      <div className="mt-4 px-3">
-        <button
-          onClick={() => navigate("/market")}
-          className="w-full rounded-xl px-4 py-3 flex items-center justify-between"
-          style={{
-            background: "linear-gradient(135deg, rgba(79,156,249,0.08) 0%, rgba(124,58,237,0.08) 100%)",
-            border: "1px solid rgba(79,156,249,0.15)",
-          }}
-          onMouseEnter={(e) => (e.currentTarget.style.borderColor = "rgba(79,156,249,0.35)")}
-          onMouseLeave={(e) => (e.currentTarget.style.borderColor = "rgba(79,156,249,0.15)")}
-        >
-          <div className="flex items-center gap-2.5">
-            <div className="rounded-lg flex items-center justify-center"
-              style={{ width: 32, height: 32, background: "rgba(79,156,249,0.12)" }}>
-              <TrendingUp size={16} color="#4F9CF9" />
-            </div>
-            <div className="text-left">
-              <p style={{ color: "var(--text-primary)", fontSize: 13, fontWeight: 600 }}>{text.dashboard.marketTitle}</p>
-              <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{text.dashboard.marketDesc}</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <span style={{ color: "#4F9CF9", fontSize: 11 }}>{text.dashboard.view}</span>
-            <TrendingUp size={12} color="#4F9CF9" style={{ transform: "rotate(0deg)" }} />
-          </div>
-        </button>
-      </div>
 
       {/* Today's Movers — from real holdings */}
       {holdings.length > 0 && (

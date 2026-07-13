@@ -11,7 +11,7 @@ type ChromeRuntimeLike = {
   ) => void;
 };
 
-type ExtensionMessageResponse = { ok?: boolean; reason?: string; dates?: string[] };
+type ExtensionMessageResponse = { ok?: boolean; reason?: string; dates?: string[]; mode?: ExtensionOpenMode };
 
 type ChromeApiLike = {
   runtime?: ChromeRuntimeLike;
@@ -70,6 +70,10 @@ export function sendExtensionOpenModeMessage(type: string, payload: Record<strin
 
 export function syncExtensionOpenMode(mode: ExtensionOpenMode) {
   return sendExtensionOpenModeMessage("asset-helper:set-open-mode", { mode });
+}
+
+export function getConfiguredExtensionOpenMode() {
+  return sendExtensionOpenModeMessage("asset-helper:get-open-mode");
 }
 
 export function consumeSnapshotDueDates() {

@@ -115,6 +115,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "asset-helper:get-open-mode") {
+    void getOpenMode()
+      .then((mode) => sendResponse({ ok: true, mode }))
+      .catch((error) => sendResponse({ ok: false, reason: error?.message ?? "get_failed" }));
+    return true;
+  }
+
   if (message.type === "asset-helper:open-mode") {
     void openMode(message.mode, sender)
       .then(() => sendResponse({ ok: true, mode: normalizeMode(message.mode) }))

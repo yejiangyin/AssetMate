@@ -24,7 +24,7 @@ import {
 import { normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction } from "../utils/holdingHelpers";
 import { dedupeDCAExecutions, hydratePlans, repairDCAData, settleDueDCAPlans, syncPlanWithHolding, computeNextExec } from "../utils/dcaEngine";
 import { safeUUID } from "../utils/safeId";
-import { consumeSnapshotDueDates, DEFAULT_OPEN_MODE, normalizeOpenMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
+import { consumeSnapshotDueDates, DEFAULT_OPEN_MODE, getConfiguredExtensionOpenMode, normalizeOpenMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
 import { estimateTransactionCosts, mergeTransactionCostProfile } from "../utils/transactionCosts";
 
 /* ─── types ──────────────────────────────────────────── */
@@ -1476,8 +1476,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   useEffect(() => {
-    void syncExtensionOpenMode(state.defaultOpenMode);
-  }, [state.defaultOpenMode]);
+    // The service worker owns toolbar click behavior. A newly opened side panel
+    // must never push its potentially stale local preference back to Chrome,
+    // otherwise it can immediately restore the popup that was just disabled.
+    void getConfiguredExtensionOpenMode().then((response) => {
+      if (!response.ok || !response.mode) return;
+      const mode = normalizeOpenMode(response.mode);
+      setState((current) => current.defaultOpenMode === mode
+        ? current
+        : { ...current, defaultOpenMode: mode });
+    });
+  }, []);
 
   useEffect(() => {
     if (!state.refreshInterval) return;

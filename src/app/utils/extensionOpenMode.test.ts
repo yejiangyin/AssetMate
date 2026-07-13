@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   getExtensionViewMode,
+  getConfiguredExtensionOpenMode,
   normalizeOpenMode,
   openExtensionMode,
   sendExtensionOpenModeMessage,
@@ -35,6 +36,25 @@ describe("extensionOpenMode", () => {
 
     try {
       assert.deepEqual(await syncExtensionOpenMode("sidepanel"), { ok: true });
+    } finally {
+      (globalThis as { chrome?: unknown }).chrome = previousChrome;
+    }
+  });
+
+  test("reads the service worker mode without applying a local preference", async () => {
+    const previousChrome = (globalThis as { chrome?: unknown }).chrome;
+    (globalThis as { chrome?: unknown }).chrome = {
+      runtime: {
+        id: "ext",
+        sendMessage: (message: unknown, callback: (response: { ok?: boolean; mode?: string } | undefined) => void) => {
+          assert.deepEqual(message, { type: "asset-helper:get-open-mode" });
+          callback({ ok: true, mode: "sidepanel" });
+        },
+      },
+    };
+
+    try {
+      assert.deepEqual(await getConfiguredExtensionOpenMode(), { ok: true, mode: "sidepanel" });
     } finally {
       (globalThis as { chrome?: unknown }).chrome = previousChrome;
     }
