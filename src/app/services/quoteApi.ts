@@ -470,13 +470,22 @@ function ymdToUnixSeconds(value: string, fallback: number) {
   return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : fallback;
 }
 
-export async function fetchBacktestDailyPrices(symbol: string, market: string, startDate?: string, endDate?: string): Promise<DailyPricePoint[]> {
+export async function fetchBacktestDailyPrices(
+  symbol: string,
+  market: string,
+  startDate?: string,
+  endDate?: string,
+  options: { preferAdjusted?: boolean } = {},
+): Promise<DailyPricePoint[]> {
   if (market === "FUND") {
     const history = await fetchCnFundOfficialHistory(symbol, 4000);
+    const useAdjustedNav = history.length > 0 && history.every((point) => {
+      const totalNav = Number(point.totalNav);
+      return Number.isFinite(totalNav) && totalNav > 0;
+    });
     return history
       .map((point) => {
         const totalNav = Number(point.totalNav);
-        const useAdjustedNav = Number.isFinite(totalNav) && totalNav > 0;
         return {
           date: point.date,
           price: useAdjustedNav ? totalNav : point.nav,
@@ -535,11 +544,17 @@ export async function fetchBacktestDailyPrices(symbol: string, market: string, s
         const date = new Date(ts * 1000).toISOString().slice(0, 10);
         splitByDate.set(date, (splitByDate.get(date) ?? 1) * ratio);
       }
+      const useAdjustedClose = options.preferAdjusted !== false
+        && timestamps.length > 0
+        && timestamps.every((_, index) => {
+          const adjustedClose = Number(adjustedCloses[index]);
+          return Number.isFinite(adjustedClose) && adjustedClose > 0;
+        });
       const points = timestamps
         .map((timestamp, index) => {
           const date = new Date(timestamp * 1000).toISOString().slice(0, 10);
           const adjustedClose = Number(adjustedCloses[index]);
-          if (Number.isFinite(adjustedClose) && adjustedClose > 0) {
+          if (useAdjustedClose) {
             return {
               date,
               price: adjustedClose,

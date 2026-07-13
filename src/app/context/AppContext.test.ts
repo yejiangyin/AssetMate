@@ -111,6 +111,25 @@ describe("automatic corporate actions", () => {
     assert.equal(result.portfolioEvents[0]?.type, "cash_dividend");
   });
 
+  test("records automatic dividend withholding tax separately", () => {
+    const taxed = fundHolding({
+      market: "A",
+      assetType: "fund",
+      dividendReinvest: false,
+      transactionCostProfile: { dividendTaxRate: 0.1 },
+    });
+    const result = applyAutomaticCorporateActions(
+      [taxed],
+      new Map([["h1", [{ ...dividend, source: "eastmoney-stock" as const }]]]),
+      false,
+      "2026-06-08",
+    );
+    assert.equal(result.portfolioEvents.find((event) => event.type === "cash_dividend")?.amount, 4);
+    const tax = result.portfolioEvents.find((event) => event.type === "tax");
+    assert.equal(tax?.amount, -0.4);
+    assert.equal(tax?.rateUsed, 0.1);
+  });
+
   test("prefers the source reinvestment price over local short history", () => {
     assert.equal(resolveFundDividendReinvestPrice(fundHolding(), { ...dividend, reinvestPrice: 1.8 }), 1.8);
   });
@@ -329,10 +348,12 @@ describe("buildClosedHolding", () => {
   });
 
   test("deducts transaction fees and taxes from realized sale return", () => {
-    const closed = buildClosedHolding(holding(), 130, "2026-07-01", 4, 8);
+    const closed = buildClosedHolding(holding(), 130, "2026-07-01", 4, { fee: 3, tax: 5 });
 
     assert.equal(closed.proceeds, 520);
     assert.equal(closed.costBasis, 400);
+    assert.equal(closed.transactionFee, 3);
+    assert.equal(closed.transactionTax, 5);
     assert.equal(closed.realizedPnl, 112);
     assert.equal(closed.realizedReturn, 0.28);
   });
@@ -417,5 +438,29 @@ describe("computeStats", () => {
     assert.equal(stats.realizedPnl, 700);
     assert.equal(stats.realizedRate, 0.7);
     assert.equal(stats.totalInvestmentPnl, 1700);
+  });
+
+  test("includes archived event baseline in cumulative statistics", () => {
+    const stats = computeStats([], [], [], {
+      daily: {
+        "2025-01-01": { realizedTradingPnl: 100, dividendPnl: 20, transactionFeePnl: -3, taxPnl: -2, feePnl: -5 },
+      },
+      realizedCostBasis: 500,
+    });
+    assert.equal(stats.realizedTradingPnl, 100);
+    assert.equal(stats.dividendPnl, 20);
+    assert.equal(stats.feePnl, -5);
+    assert.equal(stats.realizedPnl, 115);
+    assert.equal(stats.realizedRate, 0.23);
+  });
+
+  test("does not add legacy closed-holding fallback over an archived baseline", () => {
+    const stats = computeStats([], [buildClosedHolding(holding({ currency: "CNY" }), 130, "2026-07-01")], [], {
+      daily: {
+        "2026-07-01": { realizedTradingPnl: 300, dividendPnl: 0, transactionFeePnl: 0, taxPnl: 0, feePnl: 0 },
+      },
+      realizedCostBasis: 1000,
+    });
+    assert.equal(stats.realizedTradingPnl, 300);
   });
 });

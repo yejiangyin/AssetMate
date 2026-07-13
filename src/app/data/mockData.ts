@@ -13,6 +13,7 @@ export type TransactionCostProfile = {
   minimumFee?: number;
   buyTaxRate?: number;
   sellTaxRate?: number;
+  dividendTaxRate?: number;
 };
 
 export type Holding = {
@@ -80,6 +81,8 @@ export type ClosedHolding = {
   closePrice:      number;
   costBasis:       number;
   proceeds:        number;
+  transactionFee?: number;
+  transactionTax?: number;
   realizedPnl:     number;
   realizedReturn:  number;
   cashDividendTotal: number;

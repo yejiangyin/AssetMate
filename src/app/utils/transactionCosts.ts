@@ -1,6 +1,6 @@
 import type { TransactionCostProfile } from "../data/mockData";
 
-const PROFILE_KEYS = ["buyFeeRate", "sellFeeRate", "minimumFee", "buyTaxRate", "sellTaxRate"] as const;
+const PROFILE_KEYS = ["buyFeeRate", "sellFeeRate", "minimumFee", "buyTaxRate", "sellTaxRate", "dividendTaxRate"] as const;
 
 function optionalNonNegative(value: unknown) {
   if (value === "" || value == null) return undefined;
@@ -39,4 +39,18 @@ export function estimateTransactionCosts(
     : 0;
   const tax = safeAmount > 0 && taxRate != null ? safeAmount * taxRate : 0;
   return { fee, tax, feeRate, taxRate, minimumFee };
+}
+
+/** Maximum buy notional whose notional + estimated costs stays within budget. */
+export function affordableBuyAmount(profile: TransactionCostProfile | undefined, budget: number) {
+  const safeBudget = Number.isFinite(budget) ? Math.max(0, budget) : 0;
+  let low = 0;
+  let high = safeBudget;
+  for (let index = 0; index < 48; index += 1) {
+    const candidate = (low + high) / 2;
+    const { fee, tax } = estimateTransactionCosts(profile, "buy", candidate);
+    if (candidate + fee + tax <= safeBudget) low = candidate;
+    else high = candidate;
+  }
+  return low;
 }

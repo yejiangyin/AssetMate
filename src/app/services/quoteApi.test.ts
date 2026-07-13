@@ -132,6 +132,31 @@ describe("Yahoo chart fetchers", () => {
     });
   });
 
+  test("fetchBacktestDailyPrices can keep raw closes and explicit corporate actions", async () => {
+    await withMockFetch((async () => okJson({
+      chart: {
+        result: [{
+          timestamp: [1767225600, 1767312000],
+          indicators: {
+            quote: [{ close: [110, 60] }],
+            adjclose: [{ adjclose: [100, 112] }],
+          },
+          events: {
+            dividends: { d1: { date: 1767312000, amount: 1 } },
+            splits: { s1: { date: 1767312000, splitRatio: "2:1" } },
+          },
+        }],
+      },
+    })) as typeof fetch, async () => {
+      const prices = await fetchBacktestDailyPrices("AAPL", "US", "2026-01-01", "2026-01-02", { preferAdjusted: false });
+
+      assert.deepEqual(prices, [
+        { date: "2026-01-01", price: 110, dividend: 0, splitRatio: 1 },
+        { date: "2026-01-02", price: 60, dividend: 1, splitRatio: 2 },
+      ]);
+    });
+  });
+
   test("fetchBacktestDailyPrices uses cumulative NAV for fund backtests", async () => {
     await withMockFetch((async (input: string | URL | Request) => {
       const url = String(input);
@@ -172,6 +197,26 @@ describe("Yahoo chart fetchers", () => {
       const prices = await fetchBacktestDailyPrices("003547", "FUND", "2026-01-03", "2026-01-03");
 
       assert.deepEqual(prices, [{ date: "2026-01-03", price: 1.05, adjusted: false }]);
+    });
+  });
+
+  test("fund backtests never mix cumulative and unit NAV in one series", async () => {
+    await withMockFetch((async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/f10/lsjz")) return okJson({ Data: null });
+      return {
+        ok: true,
+        text: async () => [
+          "var Data_netWorthTrend = [{\"x\":1767312000000,\"y\":1.04},{\"x\":1767398400000,\"y\":1.05}];",
+          "var Data_ACWorthTrend = [[1767312000000,1.43]];",
+        ].join(""),
+      } as Response;
+    }) as typeof fetch, async () => {
+      const prices = await fetchBacktestDailyPrices("003547", "FUND", "2026-01-02", "2026-01-03");
+      assert.deepEqual(prices, [
+        { date: "2026-01-02", price: 1.04, adjusted: false },
+        { date: "2026-01-03", price: 1.05, adjusted: false },
+      ]);
     });
   });
 

@@ -238,8 +238,8 @@ function ClosedHoldingsView({
 
   const emptyText = language === "en" ? "No realized records yet" : "暂无已实现记录";
   const subtitle = language === "en"
-    ? "Sell and close records keep realized P/L, including cash dividends when applicable."
-    : "卖出和清仓后会在这里保留已实现收益，完整清仓记录会计入现金分红。";
+    ? "Sell and close records keep realized P/L with recorded fees, taxes, and applicable dividends."
+    : "卖出和清仓后会在这里保留已实现收益，并展示已记录的手续费、税费和适用分红。";
 
   if (!sorted.length) {
     return (
@@ -256,6 +256,13 @@ function ClosedHoldingsView({
       {visibleItems.map((item) => {
         const pnl = convertAmount(item.realizedPnl, item.currency, baseCurrency);
         const proceeds = convertAmount(item.proceeds, item.currency, baseCurrency);
+        const costBasis = convertAmount(item.costBasis, item.currency, baseCurrency);
+        const transactionFee = item.transactionFee == null
+          ? null
+          : convertAmount(item.transactionFee, item.currency, baseCurrency);
+        const transactionTax = item.transactionTax == null
+          ? null
+          : convertAmount(item.transactionTax, item.currency, baseCurrency);
         const color = profitColor(pnl);
         return (
           <div
@@ -308,6 +315,31 @@ function ClosedHoldingsView({
               </div>
             </div>
 
+            <div className="grid grid-cols-3 gap-2 mt-2 border-t pt-2" style={{ borderColor: "var(--border-sub)" }}>
+              <div>
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{language === "en" ? "Cost Basis" : "卖出成本"}</p>
+                <p className="truncate" style={{ color: "var(--text-secondary)", fontSize: 11, fontWeight: 700 }}>
+                  {privacyMode ? `${currencySymbol(baseCurrency)}***` : formatSummaryMoney(costBasis, baseCurrency)}
+                </p>
+              </div>
+              <div>
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{language === "en" ? "Fee" : "手续费"}</p>
+                <p className="truncate" title={transactionFee == null ? (language === "en" ? "Not recorded in legacy data" : "历史记录未保存") : undefined} style={{ color: "var(--text-secondary)", fontSize: 11, fontWeight: 700 }}>
+                  {transactionFee == null
+                    ? (language === "en" ? "Not recorded" : "未记录")
+                    : privacyMode ? `${currencySymbol(baseCurrency)}***` : formatSummaryMoney(transactionFee, baseCurrency)}
+                </p>
+              </div>
+              <div>
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{language === "en" ? "Tax" : "税费"}</p>
+                <p className="truncate" title={transactionTax == null ? (language === "en" ? "Not recorded in legacy data" : "历史记录未保存") : undefined} style={{ color: "var(--text-secondary)", fontSize: 11, fontWeight: 700 }}>
+                  {transactionTax == null
+                    ? (language === "en" ? "Not recorded" : "未记录")
+                    : privacyMode ? `${currencySymbol(baseCurrency)}***` : formatSummaryMoney(transactionTax, baseCurrency)}
+                </p>
+              </div>
+            </div>
+
             <div className="mt-3 rounded-xl px-3 py-2 flex items-center justify-between" style={{ background: `${color}12` }}>
               <span style={{ color: "var(--text-muted)", fontSize: 11 }}>
                 {language === "en" ? "Realized P/L" : "已实现收益"}
@@ -322,7 +354,7 @@ function ClosedHoldingsView({
               <span className="truncate" style={{ color, fontSize: 13, fontWeight: 800 }}>
                 {pnlSign(pnl)}{privacyMode ? `${currencySymbol(baseCurrency)}--` : formatSummaryMoney(pnl, baseCurrency)}
                 <span style={{ marginLeft: 6, fontSize: 11 }}>
-                  {privacyMode ? "--" : formatPercent(item.realizedReturn)}
+                  {formatPercent(item.realizedReturn)}
                 </span>
               </span>
             </div>
@@ -539,6 +571,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
     minimumFee: initial.transactionCostProfile?.minimumFee == null ? "" : String(initial.transactionCostProfile.minimumFee),
     buyTaxRate: ratePercentValue(initial.transactionCostProfile?.buyTaxRate),
     sellTaxRate: ratePercentValue(initial.transactionCostProfile?.sellTaxRate),
+    dividendTaxRate: ratePercentValue(initial.transactionCostProfile?.dividendTaxRate),
   }));
   const [saving, setSaving] = useState(false);
   const [securityQuery, setSecurityQuery] = useState(() =>
@@ -560,10 +593,11 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
     minimumFee: optionalNonNegative(costProfileDraft.minimumFee),
     buyTaxRate: optionalRateFromPercent(costProfileDraft.buyTaxRate),
     sellTaxRate: optionalRateFromPercent(costProfileDraft.sellTaxRate),
+    dividendTaxRate: optionalRateFromPercent(costProfileDraft.dividendTaxRate),
   });
   const validCostProfile = Object.values(costProfileDraft).every((value) => (
     !value.trim() || (Number.isFinite(Number(value)) && Number(value) >= 0)
-  )) && [costProfileDraft.buyFeeRate, costProfileDraft.sellFeeRate, costProfileDraft.buyTaxRate, costProfileDraft.sellTaxRate]
+  )) && [costProfileDraft.buyFeeRate, costProfileDraft.sellFeeRate, costProfileDraft.buyTaxRate, costProfileDraft.sellTaxRate, costProfileDraft.dividendTaxRate]
     .every((value) => !value.trim() || Number(value) <= 100);
   const valid = canSaveHoldingForm(form) && validCostProfile;
   const assetTypeSelectOptions = useMemo(() => [
@@ -782,6 +816,9 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
               </Field>
               <Field label={text.holdings.sellTaxRate}>
                 <Input type="number" step="0.01" min="0" max="100" value={costProfileDraft.sellTaxRate} onChange={(value) => setCostProfileDraft((draft) => ({ ...draft, sellTaxRate: value }))} placeholder="0" />
+              </Field>
+              <Field label={text.holdings.dividendTaxRate}>
+                <Input type="number" step="0.01" min="0" max="100" value={costProfileDraft.dividendTaxRate} onChange={(value) => setCostProfileDraft((draft) => ({ ...draft, dividendTaxRate: value }))} placeholder="0" />
               </Field>
             </div>
             <div className="mt-2">
@@ -1258,7 +1295,7 @@ function HoldingCard({
             {todayDividend > 0 && (
               <div className="mt-0.5">
                 <span style={{ color: "#31D08B", fontSize: 10, fontWeight: 600 }}>
-                  {language === "en" ? "Dividend" : "分红"} {fmtMoney(todayDividend)}
+                  {language === "en" ? "Dividend" : "分红"} {privacyMode ? `${currencySymbol(h.currency)}--` : fmtMoney(todayDividend)}
                 </span>
               </div>
             )}
@@ -1278,7 +1315,7 @@ function HoldingCard({
             </p>
             <p style={{ color: todayC, fontSize: 11, marginTop: 1 }}>
               {sign(h.todayPnl)}{privacyMode ? `${sym || h.currency}--` : todayPnlText}
-              &nbsp;<span style={{ fontSize: 10 }}>({privacyMode ? "--" : `${sign(h.todayPnlRate)}${(Number.isFinite(h.todayPnlRate) ? h.todayPnlRate * 100 : 0).toFixed(2)}%`})</span>
+              &nbsp;<span style={{ fontSize: 10 }}>({`${sign(h.todayPnlRate)}${(Number.isFinite(h.todayPnlRate) ? h.todayPnlRate * 100 : 0).toFixed(2)}%`})</span>
             </p>
             <p style={{ color: totalC, fontSize: 10, marginTop: 1 }}>
               {language === "en" ? "Total" : "累计"} {sign(totalRate)}{(totalRate * 100).toFixed(2)}%

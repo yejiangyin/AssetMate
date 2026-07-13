@@ -117,6 +117,49 @@ describe("runBacktest", () => {
     assertClose(result.points[3]?.shares ?? 0, 29.7 + 297 / 20 + 297 / 15);
   });
 
+  test("applies minimum fees and reports transaction totals", () => {
+    const result = runBacktest({ ...baseInput, feeRate: 0.001, minimumFee: 5 }, prices);
+
+    assert.equal(result.points[0]?.shares, 99.5);
+    assert.equal(result.totalFees, 5);
+    assert.equal(result.totalTaxes, 0);
+    assert.equal(result.tradeCount, 1);
+    assert.equal(result.actualStartDate, "2026-01-02");
+    assert.equal(result.actualEndDate, "2026-03-02");
+  });
+
+  test("deducts sell fees and taxes only when ending liquidation is enabled", () => {
+    const result = runBacktest({
+      ...baseInput,
+      feeRate: 0.001,
+      minimumFee: 5,
+      sellTaxRate: 0.01,
+      liquidateAtEnd: true,
+    }, prices);
+
+    assert.equal(result.liquidatedAtEnd, true);
+    assert.equal(result.tradeCount, 2);
+    assert.equal(result.totalFees, 10);
+    assertClose(result.totalTaxes, 14.925);
+    assertClose(result.finalValue, 1472.575);
+    assertClose(result.points.at(-1)?.value ?? 0, result.finalValue);
+  });
+
+  test("uses independent buy and sell fee and tax rates", () => {
+    const result = runBacktest({
+      ...baseInput,
+      feeRate: 0.001,
+      sellFeeRate: 0.002,
+      buyTaxRate: 0.003,
+      sellTaxRate: 0.004,
+      liquidateAtEnd: true,
+    }, [{ date: "2026-01-02", price: 10 }, { date: "2026-01-03", price: 10 }]);
+
+    assertClose(result.totalFees, 1 + 1.992);
+    assertClose(result.totalTaxes, 3 + 3.984);
+    assert.equal(result.tradeCount, 2);
+  });
+
   test("credits cash dividends to shares held before the ex-dividend date", () => {
     const result = runBacktest(baseInput, [
       { date: "2026-01-02", price: 10 },
@@ -164,6 +207,45 @@ describe("runBacktest", () => {
     assert.equal(result.totalReturn, 1);
   });
 
+  test("reinvests cash dividends without counting them as external capital", () => {
+    const reinvested = runBacktest({ ...baseInput, dividendMode: "reinvest" }, [
+      { date: "2026-01-02", price: 10 },
+      { date: "2026-01-05", price: 10, dividend: 1 },
+      { date: "2026-01-06", price: 11 },
+    ]);
+    const cash = runBacktest({ ...baseInput, dividendMode: "cash" }, [
+      { date: "2026-01-02", price: 10 },
+      { date: "2026-01-05", price: 10, dividend: 1 },
+      { date: "2026-01-06", price: 11 },
+    ]);
+
+    assert.equal(reinvested.totalInvested, 1000);
+    assert.equal(reinvested.totalDividends, 100);
+    assert.equal(reinvested.points[1]?.shares, 110);
+    assert.equal(reinvested.finalValue, 1210);
+    assert.equal(cash.finalValue, 1200);
+  });
+
+  test("deducts dividend tax before paying or reinvesting income", () => {
+    const result = runBacktest({ ...baseInput, dividendMode: "reinvest", dividendTaxRate: 0.2 }, [
+      { date: "2026-01-02", price: 10 },
+      { date: "2026-01-05", price: 10, dividend: 1 },
+    ]);
+
+    assert.equal(result.grossDividends, 100);
+    assert.equal(result.totalDividends, 80);
+    assert.equal(result.totalTaxes, 20);
+    assert.equal(result.points[1]?.shares, 108);
+    assert.equal(result.dividendDataStatus, "explicit");
+  });
+
+  test("rejects mixed adjusted and raw prices", () => {
+    assert.throws(() => runBacktest(baseInput, [
+      { date: "2026-01-02", price: 10, adjusted: true },
+      { date: "2026-01-03", price: 11 },
+    ]), /MIXED_PRICE_MODE/);
+  });
+
   test("applies split ratios before valuation and later buys", () => {
     const result = runBacktest(baseInput, [
       { date: "2026-01-02", price: 10 },
@@ -185,6 +267,47 @@ describe("runBacktest", () => {
 
     assert.equal(result.maxDrawdown, 0.25);
     assert.equal(result.marketMaxDrawdown, 0.25);
+  });
+
+  test("calculates DCA drawdown from a cash-flow-adjusted unit value", () => {
+    const result = runBacktest(
+      { ...baseInput, strategy: "daily_dca", initialAmount: 0, monthlyAmount: 100 },
+      [
+        { date: "2026-01-02", price: 10 },
+        { date: "2026-01-05", price: 5 },
+      ],
+    );
+
+    assert.equal(result.totalInvested, 200);
+    assertClose(result.maxDrawdown, 0.5);
+    assertClose(result.marketMaxDrawdown, 0.5);
+  });
+
+  test("reports the peak and trough dates for maximum drawdown", () => {
+    const result = runBacktest(baseInput, [
+      { date: "2026-01-02", price: 10 },
+      { date: "2026-01-05", price: 12 },
+      { date: "2026-01-06", price: 6 },
+      { date: "2026-01-07", price: 9 },
+    ]);
+
+    assert.equal(result.maxDrawdownStartDate, "2026-01-05");
+    assert.equal(result.maxDrawdownEndDate, "2026-01-06");
+    assertClose(result.maxDrawdown, 0.5);
+  });
+
+  test("aggregates cash-flow-adjusted monthly and yearly returns", () => {
+    const result = runBacktest(baseInput, [
+      { date: "2025-12-31", price: 10 },
+      { date: "2026-01-30", price: 11 },
+      { date: "2026-02-27", price: 12.1 },
+    ]);
+
+    assert.deepEqual(result.monthlyReturns.map((row) => row.key), ["2026-01", "2026-02"]);
+    assertClose(result.monthlyReturns[0]?.returnRate ?? 0, 0);
+    assertClose(result.monthlyReturns[1]?.returnRate ?? 0, 0.1);
+    assert.deepEqual(result.yearlyReturns.map((row) => row.key), ["2026"]);
+    assertClose(result.yearlyReturns[0]?.returnRate ?? 0, 0.1);
   });
 
   test("keeps market drawdown visible when cash dividends mask total drawdown", () => {

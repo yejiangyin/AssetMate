@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useLocation } from "react-router";
-import { LayoutDashboard, BarChart2, Settings, Globe, Calculator, TrendingUp } from "lucide-react";
+import { LayoutDashboard, BarChart2, Settings, Globe, Calculator, TrendingUp, AlertTriangle } from "lucide-react";
 import { AnimatePresence } from "motion/react";
 import { useEffect, useMemo, useRef } from "react";
 import type { CSSProperties } from "react";
@@ -22,7 +22,7 @@ const tabs = [
 
 /** Inner layout — can safely call useApp() because AppProvider is its parent */
 function LayoutInner() {
-  const { detailTarget, closeDetail, dcaPanelOpen, closeDCAPanel, tc, language } = useApp();
+  const { detailTarget, closeDetail, dcaPanelOpen, closeDCAPanel, tc, language, storageError } = useApp();
   const text = t(language);
   const location = useLocation();
   const previousPathRef = useRef(location.pathname);
@@ -68,6 +68,16 @@ function LayoutInner() {
       className="relative flex flex-col overflow-hidden"
       style={rootStyle}
     >
+      {storageError && (
+        <div
+          role="alert"
+          className="shrink-0 flex items-start gap-2 px-3 py-2 text-[11px] leading-4"
+          style={{ color: "#B45309", background: "#FFF7E6", borderBottom: "1px solid #F7C873" }}
+        >
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <span>{storageError}</span>
+        </div>
+      )}
       <div
         className="flex-1 min-h-0 overflow-hidden"
         style={{

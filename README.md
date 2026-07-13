@@ -55,7 +55,7 @@ Build the extension:
 pnpm run build:extension
 ```
 
-Build the Chrome Web Store package output with app bundle obfuscation:
+Build the Chrome Web Store package output with production minification:
 
 ```bash
 pnpm run build:store

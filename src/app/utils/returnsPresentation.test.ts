@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { PortfolioEvent } from "../services/portfolioEvents";
-import { breakdownBarWidth, formatCompactCny, hasMeaningfulReturnData, returnEventValue } from "./returnsPresentation";
+import { breakdownBarWidth, formatCalendarCny, formatCompactCny, hasMeaningfulReturnData, returnEventValue } from "./returnsPresentation";
 
 function event(type: PortfolioEvent["type"], amountInBase: number): PortfolioEvent {
   return {
@@ -17,11 +17,18 @@ function event(type: PortfolioEvent["type"], amountInBase: number): PortfolioEve
 }
 
 describe("returns presentation", () => {
-  test("uses one compact money scale for summaries and calendar cells", () => {
+  test("formatCompactCny always shows full amounts", () => {
     assert.equal(formatCompactCny(999.5, false, "zh-CN"), "+¥999.50");
-    assert.equal(formatCompactCny(5_000, false, "zh-CN"), "+¥5k");
-    assert.equal(formatCompactCny(-15_500, false, "zh-CN"), "-¥1.6万");
-    assert.equal(formatCompactCny(125_000_000, false, "zh-CN"), "+¥1.3亿");
+    assert.equal(formatCompactCny(5_000, false, "zh-CN"), "+¥5,000.00");
+    assert.equal(formatCompactCny(-15_500, false, "zh-CN"), "-¥15,500.00");
+    assert.equal(formatCompactCny(125_000_000, false, "zh-CN"), "+¥125,000,000.00");
+  });
+
+  test("formatCalendarCny abbreviates only large amounts for narrow cells", () => {
+    assert.equal(formatCalendarCny(999.5, false, "zh-CN"), "+¥999.5");
+    assert.equal(formatCalendarCny(5_000, false, "zh-CN"), "+¥5,000");
+    assert.equal(formatCalendarCny(-15_500, false, "zh-CN"), "-¥1.6万");
+    assert.equal(formatCalendarCny(125_000_000, false, "zh-CN"), "+¥1.3亿");
   });
 
   test("keeps bars visible when every source is negative", () => {

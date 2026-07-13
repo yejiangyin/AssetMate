@@ -53,9 +53,9 @@ function fmtPnl(v: number, priv: boolean, c: string) {
   return <span style={{ color: c, whiteSpace: "nowrap" }}>{priv ? `${sign}--` : `${sign}${formatExactMoney(Math.abs(v), "CNY", 2)}`}</span>;
 }
 
-function fmtRate(v: number, c: string, priv: boolean) {
+function fmtRate(v: number, c: string) {
   const formatted = formatPercent(v, 2);
-  return <span style={{ color: c, fontSize: 12 }}>{priv ? "--" : formatted}</span>;
+  return <span style={{ color: c, fontSize: 12 }}>{formatted}</span>;
 }
 
 
@@ -493,7 +493,7 @@ export function Dashboard() {
             <p className="truncate text-base font-bold tracking-tight" style={{ color: todayColor }}>
               {fmtPnl(stats.todayPnl, privacyMode, todayColor)}
             </p>
-            <div className="mt-0.5">{fmtRate(stats.todayPnlRate, todayColor, privacyMode)}</div>
+            <div className="mt-0.5">{fmtRate(stats.todayPnlRate, todayColor)}</div>
           </div>
         </div>
 
@@ -510,17 +510,17 @@ export function Dashboard() {
           <div className="min-w-0">
             <p className="text-tm text-[10px]">{text.dashboard.totalInvestmentPnl}</p>
             <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.totalInvestmentPnl, privacyMode, totalColor)}</p>
-            <div>{fmtRate(stats.totalInvestmentRate, totalColor, privacyMode)}</div>
+            <div>{fmtRate(stats.totalInvestmentRate, totalColor)}</div>
           </div>
           <div className="min-w-0">
             <p className="text-tm text-[10px]">{text.dashboard.totalPnl}</p>
             <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.unrealizedPnl, privacyMode, cumulColor)}</p>
-            <div>{fmtRate(stats.unrealizedRate, cumulColor, privacyMode)}</div>
+            <div>{fmtRate(stats.unrealizedRate, cumulColor)}</div>
           </div>
           <div className="min-w-0">
             <p className="text-tm text-[10px]">{text.dashboard.realizedPnl}</p>
             <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.realizedPnl, privacyMode, realizedColor)}</p>
-            <div>{fmtRate(stats.realizedRate, realizedColor, privacyMode)}</div>
+            <div>{fmtRate(stats.realizedRate, realizedColor)}</div>
           </div>
         </div>
 

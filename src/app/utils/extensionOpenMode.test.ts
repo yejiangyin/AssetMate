@@ -144,6 +144,67 @@ describe("extensionOpenMode", () => {
     }
   });
 
+  test("reports popup open failures instead of pretending the switch succeeded", async () => {
+    const previousChrome = (globalThis as { chrome?: unknown }).chrome;
+    const calls: string[] = [];
+    (globalThis as { chrome?: unknown }).chrome = {
+      runtime: {
+        id: "ext",
+        sendMessage: (message: unknown, callback: (response: { ok?: boolean; reason?: string } | undefined) => void) => {
+          calls.push(`message:${JSON.stringify(message)}`);
+          callback({ ok: false, reason: "open_failed" });
+        },
+      },
+      sidePanel: {
+        setPanelBehavior: async (options: { openPanelOnActionClick: boolean }) => {
+          calls.push(`behavior:${options.openPanelOnActionClick}`);
+        },
+      },
+      action: {
+        setPopup: async (options: { popup: string }) => {
+          calls.push(`popup:${options.popup}`);
+        },
+        openPopup: async () => {
+          calls.push("openPopup");
+          throw new Error("gesture required");
+        },
+      },
+    };
+
+    try {
+      assert.deepEqual(await openExtensionMode("popup"), { ok: false, reason: "open_failed" });
+      assert.deepEqual(calls, [
+        "behavior:false",
+        "popup:index.html",
+        "openPopup",
+        'message:{"type":"asset-helper:open-mode","mode":"popup"}',
+      ]);
+    } finally {
+      (globalThis as { chrome?: unknown }).chrome = previousChrome;
+    }
+  });
+
+  test("does not claim popup success when openPopup is unavailable", async () => {
+    const previousChrome = (globalThis as { chrome?: unknown }).chrome;
+    (globalThis as { chrome?: unknown }).chrome = {
+      runtime: {
+        id: "ext",
+        sendMessage: (_message: unknown, callback: (response: { ok?: boolean; reason?: string } | undefined) => void) => {
+          callback({ ok: false, reason: "open_popup_unavailable" });
+        },
+      },
+      action: {
+        setPopup: async () => undefined,
+      },
+    };
+
+    try {
+      assert.deepEqual(await openExtensionMode("popup"), { ok: false, reason: "open_popup_unavailable" });
+    } finally {
+      (globalThis as { chrome?: unknown }).chrome = previousChrome;
+    }
+  });
+
   test("falls back when runtime is unavailable", async () => {
     const previousChrome = (globalThis as { chrome?: unknown }).chrome;
     delete (globalThis as { chrome?: unknown }).chrome;

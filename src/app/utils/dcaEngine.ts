@@ -10,6 +10,7 @@ import { nextExecutionDate, isTradingDay, marketDate, effectiveDcaMarket, closur
 import { resolveHoldingTradeStatus } from "../utils/tradeStatus";
 import { normalizeHoldingType, normalizeHoldingSymbol, applyHoldingAdjustment, recomputeHoldingMetrics } from "./holdingHelpers";
 import { safeUUID } from "./safeId";
+import { affordableBuyAmount } from "./transactionCosts";
 
 const DCA_QUOTE_FRESHNESS_MS = 24 * 60 * 60 * 1000;
 
@@ -563,7 +564,8 @@ function settlePendingFundExecutions(
       }
     }
 
-    const quantity = execution.amount / confirmed.price;
+    const purchaseAmount = affordableBuyAmount(holding.transactionCostProfile, execution.amount);
+    const quantity = purchaseAmount / confirmed.price;
     if (!(quantity > 0)) {
       nextExecutions[i] = {
         ...execution,
