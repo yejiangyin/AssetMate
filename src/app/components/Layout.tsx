@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useLocation } from "react-router";
-import { LayoutDashboard, BarChart2, Settings, Globe, Calculator, TrendingUp } from "lucide-react";
+import { LayoutDashboard, BarChart2, Settings, Globe, Calculator, TrendingUp, AlertTriangle } from "lucide-react";
 import { AnimatePresence } from "motion/react";
 import { useEffect, useMemo, useRef } from "react";
 import type { CSSProperties } from "react";
@@ -20,20 +20,38 @@ const tabs = [
   { to: "/settings", key: "settings" as const, icon: Settings },
 ];
 
+export function extensionLayoutDimensions(isSidePanel: boolean): CSSProperties {
+  if (isSidePanel) {
+    return {
+      width: "100vw",
+      height: "100vh",
+      minWidth: 320,
+      minHeight: 0,
+      maxHeight: "100vh",
+    };
+  }
+  // Chrome derives a popup's initial viewport from its document content.
+  // Viewport-relative min() values create a circular dependency and can
+  // collapse a newly restored popup to a tiny square.
+  return {
+    width: 400,
+    height: 600,
+    minWidth: 400,
+    minHeight: 600,
+    maxHeight: 600,
+  };
+}
+
 /** Inner layout — can safely call useApp() because AppProvider is its parent */
 function LayoutInner() {
-  const { detailTarget, closeDetail, dcaPanelOpen, closeDCAPanel, tc, language } = useApp();
+  const { detailTarget, closeDetail, dcaPanelOpen, closeDCAPanel, tc, language, storageError } = useApp();
   const text = t(language);
   const location = useLocation();
   const previousPathRef = useRef(location.pathname);
   const accent = "var(--app-accent, #4F9CF9)";
   const isSidePanel = getExtensionViewMode() === "sidepanel";
   const rootStyle = useMemo(() => ({
-    width: isSidePanel ? "100vw" : "min(400px, 100vw)",
-    height: isSidePanel ? "100vh" : "min(600px, 100vh)",
-    minWidth: isSidePanel ? 320 : "min(320px, 100vw)",
-    minHeight: isSidePanel ? 0 : "min(480px, 100vh)",
-    maxHeight: "100vh",
+    ...extensionLayoutDimensions(isSidePanel),
     background: tc.bg,
     fontFamily: "'Inter', system-ui, sans-serif",
     "--bg": tc.bg,
@@ -68,6 +86,16 @@ function LayoutInner() {
       className="relative flex flex-col overflow-hidden"
       style={rootStyle}
     >
+      {storageError && (
+        <div
+          role="alert"
+          className="shrink-0 flex items-start gap-2 px-3 py-2 text-[11px] leading-4"
+          style={{ color: "#B45309", background: "#FFF7E6", borderBottom: "1px solid #F7C873" }}
+        >
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <span>{storageError}</span>
+        </div>
+      )}
       <div
         className="flex-1 min-h-0 overflow-hidden"
         style={{

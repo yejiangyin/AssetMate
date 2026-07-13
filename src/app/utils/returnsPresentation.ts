@@ -23,13 +23,16 @@ export function formatCompactCny(value: number, privacyMode: boolean, locale: st
   const sign = value > 0 ? "+" : value < 0 ? "-" : "";
   if (privacyMode) return `${sign}¥--`;
   const absolute = Math.abs(value);
-  const formatScaled = (scaled: number, unit: string) => (
-    `${sign}¥${scaled.toLocaleString(locale, { minimumFractionDigits: 0, maximumFractionDigits: 1 })}${unit}`
-  );
-  if (absolute >= 100_000_000) return formatScaled(absolute / 100_000_000, "亿");
-  if (absolute >= 10_000) return formatScaled(absolute / 10_000, "万");
-  if (absolute >= 1_000) return formatScaled(absolute / 1_000, "k");
   return `${sign}¥${absolute.toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+export function formatCalendarCny(value: number, privacyMode: boolean, locale: string) {
+  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
+  if (privacyMode) return "¥--";
+  const absolute = Math.abs(value);
+  if (absolute >= 100_000_000) return `${sign}¥${(absolute / 100_000_000).toLocaleString(locale, { maximumFractionDigits: 1 })}亿`;
+  if (absolute >= 10_000) return `${sign}¥${(absolute / 10_000).toLocaleString(locale, { maximumFractionDigits: 1 })}万`;
+  return `${sign}¥${absolute.toLocaleString(locale, { maximumFractionDigits: 2 })}`;
 }
 
 export function returnEventValue(event: PortfolioEvent) {

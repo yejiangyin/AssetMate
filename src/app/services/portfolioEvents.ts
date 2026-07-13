@@ -44,7 +44,15 @@ export interface PortfolioEvent {
 export interface ReturnBreakdown {
   realizedTradingPnl: number;
   dividendPnl: number;
+  transactionFeePnl: number;
+  taxPnl: number;
+  /** Aggregate of transactionFeePnl and taxPnl for snapshot compatibility. */
   feePnl: number;
+}
+
+export interface PortfolioEventBaseline {
+  daily: Record<string, ReturnBreakdown>;
+  realizedCostBasis: number;
 }
 
 export interface PortfolioSnapshotInput {
@@ -134,7 +142,40 @@ const DIVIDEND_EVENT_TYPES = new Set<PortfolioEventType>([
   "interest",
   "bond_coupon",
 ]);
-const MAX_PORTFOLIO_EVENTS = 5000;
+export const MAX_PORTFOLIO_EVENTS = 5000;
+
+export function emptyReturnBreakdown(): ReturnBreakdown {
+  return { realizedTradingPnl: 0, dividendPnl: 0, transactionFeePnl: 0, taxPnl: 0, feePnl: 0 };
+}
+
+export function normalizePortfolioEventBaseline(raw: unknown): PortfolioEventBaseline {
+  const candidate = raw && typeof raw === "object" ? raw as Partial<PortfolioEventBaseline> : {};
+  const daily: Record<string, ReturnBreakdown> = {};
+  if (candidate.daily && typeof candidate.daily === "object") {
+    for (const [date, value] of Object.entries(candidate.daily)) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !value || typeof value !== "object") continue;
+      const row = value as Partial<ReturnBreakdown>;
+      daily[date] = {
+        realizedTradingPnl: finiteNumber(row.realizedTradingPnl),
+        dividendPnl: finiteNumber(row.dividendPnl),
+        transactionFeePnl: finiteNumber(row.transactionFeePnl),
+        taxPnl: finiteNumber(row.taxPnl),
+        feePnl: finiteNumber(row.feePnl),
+      };
+    }
+  }
+  return { daily, realizedCostBasis: Math.max(0, finiteNumber(candidate.realizedCostBasis)) };
+}
+
+export function mergeReturnBreakdowns(a: ReturnBreakdown, b: ReturnBreakdown): ReturnBreakdown {
+  return {
+    realizedTradingPnl: a.realizedTradingPnl + b.realizedTradingPnl,
+    dividendPnl: a.dividendPnl + b.dividendPnl,
+    transactionFeePnl: a.transactionFeePnl + b.transactionFeePnl,
+    taxPnl: a.taxPnl + b.taxPnl,
+    feePnl: a.feePnl + b.feePnl,
+  };
+}
 
 function finiteNumber(value: unknown, fallback = 0) {
   const parsed = Number(value);
@@ -168,6 +209,33 @@ export function dedupePortfolioEvents(events: PortfolioEvent[]) {
 
 export function prunePortfolioEvents(events: PortfolioEvent[], maxEvents = MAX_PORTFOLIO_EVENTS) {
   return dedupePortfolioEvents(events).slice(-maxEvents);
+}
+
+export function compactPortfolioEventHistory(
+  events: PortfolioEvent[],
+  existingBaseline: PortfolioEventBaseline,
+  maxEvents = MAX_PORTFOLIO_EVENTS,
+) {
+  const sorted = dedupePortfolioEvents(events);
+  const removed = sorted.slice(0, Math.max(0, sorted.length - maxEvents));
+  const baseline = normalizePortfolioEventBaseline(existingBaseline);
+  for (const event of removed) {
+    baseline.daily[event.date] = mergeReturnBreakdowns(
+      baseline.daily[event.date] ?? emptyReturnBreakdown(),
+      computeReturnBreakdown([event]),
+    );
+    if (event.type === "sell") {
+      baseline.realizedCostBasis += amountInBase(event.costBasisAtEvent ?? 0, event.currency);
+    }
+  }
+  return { events: sorted.slice(-maxEvents), baseline };
+}
+
+export function computeBaselineBreakdown(baseline?: PortfolioEventBaseline) {
+  return Object.values(baseline?.daily ?? {}).reduce(
+    (sum, row) => mergeReturnBreakdowns(sum, row),
+    emptyReturnBreakdown(),
+  );
 }
 
 export function normalizePortfolioEvent(raw: Partial<PortfolioEvent> & Record<string, unknown>): PortfolioEvent | null {
@@ -417,6 +485,7 @@ export function migratePortfolioEvents(
       .filter((event) => event.holdingId && event.corporateActionId)
       .map((event) => `${event.holdingId}:${event.corporateActionId}`),
   );
+  const claimedSellEventIds = new Set<string>();
 
   for (const holding of holdings) {
     for (const action of holding.corporateActions ?? []) {
@@ -451,27 +520,45 @@ export function migratePortfolioEvents(
 
   for (const closed of closedHoldings) {
     const date = ymdFromEventValue(closed.closedAt);
+    for (const event of eventMap.values()) {
+      if (event.id.startsWith("migration:closed") && event.id.includes(`:${closed.id}`)) {
+        eventMap.set(event.id, { ...event, relatedEventId: closed.id });
+      }
+    }
     const sellAmount = finiteNumber(closed.proceeds) - finiteNumber(closed.costBasis);
-    const sellEvent: PortfolioEvent = {
-      id: `migration:closed:${closed.id}`,
-      date,
-      holdingId: closed.sourceHoldingId,
-      symbol: closed.symbol,
-      name: closed.name,
-      market: closed.market,
-      assetType: closed.assetType,
-      type: "sell",
-      quantity: closed.quantity,
-      price: closed.closePrice,
-      amount: sellAmount,
-      amountInBase: amountInBase(sellAmount, closed.currency),
-      currency: closed.currency,
-      source: "migration",
-      costBasisAtEvent: closed.costBasis,
-      proceeds: closed.proceeds,
-      createdAt: `${date}T00:00:00.000Z`,
-    };
+    const matchingSell = [...eventMap.values()].find((event) => (
+      event.type === "sell"
+      && !claimedSellEventIds.has(event.id)
+      && event.holdingId === closed.sourceHoldingId
+      && event.date === date
+      && Math.abs(finiteNumber(event.quantity) - finiteNumber(closed.quantity)) < 1e-8
+      && Math.abs(finiteNumber(event.price) - finiteNumber(closed.closePrice)) < 1e-8
+      && (!event.relatedEventId || event.relatedEventId === closed.id)
+    ));
+    const sellEvent: PortfolioEvent = matchingSell
+      ? { ...matchingSell, relatedEventId: closed.id }
+      : {
+        id: `migration:closed:${closed.id}`,
+        date,
+        holdingId: closed.sourceHoldingId,
+        symbol: closed.symbol,
+        name: closed.name,
+        market: closed.market,
+        assetType: closed.assetType,
+        type: "sell",
+        quantity: closed.quantity,
+        price: closed.closePrice,
+        amount: sellAmount,
+        amountInBase: amountInBase(sellAmount, closed.currency),
+        currency: closed.currency,
+        source: "migration",
+        relatedEventId: closed.id,
+        costBasisAtEvent: closed.costBasis,
+        proceeds: closed.proceeds,
+        createdAt: `${date}T00:00:00.000Z`,
+      };
     eventMap.set(sellEvent.id, sellEvent);
+    claimedSellEventIds.add(sellEvent.id);
     const dividendEventTotal = [...eventMap.values()]
       .reduce((sum, event) => sum + Math.max(0, dividendEventAmountForClosed(event, closed)), 0);
     const missingDividend = Math.max(0, finiteNumber(closed.cashDividendTotal) - dividendEventTotal);
@@ -489,6 +576,7 @@ export function migratePortfolioEvents(
         amountInBase: amountInBase(missingDividend, closed.currency),
         currency: closed.currency,
         source: "migration",
+        relatedEventId: closed.id,
         note: "migrated closed holding cashDividendTotal summary",
         createdAt: `${date}T00:00:00.000Z`,
       };
@@ -499,26 +587,55 @@ export function migratePortfolioEvents(
         && event.holdingId === closed.sourceHoldingId
         && event.date === date,
     );
-    if (!hasExistingFees && finiteNumber(closed.realizedPnl) < sellAmount) {
-      const inferredFee = Math.max(0, sellAmount + missingDividend - finiteNumber(closed.realizedPnl));
-      if (inferredFee > 0) {
+    if (!hasExistingFees) {
+      const explicitCosts = [
+        { type: "fee" as const, amount: Math.max(0, finiteNumber(closed.transactionFee)), note: "migrated recorded transaction fee" },
+        { type: "tax" as const, amount: Math.max(0, finiteNumber(closed.transactionTax)), note: "migrated recorded transaction tax" },
+      ];
+      for (const cost of explicitCosts) {
+        if (!(cost.amount > 0)) continue;
         const event: PortfolioEvent = {
-          id: `migration:closed-fee:${closed.id}:${date}`,
+          id: `migration:closed-${cost.type}:${closed.id}:${date}`,
           date,
           holdingId: closed.sourceHoldingId,
           symbol: closed.symbol,
           name: closed.name,
           market: closed.market,
           assetType: closed.assetType,
-          type: "fee",
-          amount: -inferredFee,
-          amountInBase: amountInBase(-inferredFee, closed.currency),
+          type: cost.type,
+          amount: -cost.amount,
+          amountInBase: amountInBase(-cost.amount, closed.currency),
           currency: closed.currency,
           source: "migration",
-          note: "inferred transaction cost from closed holding realizedPnl",
+          relatedEventId: closed.id,
+          note: cost.note,
           createdAt: `${date}T00:00:00.000Z`,
         };
         eventMap.set(event.id, event);
+      }
+      const hasExplicitCosts = explicitCosts.some((cost) => cost.amount > 0);
+      if (!hasExplicitCosts && finiteNumber(closed.realizedPnl) < sellAmount) {
+        const inferredFee = Math.max(0, sellAmount + missingDividend - finiteNumber(closed.realizedPnl));
+        if (inferredFee > 0) {
+          const event: PortfolioEvent = {
+            id: `migration:closed-fee:${closed.id}:${date}`,
+            date,
+            holdingId: closed.sourceHoldingId,
+            symbol: closed.symbol,
+            name: closed.name,
+            market: closed.market,
+            assetType: closed.assetType,
+            type: "fee",
+            amount: -inferredFee,
+            amountInBase: amountInBase(-inferredFee, closed.currency),
+            currency: closed.currency,
+            source: "migration",
+            relatedEventId: closed.id,
+            note: "inferred aggregate transaction cost from legacy closed holding",
+            createdAt: `${date}T00:00:00.000Z`,
+          };
+          eventMap.set(event.id, event);
+        }
       }
     }
   }
@@ -552,7 +669,7 @@ export function migratePortfolioEvents(
     eventMap.set(event.id, event);
   }
 
-  return prunePortfolioEvents([...eventMap.values()]);
+  return dedupePortfolioEvents([...eventMap.values()]);
 }
 
 export function computeReturnBreakdown(events: PortfolioEvent[]): ReturnBreakdown {
@@ -561,26 +678,38 @@ export function computeReturnBreakdown(events: PortfolioEvent[]): ReturnBreakdow
     if (event.type === "cash_dividend" || event.type === "dividend_reinvest" || event.type === "interest" || event.type === "bond_coupon") {
       acc.dividendPnl += event.amountInBase;
     }
-    if (event.type === "fee" || event.type === "tax") acc.feePnl += event.amountInBase;
+    if (event.type === "fee") {
+      acc.transactionFeePnl += event.amountInBase;
+      acc.feePnl += event.amountInBase;
+    }
+    if (event.type === "tax") {
+      acc.taxPnl += event.amountInBase;
+      acc.feePnl += event.amountInBase;
+    }
     return acc;
-  }, { realizedTradingPnl: 0, dividendPnl: 0, feePnl: 0 });
+  }, { realizedTradingPnl: 0, dividendPnl: 0, transactionFeePnl: 0, taxPnl: 0, feePnl: 0 });
 }
 
-function aggregateEventsByDate(events: PortfolioEvent[]) {
+function aggregateEventsByDate(events: PortfolioEvent[], baseline?: PortfolioEventBaseline) {
   const map = new Map<string, ReturnBreakdown>();
+  for (const [date, row] of Object.entries(baseline?.daily ?? {})) {
+    map.set(date, { ...row });
+  }
   for (const event of events) {
-    const bucket = map.get(event.date) ?? { realizedTradingPnl: 0, dividendPnl: 0, feePnl: 0 };
+    const bucket = map.get(event.date) ?? { realizedTradingPnl: 0, dividendPnl: 0, transactionFeePnl: 0, taxPnl: 0, feePnl: 0 };
     const single = computeReturnBreakdown([event]);
     bucket.realizedTradingPnl += single.realizedTradingPnl;
     bucket.dividendPnl += single.dividendPnl;
+    bucket.transactionFeePnl += single.transactionFeePnl;
+    bucket.taxPnl += single.taxPnl;
     bucket.feePnl += single.feePnl;
     map.set(event.date, bucket);
   }
   return map;
 }
 
-export function getDailyReturns(events: PortfolioEvent[], snapshots: PortfolioSnapshotInput[]): DailyReturn[] {
-  const eventByDate = aggregateEventsByDate(events);
+export function getDailyReturns(events: PortfolioEvent[], snapshots: PortfolioSnapshotInput[], baseline?: PortfolioEventBaseline): DailyReturn[] {
+  const eventByDate = aggregateEventsByDate(events, baseline);
   const snapshotByDate = new Map<string, PortfolioSnapshotInput>();
   for (const snapshot of snapshots) {
     if (snapshot.date && Number.isFinite(snapshot.totalAsset)) {
@@ -613,12 +742,12 @@ export function getDailyReturns(events: PortfolioEvent[], snapshots: PortfolioSn
     const currentUnrealized = hasBreakdown ? snapshot!.unrealizedPnl! : undefined;
     const isInitialBaseline = hasBreakdown && lastUnrealizedPnl === undefined;
     const unrealizedPnlChange = hasBreakdown
-      ? currentUnrealized! - (lastUnrealizedPnl ?? 0)
+      ? isInitialBaseline ? 0 : currentUnrealized! - lastUnrealizedPnl!
       : 0;
     if (hasBreakdown) {
       lastUnrealizedPnl = currentUnrealized;
     }
-    const eventBreakdown = eventByDate.get(date) ?? { realizedTradingPnl: 0, dividendPnl: 0, feePnl: 0 };
+    const eventBreakdown = eventByDate.get(date) ?? { realizedTradingPnl: 0, dividendPnl: 0, transactionFeePnl: 0, taxPnl: 0, feePnl: 0 };
     const totalPnl = unrealizedPnlChange + eventBreakdown.realizedTradingPnl + eventBreakdown.dividendPnl + eventBreakdown.feePnl;
     rows.push({
       date,
@@ -716,6 +845,8 @@ export function getHoldingReturnContributions(
       unrealizedPnlChange: 0,
       realizedTradingPnl: 0,
       dividendPnl: 0,
+      transactionFeePnl: 0,
+      taxPnl: 0,
       feePnl: 0,
       totalPnl: 0,
       incompleteBreakdown: incompleteBreakdown || undefined,
@@ -739,6 +870,8 @@ export function getHoldingReturnContributions(
     const breakdown = computeReturnBreakdown([event]);
     current.realizedTradingPnl += breakdown.realizedTradingPnl;
     current.dividendPnl += breakdown.dividendPnl;
+    current.transactionFeePnl += breakdown.transactionFeePnl;
+    current.taxPnl += breakdown.taxPnl;
     current.feePnl += breakdown.feePnl;
   }
 

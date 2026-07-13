@@ -6,21 +6,25 @@ import type { ChartPoint } from "../services/quoteApi";
 import { fetchCorporateActions, type CorporateActionEvent } from "../services/corporateActions";
 import {
   PortfolioEvent,
+  PortfolioEventBaseline,
   PortfolioEventSource,
   amountInBase,
   buildBuyEvent,
   buildPortfolioEventFromCorporateAction,
   buildSellEvent,
+  compactPortfolioEventHistory,
+  computeBaselineBreakdown,
   computeReturnBreakdown,
+  dedupePortfolioEvents,
   migratePortfolioEvents,
   normalizePortfolioEvents,
-  prunePortfolioEvents,
+  normalizePortfolioEventBaseline,
   ymdFromEventValue,
 } from "../services/portfolioEvents";
 import { normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction } from "../utils/holdingHelpers";
 import { dedupeDCAExecutions, hydratePlans, repairDCAData, settleDueDCAPlans, syncPlanWithHolding, computeNextExec } from "../utils/dcaEngine";
 import { safeUUID } from "../utils/safeId";
-import { DEFAULT_OPEN_MODE, normalizeOpenMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
+import { consumeSnapshotDueDates, DEFAULT_OPEN_MODE, getConfiguredExtensionOpenMode, normalizeOpenMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
 import { estimateTransactionCosts, mergeTransactionCostProfile } from "../utils/transactionCosts";
 
 /* ─── types ──────────────────────────────────────────── */
@@ -288,7 +292,12 @@ function buildThemeColors(theme: Theme): ThemeColors {
 const initialDCAPlans: DCAPlan[] = [];
 
 /* ─── PortfolioStats ─────────────────────────────────── */
-export function computeStats(holdings: Holding[], closedHoldings: ClosedHolding[] = [], portfolioEvents: PortfolioEvent[] = []): PortfolioStats {
+export function computeStats(
+  holdings: Holding[],
+  closedHoldings: ClosedHolding[] = [],
+  portfolioEvents: PortfolioEvent[] = [],
+  portfolioEventBaseline: PortfolioEventBaseline = { daily: {}, realizedCostBasis: 0 },
+): PortfolioStats {
   const totalMV    = holdings.reduce((s, h) => s + toCNY(h.quantity * h.currentPrice, h.currency), 0);
   const todayPnl   = holdings.reduce((s, h) => s + toCNY(h.todayPnl,    h.currency), 0);
   const unrealizedPnl = holdings.reduce((s, h) => s + toCNY(
@@ -297,22 +306,26 @@ export function computeStats(holdings: Holding[], closedHoldings: ClosedHolding[
   ), 0);
   const costBasis  = holdings.reduce((s, h) => s + toCNY(h.quantity * h.costPrice, h.currency), 0);
   const eventBreakdown = computeReturnBreakdown(portfolioEvents);
-  const fallbackClosedPnl = portfolioEvents.length > 0
+  const baselineBreakdown = computeBaselineBreakdown(portfolioEventBaseline);
+  const hasEventHistory = portfolioEvents.length > 0 || Object.keys(portfolioEventBaseline.daily).length > 0;
+  const fallbackClosedPnl = hasEventHistory
     ? 0
     : closedHoldings.reduce((s, h) => s + toCNY(h.realizedPnl - (h.cashDividendTotal ?? 0), h.currency), 0);
-  const fallbackClosedDividend = portfolioEvents.length > 0
+  const fallbackClosedDividend = hasEventHistory
     ? 0
     : closedHoldings.reduce((s, h) => s + toCNY(h.cashDividendTotal ?? 0, h.currency), 0);
-  const realizedTradingPnl = eventBreakdown.realizedTradingPnl + fallbackClosedPnl;
-  const dividendPnl = eventBreakdown.dividendPnl + fallbackClosedDividend;
-  const feePnl = eventBreakdown.feePnl;
+  const realizedTradingPnl = baselineBreakdown.realizedTradingPnl + eventBreakdown.realizedTradingPnl + fallbackClosedPnl;
+  const dividendPnl = baselineBreakdown.dividendPnl + eventBreakdown.dividendPnl + fallbackClosedDividend;
+  const feePnl = baselineBreakdown.feePnl + eventBreakdown.feePnl;
   const realizedPnl = realizedTradingPnl + dividendPnl + feePnl;
   const realizedCostBasis = closedHoldings.reduce((s, h) => s + toCNY(h.costBasis, h.currency), 0);
   const eventRealizedCostBasis = portfolioEvents.reduce((sum, event) => {
     if (event.type !== "sell") return sum;
     return sum + toCNY(event.costBasisAtEvent ?? 0, event.currency);
   }, 0);
-  const realizedRateCostBasis = eventRealizedCostBasis > 0 ? eventRealizedCostBasis : realizedCostBasis;
+  const realizedRateCostBasis = portfolioEventBaseline.realizedCostBasis + eventRealizedCostBasis > 0
+    ? portfolioEventBaseline.realizedCostBasis + eventRealizedCostBasis
+    : realizedCostBasis;
   const totalInvestmentPnl = unrealizedPnl + realizedPnl;
   const totalInvestmentCostBasis = costBasis + realizedCostBasis;
   const prevMV     = totalMV - todayPnl;
@@ -358,10 +371,12 @@ interface AppState {
   lastRefreshed:   string;
   lastRefreshAt:   number;
   lastRefreshError: string;
+  storageError:     string;
   detailTarget:    DetailTarget | null;
   dcaPlans:        DCAPlan[];
   dcaExecutions:   DCAExecution[];
   portfolioEvents: PortfolioEvent[];
+  portfolioEventBaseline: PortfolioEventBaseline;
   assetSnapshots:  PortfolioSnapshot[];
   dcaPanelOpen:    boolean;
   dcaPanelHoldingId: string | null;
@@ -408,6 +423,7 @@ interface AppContextType extends AppState {
 const AppContext = createContext<AppContextType | null>(null);
 
 const STORAGE_KEY = "asset-helper:v2";
+const SAVED_BACKTESTS_KEY = "asset-helper:saved-backtests:v1";
 const STORAGE_VERSION = 3;
 const REFRESH_META_KEY = "asset-helper:portfolio-refresh-meta:v1";
 const REFRESH_RECENT_TTL = 45_000;
@@ -456,6 +472,7 @@ type PersistedState = Partial<Pick<
   | "dcaPlans"
   | "dcaExecutions"
   | "portfolioEvents"
+  | "portfolioEventBaseline"
   | "assetSnapshots"
 >> & { version?: number };
 
@@ -472,6 +489,12 @@ function positiveNumber(value: unknown, fallback = 0) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function optionalNonNegativeNumber(value: unknown) {
+  if (value == null || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
 function normalizeClosedHolding(raw: Partial<ClosedHolding> & Record<string, unknown>): ClosedHolding | null {
   if (!raw || typeof raw.symbol !== "string" || typeof raw.name !== "string") return null;
   const quantity = positiveNumber(raw.quantity);
@@ -480,6 +503,8 @@ function normalizeClosedHolding(raw: Partial<ClosedHolding> & Record<string, unk
   const costBasis = positiveNumber(raw.costBasis, quantity * costPrice);
   const proceeds = positiveNumber(raw.proceeds, quantity * closePrice);
   const cashDividendTotal = positiveNumber(raw.cashDividendTotal);
+  const transactionFee = optionalNonNegativeNumber(raw.transactionFee);
+  const transactionTax = optionalNonNegativeNumber(raw.transactionTax);
   const realizedPnl = positiveNumber(raw.realizedPnl, proceeds + cashDividendTotal - costBasis);
   const closedAt = typeof raw.closedAt === "string" && raw.closedAt ? raw.closedAt : todayLocalYMD();
   return {
@@ -495,6 +520,8 @@ function normalizeClosedHolding(raw: Partial<ClosedHolding> & Record<string, unk
     closePrice,
     costBasis,
     proceeds,
+    transactionFee,
+    transactionTax,
     realizedPnl,
     realizedReturn: costBasis > 0 ? realizedPnl / costBasis : positiveNumber(raw.realizedReturn),
     cashDividendTotal,
@@ -523,7 +550,7 @@ export function buildClosedHolding(
   closePrice = holding.currentPrice,
   closedAt = todayLocalYMD(),
   closedQuantity?: number,
-  transactionCosts = 0,
+  transactionCosts: number | { fee?: number; tax?: number } = 0,
 ): ClosedHolding {
   const totalQuantity = Number.isFinite(holding.quantity) ? holding.quantity : 0;
   // For partial closes, only the sold quantity is recorded; for full closes
@@ -537,7 +564,13 @@ export function buildClosedHolding(
   const proceeds = quantity * safeClosePrice;
   const isPartial = quantity < totalQuantity;
   const cashDividendTotal = isPartial ? 0 : (holding.cashDividendTotal ?? 0);
-  const safeTransactionCosts = Number.isFinite(transactionCosts) ? Math.max(0, transactionCosts) : 0;
+  const transactionFee = typeof transactionCosts === "number"
+    ? (Number.isFinite(transactionCosts) ? Math.max(0, transactionCosts) : 0)
+    : (Number.isFinite(transactionCosts.fee) ? Math.max(0, transactionCosts.fee ?? 0) : 0);
+  const transactionTax = typeof transactionCosts === "number"
+    ? 0
+    : (Number.isFinite(transactionCosts.tax) ? Math.max(0, transactionCosts.tax ?? 0) : 0);
+  const safeTransactionCosts = transactionFee + transactionTax;
   const realizedPnl = proceeds - costBasis - safeTransactionCosts + cashDividendTotal;
   return {
     id: `closed_${safeUUID()}`,
@@ -552,6 +585,8 @@ export function buildClosedHolding(
     closePrice: safeClosePrice,
     costBasis,
     proceeds,
+    transactionFee,
+    transactionTax,
     realizedPnl,
     realizedReturn: costBasis > 0 ? realizedPnl / costBasis : 0,
     cashDividendTotal,
@@ -574,8 +609,14 @@ function todayShanghaiYMD(date = new Date()) {
   return `${pick("year")}-${pick("month")}-${pick("day")}`;
 }
 
-function upsertPortfolioSnapshot(snapshots: PortfolioSnapshot[], holdings: Holding[], portfolioEvents: PortfolioEvent[] = [], date = new Date()) {
-  const stats = computeStats(holdings, [], portfolioEvents);
+function upsertPortfolioSnapshot(
+  snapshots: PortfolioSnapshot[],
+  holdings: Holding[],
+  portfolioEvents: PortfolioEvent[] = [],
+  date = new Date(),
+  portfolioEventBaseline: PortfolioEventBaseline = { daily: {}, realizedCostBasis: 0 },
+) {
+  const stats = computeStats(holdings, [], portfolioEvents, portfolioEventBaseline);
   const today = todayLocalYMD(date);
   const existingToday = snapshots.find((snapshot) => snapshot.date === today);
   const hasBreakdownHistory = snapshots.some((snapshot) => Number.isFinite(snapshot.unrealizedPnl));
@@ -693,7 +734,7 @@ function appendDCAExecutionEvents(
     existingExecutionIds.add(execution.id);
     changed = true;
   }
-  return changed ? prunePortfolioEvents(nextEvents) : events;
+  return changed ? dedupePortfolioEvents(nextEvents) : events;
 }
 
 function hasFundNavRefreshWindow(holdings: Holding[], now = new Date()) {
@@ -806,6 +847,9 @@ export function applyAutomaticCorporateActions(
       if (action.type === "cash_dividend" && action.amount && action.amount > 0) {
         const totalAmount = action.amount * next.quantity;
         if (!(totalAmount > 0)) continue;
+        const dividendTaxRate = Math.min(1, Math.max(0, next.transactionCostProfile?.dividendTaxRate ?? 0));
+        const dividendTax = totalAmount * dividendTaxRate;
+        const netDividend = totalAmount - dividendTax;
         const shouldReinvest = canAutoReinvestDividend(next) && (next.dividendReinvest ?? dividendReinvest);
         if (shouldReinvest) {
           const reinvestPrice = resolveFundDividendReinvestPrice(next, action);
@@ -815,7 +859,7 @@ export function applyAutomaticCorporateActions(
             type: "dividend_reinvest",
             date: postingDate,
             amount: totalAmount,
-            shares: totalAmount / reinvestPrice,
+            shares: netDividend / reinvestPrice,
             price: reinvestPrice,
             recordDate: action.recordDate,
             exDate: action.exDate,
@@ -848,6 +892,26 @@ export function applyAutomaticCorporateActions(
           const event = latestAction ? buildPortfolioEventFromCorporateAction(next, latestAction, "auto") : null;
           if (event) portfolioEvents.push(event);
         }
+        if (dividendTax > 0) {
+          portfolioEvents.push({
+            id: `auto:dividend-tax:${action.id}:${postingDate}`,
+            date: postingDate,
+            holdingId: next.id,
+            symbol: next.symbol,
+            name: next.name,
+            market: next.market,
+            assetType: next.assetType,
+            type: "tax",
+            amount: -dividendTax,
+            amountInBase: amountInBase(-dividendTax, next.currency),
+            currency: next.currency,
+            source: "auto",
+            corporateActionId: action.id,
+            rateUsed: dividendTaxRate,
+            note: "automatic dividend withholding tax",
+            createdAt: `${postingDate}T00:00:00.000Z`,
+          });
+        }
         changed = true;
       }
     }
@@ -876,10 +940,12 @@ function defaultState(): AppState {
     lastRefreshed:   "—",
     lastRefreshAt:   0,
     lastRefreshError: "",
+    storageError:     "",
     detailTarget:    null,
     dcaPlans:        hydratePlans(initialDCAPlans),
     dcaExecutions:   [],
     portfolioEvents: [],
+    portfolioEventBaseline: { daily: {}, realizedCostBasis: 0 },
     assetSnapshots:  [],
     dcaPanelOpen:    false,
     dcaPanelHoldingId: null,
@@ -903,6 +969,7 @@ function blankState(current: AppState): AppState {
     dcaPlans:        [],
     dcaExecutions:   [],
     portfolioEvents: [],
+    portfolioEventBaseline: { daily: {}, realizedCostBasis: 0 },
     assetSnapshots:  [],
     // Preserve user's UI preferences instead of resetting them to defaults.
     colorScheme:     current.colorScheme,
@@ -919,6 +986,7 @@ function blankState(current: AppState): AppState {
 }
 
 function buildPersistedState(state: AppState): PersistedState {
+  const history = compactPortfolioEventHistory(state.portfolioEvents, state.portfolioEventBaseline);
   return {
     version: STORAGE_VERSION,
     groups: state.groups,
@@ -935,7 +1003,8 @@ function buildPersistedState(state: AppState): PersistedState {
     defaultOpenMode: state.defaultOpenMode,
     dcaPlans: state.dcaPlans,
     dcaExecutions: pruneDCAExecutions(state.dcaExecutions),
-    portfolioEvents: prunePortfolioEvents(state.portfolioEvents),
+    portfolioEvents: history.events,
+    portfolioEventBaseline: history.baseline,
     assetSnapshots: prunePortfolioSnapshots(state.assetSnapshots),
   };
 }
@@ -943,10 +1012,15 @@ function buildPersistedState(state: AppState): PersistedState {
 function compactPersistedStateForStorage(snapshot: PersistedState): PersistedState {
   const snapshots = prunePortfolioSnapshots(snapshot.assetSnapshots ?? []);
   const detailedStart = Math.max(0, snapshots.length - COMPACT_PORTFOLIO_SNAPSHOTS);
+  const history = compactPortfolioEventHistory(
+    snapshot.portfolioEvents ?? [],
+    normalizePortfolioEventBaseline(snapshot.portfolioEventBaseline),
+  );
   return {
     ...snapshot,
     dcaExecutions: pruneDCAExecutions(snapshot.dcaExecutions ?? []),
-    portfolioEvents: prunePortfolioEvents(snapshot.portfolioEvents ?? []),
+    portfolioEvents: history.events,
+    portfolioEventBaseline: history.baseline,
     assetSnapshots: snapshots.map((item, index) => (
       index >= detailedStart ? item : { ...item, holdingUnrealizedPnl: undefined }
     )),
@@ -962,6 +1036,16 @@ function clearNonCriticalStorage() {
     } catch {
       // Best effort only; these caches can be rebuilt.
     }
+  }
+}
+
+function readSavedBacktestsForBackup() {
+  if (typeof window === "undefined") return [];
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(SAVED_BACKTESTS_KEY) ?? "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
 }
 
@@ -1056,7 +1140,11 @@ export function loadInitialState(): AppState {
     const dcaPlans = repaired.plans.length > 0 ? hydratePlans(repaired.plans, dcaExecutions) : base.dcaPlans;
     const finalHoldings = repaired.changed ? repaired.holdings : holdings;
     const existingEvents = normalizePortfolioEvents(saved.portfolioEvents);
-    const portfolioEvents = migratePortfolioEvents(finalHoldings, closedHoldings, dcaExecutions, existingEvents);
+    const portfolioEventBaseline = normalizePortfolioEventBaseline(saved.portfolioEventBaseline);
+    const hasArchivedEvents = Object.keys(portfolioEventBaseline.daily).length > 0;
+    const portfolioEvents = hasArchivedEvents
+      ? existingEvents
+      : migratePortfolioEvents(finalHoldings, closedHoldings, dcaExecutions, existingEvents);
     const assetSnapshots = Array.isArray(saved.assetSnapshots)
       ? saved.assetSnapshots
           .filter((snapshot) => (
@@ -1096,6 +1184,7 @@ export function loadInitialState(): AppState {
       dcaPlans,
       dcaExecutions,
       portfolioEvents,
+      portfolioEventBaseline,
       assetSnapshots,
       colorScheme: enumOr(saved.colorScheme, COLOR_SCHEMES, base.colorScheme),
       theme: enumOr(saved.theme, THEMES, base.theme),
@@ -1136,43 +1225,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   /* theme colors — recomputed when theme changes */
   const tc = useMemo(() => buildThemeColors(state.theme), [state.theme]);
-  const stats = useMemo(() => computeStats(state.holdings, state.closedHoldings, state.portfolioEvents), [state.holdings, state.closedHoldings, state.portfolioEvents]);
-  const persistedSnapshot = useMemo<PersistedState>(() => ({
-    version: STORAGE_VERSION,
-    groups: state.groups,
-    holdings: state.holdings,
-    closedHoldings: state.closedHoldings,
-    defaultPrivacyMode: state.defaultPrivacyMode,
-    colorScheme: state.colorScheme,
-    theme: state.theme,
-    currency: state.currency,
-    language: state.language,
-    refreshInterval: state.refreshInterval,
-    tradeTimeOnly: state.tradeTimeOnly,
-    dividendReinvest: state.dividendReinvest,
-    defaultOpenMode: state.defaultOpenMode,
-    dcaPlans: state.dcaPlans,
-    dcaExecutions: pruneDCAExecutions(state.dcaExecutions),
-    portfolioEvents: state.portfolioEvents,
-    assetSnapshots: state.assetSnapshots,
-  }), [
-    state.groups,
-    state.holdings,
-    state.closedHoldings,
-    state.defaultPrivacyMode,
-    state.colorScheme,
-    state.theme,
-    state.currency,
-    state.language,
-    state.refreshInterval,
-    state.tradeTimeOnly,
-    state.dividendReinvest,
-    state.defaultOpenMode,
-    state.dcaPlans,
-    state.dcaExecutions,
-    state.portfolioEvents,
-    state.assetSnapshots,
-  ]);
+  const stats = useMemo(
+    () => computeStats(state.holdings, state.closedHoldings, state.portfolioEvents, state.portfolioEventBaseline),
+    [state.holdings, state.closedHoldings, state.portfolioEvents, state.portfolioEventBaseline],
+  );
+  const persistedSnapshot = useMemo<PersistedState>(() => buildPersistedState(state), [state]);
 
   const applyDCAState = useCallback((
     holdings: Holding[],
@@ -1223,7 +1280,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         dcaExecutions: dcaState.dcaExecutions,
         portfolioEvents,
         assetSnapshots: corporateState.changed || eventsChanged
-          ? upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, now)
+          ? upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, now, s.portfolioEventBaseline)
           : s.assetSnapshots,
       };
     });
@@ -1315,7 +1372,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           dcaPlans: dcaState.dcaPlans,
           dcaExecutions: dcaState.dcaExecutions,
           portfolioEvents,
-          assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, now),
+          assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, now, s.portfolioEventBaseline),
           isRefreshing: false,
           lastRefreshed: t,
           lastRefreshAt: now.getTime(),
@@ -1362,7 +1419,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     // from fetching data at all, leaving it showing stale values with no
     // "refreshing" indication. Each view should always refresh at least once
     // on open.
-    void runRefresh(stateRef.current.holdings, { bypassCoordination: true });
+    void consumeSnapshotDueDates().then((response) => {
+      void runRefresh(stateRef.current.holdings, {
+        forceCorporateActions: Boolean(response.dates?.length),
+        bypassCoordination: true,
+      });
+    });
   }, [runRefresh]);
 
   useEffect(() => {
@@ -1370,7 +1432,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     persistedSnapshotRef.current = persistedSnapshot;
     if (persistTimerRef.current != null) window.clearTimeout(persistTimerRef.current);
     persistTimerRef.current = window.setTimeout(() => {
-      savePersistedState(persistedSnapshot);
+      const saved = savePersistedState(persistedSnapshot, { clearCachesOnFailure: true });
+      const storageError = saved.ok
+        ? ""
+        : stateRef.current.language === "en"
+          ? "Changes could not be saved because extension storage is full. Clear local data or export a backup before continuing."
+          : "数据未能保存：浏览器扩展存储空间不足。请先导出备份或清理本地数据后再继续。";
+      setState((current) => current.storageError === storageError ? current : { ...current, storageError });
       persistTimerRef.current = null;
     }, 250);
   }, [persistedSnapshot]);
@@ -1397,6 +1465,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         lastRefreshed: current.lastRefreshed,
         lastRefreshAt: current.lastRefreshAt,
         lastRefreshError: current.lastRefreshError,
+        storageError: current.storageError,
         detailTarget: current.detailTarget,
         dcaPanelOpen: current.dcaPanelOpen,
         dcaPanelHoldingId: current.dcaPanelHoldingId,
@@ -1407,8 +1476,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   useEffect(() => {
-    void syncExtensionOpenMode(state.defaultOpenMode);
-  }, [state.defaultOpenMode]);
+    // The service worker owns toolbar click behavior. A newly opened side panel
+    // must never push its potentially stale local preference back to Chrome,
+    // otherwise it can immediately restore the popup that was just disabled.
+    void getConfiguredExtensionOpenMode().then((response) => {
+      if (!response.ok || !response.mode) return;
+      const mode = normalizeOpenMode(response.mode);
+      setState((current) => current.defaultOpenMode === mode
+        ? current
+        : { ...current, defaultOpenMode: mode });
+    });
+  }, []);
 
   useEffect(() => {
     if (!state.refreshInterval) return;
@@ -1450,7 +1528,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const exportPortfolio = useCallback(() => JSON.stringify({
     exportedAt: new Date().toISOString(),
     app: "资产助手",
-    version: 3,
+    version: 4,
     data: {
       groups: state.groups,
       holdings: state.holdings,
@@ -1458,7 +1536,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       dcaPlans: state.dcaPlans,
       dcaExecutions: state.dcaExecutions,
       portfolioEvents: state.portfolioEvents,
+      portfolioEventBaseline: state.portfolioEventBaseline,
       assetSnapshots: state.assetSnapshots,
+      savedBacktests: readSavedBacktestsForBackup(),
       settings: {
         defaultPrivacyMode: state.defaultPrivacyMode,
         colorScheme: state.colorScheme,
@@ -1491,12 +1571,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const dcaExecutions = Array.isArray(data.dcaExecutions) ? pruneDCAExecutions(data.dcaExecutions) : current.dcaExecutions;
       const dcaPlans = Array.isArray(data.dcaPlans) ? hydratePlans(data.dcaPlans, dcaExecutions) : current.dcaPlans;
       const dcaState = applyDCAState(holdings, dcaPlans, dcaExecutions);
-      const portfolioEvents = migratePortfolioEvents(
-        dcaState.holdings,
-        closedHoldings,
-        dcaState.dcaExecutions,
-        normalizePortfolioEvents(data.portfolioEvents),
-      );
+      const portfolioEventBaseline = normalizePortfolioEventBaseline(data.portfolioEventBaseline);
+      const importedEvents = normalizePortfolioEvents(data.portfolioEvents);
+      const portfolioEvents = Object.keys(portfolioEventBaseline.daily).length > 0
+        ? importedEvents
+        : migratePortfolioEvents(dcaState.holdings, closedHoldings, dcaState.dcaExecutions, importedEvents);
       const nextState: AppState = {
         ...current,
         groups: Array.isArray(data.groups) ? data.groups : current.groups,
@@ -1505,14 +1584,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
         portfolioEvents,
+        portfolioEventBaseline,
         // upsertPortfolioSnapshot(snapshots, holdings, date) keeps all
         // historical snapshots from the first arg and replaces only today's
         // entry with a freshly computed one from `holdings`. Passing the
         // imported snapshot array here preserves the 180-day trend history;
         // the .slice(-180) inside the function caps the total length.
         assetSnapshots: Array.isArray(data.assetSnapshots)
-          ? upsertPortfolioSnapshot(data.assetSnapshots, dcaState.holdings, portfolioEvents)
-          : upsertPortfolioSnapshot(current.assetSnapshots, dcaState.holdings, portfolioEvents),
+          ? upsertPortfolioSnapshot(data.assetSnapshots, dcaState.holdings, portfolioEvents, new Date(), portfolioEventBaseline)
+          : upsertPortfolioSnapshot(current.assetSnapshots, dcaState.holdings, portfolioEvents, new Date(), portfolioEventBaseline),
         defaultPrivacyMode: typeof settings.defaultPrivacyMode === "boolean"
           ? settings.defaultPrivacyMode
           : typeof settings.privacyMode === "boolean"
@@ -1536,6 +1616,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         errorMessage: storageError,
       });
       if (!saved.ok) return saved;
+      if (Array.isArray(data.savedBacktests) && typeof window !== "undefined") {
+        try {
+          window.localStorage.setItem(SAVED_BACKTESTS_KEY, JSON.stringify(data.savedBacktests.slice(0, 8)));
+        } catch {
+          nextState.storageError = nextState.language === "en"
+            ? "Portfolio data was restored, but saved backtest comparisons could not be stored."
+            : "持仓数据已恢复，但保存的回测对比方案未能写入存储。";
+        }
+      }
       pruneCorporateActionCheckedAt(dcaState.holdings);
       setState(nextState);
       void runRefresh(dcaState.holdings, { forceCorporateActions: true, bypassCoordination: true });
@@ -1629,7 +1718,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
         portfolioEvents,
-        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents),
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
       };
     });
   }, [applyDCAState]);
@@ -1674,7 +1763,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
         portfolioEvents,
-        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents),
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
       };
     });
   }, [applyDCAState]);
@@ -1686,7 +1775,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const numericPrice = Number(input.price);
       const numericFee = Number.isFinite(Number(input.fee)) ? Math.max(0, Number(input.fee)) : 0;
       const numericTax = Number.isFinite(Number(input.tax)) ? Math.max(0, Number(input.tax)) : 0;
-      const transactionCosts = numericFee + numericTax;
       const transactionDate = ymdFromIsoLike(input.date) || todayLocalYMD();
       const isBuy = input.type === "buy"
         && Number.isFinite(numericQuantity) && numericQuantity > 0
@@ -1700,7 +1788,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // realized P/L shows up in the closed history. For partial sells the
       // entry carries only the sold quantity; the remaining position stays.
       const closedHolding = isSell
-        ? buildClosedHolding(target, numericPrice, transactionDate, willClose ? target.quantity : numericQuantity, transactionCosts)
+        ? buildClosedHolding(target, numericPrice, transactionDate, willClose ? target.quantity : numericQuantity, {
+          fee: numericFee,
+          tax: numericTax,
+        })
         : null;
       let adjusted = applyHoldingAdjustment(target, input);
       if (adjusted && input.rememberCostProfile && input.costProfilePatch) {
@@ -1725,7 +1816,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           });
           const latestAction = costHolding.corporateActions?.at(-1);
           const costEvent = latestAction ? buildPortfolioEventFromCorporateAction(costHolding, latestAction, "manual") : null;
-          if (costEvent) costEvents.push(costEvent);
+          if (costEvent) costEvents.push({
+            ...costEvent,
+            relatedEventId: isSell ? closedHolding?.id : costEvent.relatedEventId,
+          });
           if (adjusted) adjusted = costHolding;
         }
       }
@@ -1745,7 +1839,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const event = isBuy
         ? buildBuyEvent(target, { quantity: numericQuantity, price: numericPrice, date: transactionDate, source: "manual" })
         : isSell
-          ? buildSellEvent(target, { quantity: willClose ? target.quantity : numericQuantity, price: numericPrice, date: transactionDate, source: "manual" })
+          ? buildSellEvent(target, {
+            quantity: willClose ? target.quantity : numericQuantity,
+            price: numericPrice,
+            date: transactionDate,
+            source: "manual",
+            relatedEventId: closedHolding?.id,
+          })
           : null;
       const transactionEvents = event ? [event, ...costEvents] : [];
       const portfolioEvents = appendDCAExecutionEvents(
@@ -1760,7 +1860,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         dcaExecutions: dcaState.dcaExecutions,
         closedHoldings: nextClosedHoldings,
         portfolioEvents,
-        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents),
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
       };
     });
   }, [applyDCAState]);
@@ -1775,7 +1875,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const dcaState = applyDCAState(updatedHoldings, updatedPlans, updatedExecutions);
       const closedHolding = target.quantity > 0 && target.costPrice > 0 ? buildClosedHolding(target) : null;
       const event = closedHolding
-        ? buildSellEvent(target, { quantity: target.quantity, price: target.currentPrice, source: "manual" })
+        ? buildSellEvent(target, {
+          quantity: target.quantity,
+          price: target.currentPrice,
+          source: "manual",
+          relatedEventId: closedHolding.id,
+        })
         : null;
       const portfolioEvents = appendDCAExecutionEvents(event ? [...s.portfolioEvents, event] : s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
       return {
@@ -1785,17 +1890,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         dcaExecutions: dcaState.dcaExecutions,
         closedHoldings: closedHolding ? [closedHolding, ...s.closedHoldings] : s.closedHoldings,
         portfolioEvents,
-        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents),
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
         dcaPanelHoldingId: s.dcaPanelHoldingId === id ? null : s.dcaPanelHoldingId,
       };
     });
   }, [applyDCAState]);
 
   const removeClosedHolding = useCallback((id: string) => {
-    setState((s) => ({
-      ...s,
-      closedHoldings: s.closedHoldings.filter((item) => item.id !== id),
-    }));
+    setState((s) => {
+      const portfolioEvents = dedupePortfolioEvents(s.portfolioEvents.filter((event) => (
+        event.relatedEventId !== id && !event.id.includes(`closed:${id}`) && !event.id.includes(`closed-${id}`)
+      )));
+      return {
+        ...s,
+        closedHoldings: s.closedHoldings.filter((item) => item.id !== id),
+        portfolioEvents,
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, s.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
+      };
+    });
   }, []);
 
   /* detail overlay */
@@ -1888,7 +2000,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 	        dcaPlans: dcaState.dcaPlans,
 	        dcaExecutions: dcaState.dcaExecutions,
 	        portfolioEvents,
-	        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents),
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
 	      };
 	    });
   }, [applyDCAState]);

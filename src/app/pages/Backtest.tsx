@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Calculator, CalendarDays, ChevronDown, ChevronLeft, ChevronRight,
-  Loader2, RefreshCw, TrendingUp, Wifi, WifiOff,
+  Loader2, RefreshCw, Save, Trash2, TrendingUp, Wifi, WifiOff,
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useApp } from "../context/AppContext";
 import { fetchBacktestDailyPrices } from "../services/quoteApi";
 import type { LiveResult, Market } from "../services/securitiesApi";
-import { currencySymbol, formatExactMoney, formatPercent } from "../utils/numberFormat";
+import { formatExactMoney, formatPercent } from "../utils/numberFormat";
 import { BacktestInput, BacktestResult, BacktestStrategy, runBacktest } from "../utils/backtestEngine";
 import { SparklineChart } from "../components/SparklineChart";
 import { getMarketBadgeWithBg } from "../utils/marketBadge";
@@ -23,6 +23,82 @@ const marketOptions = [
   { value: "FUND", label: "基金" },
   { value: "CRYPTO", label: "加密" },
 ];
+
+const benchmarkOptions = [
+  { value: "auto", labelZh: "自动匹配", labelEn: "Auto", symbol: "", market: "INDEX" },
+  { value: "none", labelZh: "不对比", labelEn: "None", symbol: "", market: "INDEX" },
+  { value: "csi300", labelZh: "沪深300", labelEn: "CSI 300", symbol: "000300", market: "INDEX" },
+  { value: "hsi", labelZh: "恒生指数", labelEn: "Hang Seng", symbol: "^HSI", market: "INDEX" },
+  { value: "sp500", labelZh: "标普500", labelEn: "S&P 500", symbol: "^GSPC", market: "INDEX" },
+  { value: "nikkei", labelZh: "日经225", labelEn: "Nikkei 225", symbol: "^N225", market: "INDEX" },
+  { value: "btc", labelZh: "比特币", labelEn: "Bitcoin", symbol: "BTC-USD", market: "CRYPTO" },
+] as const;
+
+type BenchmarkValue = typeof benchmarkOptions[number]["value"];
+type BenchmarkSummary = { label: string; totalReturn: number; annualizedReturn: number; maxDrawdown: number };
+type SavedBacktest = {
+  id: string;
+  name: string;
+  symbol: string;
+  market: string;
+  strategy: BacktestStrategy;
+  startDate: string;
+  endDate: string;
+  totalPnl: number;
+  totalInvested?: number;
+  finalValue?: number;
+  totalDividends?: number;
+  dividendDataStatus?: BacktestResult["dividendDataStatus"];
+  totalReturn: number;
+  annualizedReturn: number;
+  maxDrawdown: number;
+  totalFees?: number;
+  totalTaxes?: number;
+  tradeCount?: number;
+  dividendMode?: BacktestResult["dividendMode"];
+  liquidatedAtEnd?: boolean;
+  benchmarkSummary?: BenchmarkSummary | null;
+  currency: string;
+  createdAt: string;
+  form?: BacktestInput;
+  securityQuery?: string;
+  benchmark?: BenchmarkValue;
+};
+
+const SAVED_BACKTESTS_KEY = "asset-helper:saved-backtests:v1";
+
+export function autoBenchmark(market: string): Exclude<BenchmarkValue, "auto" | "none"> | "none" {
+  if (market === "A" || market === "FUND") return "csi300";
+  if (market === "HK") return "hsi";
+  if (market === "US") return "sp500";
+  if (market === "CRYPTO") return "btc";
+  if (market === "JP") return "nikkei";
+  return "none";
+}
+
+export function buildBenchmarkInput(runForm: BacktestInput, symbol: string, market: string): BacktestInput {
+  return {
+    ...runForm,
+    symbol,
+    market,
+    assetType: "index",
+    feeRate: 0,
+    sellFeeRate: 0,
+    buyTaxRate: 0,
+    sellTaxRate: 0,
+    dividendTaxRate: 0,
+    minimumFee: 0,
+  };
+}
+
+function loadSavedBacktests(): SavedBacktest[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SAVED_BACKTESTS_KEY) ?? "[]");
+    return Array.isArray(parsed) ? parsed.slice(0, 8) : [];
+  } catch {
+    return [];
+  }
+}
 
 function monthsAgoYMD(months: number) {
   const now = new Date();
@@ -209,9 +285,9 @@ function selectInput(value: string, onChange: (value: string) => void, options: 
 
 function MetricCard({ label, value, color }: { label: string; value: string; color?: string }) {
   return (
-    <div className="rounded-2xl p-3" style={{ background: "var(--bg-card)", border: "1px solid var(--border-sub)" }}>
+    <div className="min-h-[68px] rounded-xl p-3" style={{ background: "var(--bg-card)", border: "1px solid var(--border-sub)" }}>
       <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{label}</p>
-      <p className="truncate" style={{ color: color ?? "var(--text-primary)", fontSize: 14, fontWeight: 800, marginTop: 4 }}>
+      <p className="break-words" style={{ color: color ?? "var(--text-primary)", fontSize: 13, fontWeight: 800, lineHeight: 1.25, marginTop: 4 }}>
         {value}
       </p>
     </div>
@@ -621,6 +697,13 @@ function strategyBuyLabel(strategy: BacktestStrategy, isEn: boolean) {
   return isEn ? "Buy" : "买入";
 }
 
+function strategyLabel(strategy: BacktestStrategy, isEn: boolean) {
+  if (strategy === "monthly_dca") return isEn ? "Monthly DCA" : "月定投";
+  if (strategy === "weekly_dca") return isEn ? "Weekly DCA" : "周定投";
+  if (strategy === "daily_dca") return isEn ? "Daily DCA" : "日定投";
+  return isEn ? "Lump sum" : "一次性买入";
+}
+
 function strategyBuyLabelWithPeriod(strategy: BacktestStrategy, period: number, isEn: boolean) {
   const label = strategyBuyLabel(strategy, isEn);
   if (strategy === "lump_sum" || period <= 0) return label;
@@ -628,7 +711,7 @@ function strategyBuyLabelWithPeriod(strategy: BacktestStrategy, period: number, 
 }
 
 export function Backtest() {
-  const { language, profitColor, privacyMode } = useApp();
+  const { language, profitColor, holdings } = useApp();
   const isEn = language === "en";
   const text = t(language);
   const [viewportWidth, setViewportWidth] = useState(() => typeof window === "undefined" ? 400 : window.innerWidth);
@@ -646,12 +729,25 @@ export function Backtest() {
     strategy: "lump_sum",
     monthlyAmount: 1000,
     feeRate: 0,
+    sellFeeRate: 0,
+    buyTaxRate: 0,
+    sellTaxRate: 0,
+    dividendTaxRate: 0,
+    minimumFee: 0,
+    liquidateAtEnd: false,
+    dividendMode: "cash",
   });
   const [securityQuery, setSecurityQuery] = useState("");
   const [marketScope, setMarketScope] = useState<Market | "">("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<BacktestResult | null>(null);
+  const [benchmark, setBenchmark] = useState<BenchmarkValue>("auto");
+  const [benchmarkResult, setBenchmarkResult] = useState<BenchmarkSummary | null>(null);
+  const [benchmarkError, setBenchmarkError] = useState("");
+  const [savedBacktests, setSavedBacktests] = useState<SavedBacktest[]>(loadSavedBacktests);
+  const [periodView, setPeriodView] = useState<"month" | "year">("month");
+  const [pageTab, setPageTab] = useState<"backtest" | "compare">("backtest");
   const runSeqRef = useRef(0);
 
   const chartColor = profitColor(result?.totalPnl ?? 0);
@@ -675,8 +771,26 @@ export function Backtest() {
       };
     }) ?? [];
   }, [result]);
+  const visiblePeriodReturns = result
+    ? (periodView === "month" ? result.monthlyReturns.slice(-12) : result.yearlyReturns).slice().reverse()
+    : [];
   const quoteCurrency = currencyForMarket(form.market);
   const isCompactForm = viewportWidth < 380;
+  const comparisonMeta = useMemo(() => {
+    if (savedBacktests.length === 0) return null;
+    const bestReturn = Math.max(...savedBacktests.map((item) => item.totalReturn));
+    const bestAnnualized = Math.max(...savedBacktests.map((item) => item.annualizedReturn));
+    const lowestDrawdown = Math.min(...savedBacktests.map((item) => item.maxDrawdown));
+    const currencies = new Set(savedBacktests.map((item) => item.currency));
+    const ranges = new Set(savedBacktests.map((item) => `${item.startDate}:${item.endDate}`));
+    return {
+      bestReturn,
+      bestAnnualized,
+      lowestDrawdown,
+      mixedCurrencies: currencies.size > 1,
+      mixedRanges: ranges.size > 1,
+    };
+  }, [savedBacktests]);
 
   useEffect(() => {
     const handleResize = () => setViewportWidth(window.innerWidth);
@@ -686,10 +800,95 @@ export function Backtest() {
   }, []);
 
   const updateForm = <K extends keyof BacktestInput>(key: K, value: BacktestInput[K]) => {
+    runSeqRef.current += 1;
     setForm((current) => ({ ...current, [key]: value }));
+    setResult(null);
+    setBenchmarkResult(null);
+    setBenchmarkError("");
+    setError("");
+    setLoading(false);
+  };
+
+  const matchingHolding = useMemo(() => holdings.find((holding) =>
+    holding.market === form.market && normalizeHoldingSymbol(holding.symbol, holding.market) === form.symbol
+  ), [form.market, form.symbol, holdings]);
+
+  const applyHoldingCosts = () => {
+    const profile = matchingHolding?.transactionCostProfile;
+    if (!profile) return;
+    runSeqRef.current += 1;
+    setForm((current) => ({
+      ...current,
+      feeRate: profile.buyFeeRate ?? 0,
+      sellFeeRate: profile.sellFeeRate ?? profile.buyFeeRate ?? 0,
+      buyTaxRate: profile.buyTaxRate ?? 0,
+      sellTaxRate: profile.sellTaxRate ?? 0,
+      minimumFee: profile.minimumFee ?? 0,
+    }));
+    setResult(null);
+    setBenchmarkResult(null);
+    setBenchmarkError("");
+    setError("");
+    setLoading(false);
+  };
+
+  const persistSavedBacktests = (next: SavedBacktest[]) => {
+    const limited = next.slice(0, 8);
+    setSavedBacktests(limited);
+    try { localStorage.setItem(SAVED_BACKTESTS_KEY, JSON.stringify(limited)); } catch { /* non-critical */ }
+  };
+
+  const saveCurrentResult = () => {
+    if (!result) return;
+    const item: SavedBacktest = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name: securityQuery || form.symbol,
+      symbol: form.symbol,
+      market: form.market,
+      strategy: form.strategy,
+      startDate: result.actualStartDate,
+      endDate: result.actualEndDate,
+      totalPnl: result.totalPnl,
+      totalInvested: result.totalInvested,
+      finalValue: result.finalValue,
+      totalDividends: result.totalDividends,
+      dividendDataStatus: result.dividendDataStatus,
+      totalReturn: result.totalReturn,
+      annualizedReturn: result.annualizedReturn,
+      maxDrawdown: result.maxDrawdown,
+      totalFees: result.totalFees,
+      totalTaxes: result.totalTaxes,
+      tradeCount: result.tradeCount,
+      dividendMode: result.dividendMode,
+      liquidatedAtEnd: result.liquidatedAtEnd,
+      benchmarkSummary: benchmarkResult,
+      currency: quoteCurrency,
+      createdAt: new Date().toISOString(),
+      form: { ...form },
+      securityQuery,
+      benchmark,
+    };
+    persistSavedBacktests([item, ...savedBacktests]);
+  };
+
+  const loadSavedBacktest = (item: SavedBacktest) => {
+    if (!item.form) return;
+    runSeqRef.current += 1;
+    setForm(item.form);
+    setSecurityQuery(item.securityQuery || item.name);
+    setMarketScope(marketOptions.some((option) => option.value === item.form?.market) ? item.form.market as Market : "");
+    setBenchmark(item.benchmark ?? "auto");
+    setResult(null);
+    setBenchmarkResult(null);
+    setBenchmarkError("");
+    setError("");
+    setLoading(false);
+    setPageTab("backtest");
+    void run(item.form, item.benchmark ?? "auto");
   };
 
   const handleSecuritySelect = (result: LiveResult) => {
+    runSeqRef.current += 1;
     const normalized = normalizeHoldingType(result.symbol, result.name, result.market, result.assetType);
     const normalizedSymbol = normalizeHoldingSymbol(result.symbol, normalized.market);
     setSecurityQuery(`${result.name} (${result.symbol})`);
@@ -700,33 +899,71 @@ export function Backtest() {
       assetType: normalized.assetType,
     }));
     setResult(null);
+    setBenchmarkResult(null);
+    setBenchmarkError("");
     setError("");
+    setLoading(false);
   };
 
-  const run = async () => {
+  const run = async (runForm: BacktestInput = form, runBenchmark: BenchmarkValue = benchmark) => {
     const runSeq = ++runSeqRef.current;
-    const symbol = form.symbol.trim();
+    const symbol = runForm.symbol.trim();
     if (!symbol) {
       setError(isEn ? "Enter a symbol first." : "请先输入标的代码。");
       return;
     }
+    if (runForm.initialAmount <= 0 && (runForm.strategy === "lump_sum" || runForm.monthlyAmount <= 0)) {
+      setError(isEn ? "Enter an investment amount greater than zero." : "请输入大于 0 的投资金额。");
+      return;
+    }
     setLoading(true);
     setError("");
+    setBenchmarkError("");
     try {
-      const prices = await fetchBacktestDailyPrices(symbol, form.market, form.startDate, form.endDate);
+      const resolvedBenchmark = runBenchmark === "auto" ? autoBenchmark(runForm.market) : runBenchmark;
+      const benchmarkOption = benchmarkOptions.find((option) => option.value === resolvedBenchmark);
+      const [prices, benchmarkPrices] = await Promise.all([
+        fetchBacktestDailyPrices(symbol, runForm.market, runForm.startDate, runForm.endDate, { preferAdjusted: false }),
+        benchmarkOption?.symbol
+          ? fetchBacktestDailyPrices(benchmarkOption.symbol, benchmarkOption.market, runForm.startDate, runForm.endDate, { preferAdjusted: false }).catch(() => null)
+          : Promise.resolve(null),
+      ]);
       const sortedDates = prices.map((point) => point.date).sort();
-      const inSelectedRange = prices.some((point) => point.date >= form.startDate && point.date <= form.endDate);
+      const inSelectedRange = prices.some((point) => point.date >= runForm.startDate && point.date <= runForm.endDate);
       if (!inSelectedRange) {
         const firstDate = sortedDates[0] ?? "";
         const lastDate = sortedDates[sortedDates.length - 1] ?? "";
         throw new Error(firstDate && lastDate ? `NO_PRICE_DATA:${firstDate}:${lastDate}` : "NO_PRICE_DATA");
       }
-      const nextResult = runBacktest({ ...form, symbol }, prices);
+      const nextResult = runBacktest({ ...runForm, symbol }, prices);
       if (runSeq !== runSeqRef.current) return;
       setResult(nextResult);
+      if (benchmarkOption?.symbol && benchmarkPrices?.length) {
+        try {
+          const benchmarkBacktest = runBacktest(
+            buildBenchmarkInput(runForm, benchmarkOption.symbol, benchmarkOption.market),
+            benchmarkPrices,
+          );
+          setBenchmarkResult({
+            label: isEn ? benchmarkOption.labelEn : benchmarkOption.labelZh,
+            totalReturn: benchmarkBacktest.totalReturn,
+            annualizedReturn: benchmarkBacktest.annualizedReturn,
+            maxDrawdown: benchmarkBacktest.maxDrawdown,
+          });
+        } catch {
+          setBenchmarkResult(null);
+          setBenchmarkError(isEn ? "Benchmark data is unavailable for this range." : "该区间暂无基准数据。");
+        }
+      } else {
+        setBenchmarkResult(null);
+        if (benchmarkOption?.symbol) {
+          setBenchmarkError(isEn ? "Benchmark data is unavailable for this range." : "该区间暂无基准数据。");
+        }
+      }
     } catch (err) {
       if (runSeq !== runSeqRef.current) return;
       setResult(null);
+      setBenchmarkResult(null);
       const errorMessage = err instanceof Error ? err.message : "";
       const coverage = errorMessage.startsWith("NO_PRICE_DATA:") ? errorMessage.split(":").slice(1) : [];
       const message = errorMessage.startsWith("NO_PRICE_DATA")
@@ -759,19 +996,41 @@ export function Backtest() {
             {isEn ? "Backtest" : "收益回测"}
           </span>
         </div>
-        <button
-          onClick={run}
-          disabled={loading}
-          className="flex items-center gap-1 rounded-xl px-3 py-2"
-          style={{ background: "rgba(79,156,249,0.15)", color: "#4F9CF9", fontSize: 12, fontWeight: 800 }}
-        >
-          <RefreshCw size={13} className={loading ? "animate-spin-smooth" : undefined} />
-          {isEn ? "Run" : "开始"}
-        </button>
+        <div className="flex items-center gap-2">
+          {pageTab === "backtest" && (
+            <button
+              onClick={() => void run()}
+              disabled={loading}
+              className="flex items-center gap-1 rounded-lg px-3 py-2"
+              style={{ background: "rgba(79,156,249,0.15)", color: "#4F9CF9", fontSize: 12, fontWeight: 800 }}
+            >
+              <RefreshCw size={13} className={loading ? "animate-spin-smooth" : undefined} />
+              {isEn ? "Run" : "开始"}
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="shrink-0 border-b border-app-border px-3 py-2">
+        <div className="grid grid-cols-2 rounded-xl bg-app-card p-1">
+          {(["backtest", "compare"] as const).map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              onClick={() => setPageTab(tab)}
+              className="rounded-lg py-1.5 text-[11px] font-semibold transition-colors focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-app-accent"
+              style={{ color: pageTab === tab ? "#4F9CF9" : "var(--text-muted)", background: pageTab === tab ? "rgba(79,156,249,0.14)" : "transparent" }}
+            >
+              {tab === "backtest" ? (isEn ? "Backtest" : "回测") : (isEn ? "Comparisons" : "方案对比")}
+              {tab === "compare" && savedBacktests.length > 0 ? ` (${savedBacktests.length})` : ""}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 py-3" style={{ scrollbarWidth: "none", paddingBottom: 16 }}>
-        <div className="rounded-2xl p-3" style={{ background: "var(--bg-surface)", border: "1px solid var(--border-sub)" }}>
+        <div style={{ display: pageTab === "backtest" ? "block" : "none" }}>
+        <div className="rounded-xl p-3" style={{ background: "var(--bg-surface)", border: "1px solid var(--border-sub)" }}>
           <div className="flex gap-2 items-end mb-3">
             <label style={{ width: 120, flexShrink: 0 }}>
               <p style={{ color: "var(--text-muted)", fontSize: 10, marginBottom: 5 }}>{text.holdings.marketScope}</p>
@@ -799,26 +1058,37 @@ export function Backtest() {
             </label>
           </div>
 
-          <div
-            className="grid gap-2 items-end mt-3"
-            style={{ gridTemplateColumns: isCompactForm ? "minmax(0, 1fr)" : "minmax(0, 1fr) 112px" }}
-          >
+          <div className="mt-3">
             <label className="flex-1 min-w-0">
               <p style={{ color: "var(--text-muted)", fontSize: 10, marginBottom: 5 }}>{isEn ? "Time Range" : "时间范围"}</p>
               <DateRangeField
                 startDate={form.startDate}
                 endDate={form.endDate}
                 onChange={(startDate, endDate) => {
+                  runSeqRef.current += 1;
                   setForm((current) => ({ ...current, startDate, endDate }));
                   setResult(null);
+                  setBenchmarkResult(null);
+                  setBenchmarkError("");
                   setError("");
+                  setLoading(false);
                 }}
                 isEn={isEn}
               />
             </label>
-            <label style={{ minWidth: 0 }}>
-              <p style={{ color: "var(--text-muted)", fontSize: 10, marginBottom: 5 }}>{isEn ? "Fee Rate (%)" : "手续费率 (%)"}</p>
-              {feeRateInput(form.feeRate, (value) => updateForm("feeRate", value))}
+          </div>
+
+          <div className="mt-3">
+            <label>
+              <p className="mb-1 text-[10px] text-tm">{isEn ? "Benchmark" : "对比基准"}</p>
+              {selectInput(benchmark, (value) => {
+                runSeqRef.current += 1;
+                setBenchmark(value as BenchmarkValue);
+                setResult(null);
+                setBenchmarkResult(null);
+                setBenchmarkError("");
+                setLoading(false);
+              }, benchmarkOptions.map((option) => ({ value: option.value, label: isEn ? option.labelEn : option.labelZh })))}
             </label>
           </div>
 
@@ -879,18 +1149,133 @@ export function Backtest() {
                 </label>
               </div>
             )}
+
+            <div className="mt-3">
+              <p className="mb-1 text-[10px] text-tm">{isEn ? "Dividend treatment" : "分红处理"}</p>
+              <div className="grid grid-cols-2 rounded-xl border border-app-border bg-app-card p-1">
+                {(["cash", "reinvest"] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => updateForm("dividendMode", mode)}
+                    className="rounded-lg py-1.5 text-[10px] font-semibold"
+                    style={{ color: form.dividendMode === mode ? "#4F9CF9" : "var(--text-muted)", background: form.dividendMode === mode ? "rgba(79,156,249,0.13)" : "transparent" }}
+                  >
+                    {mode === "cash" ? (isEn ? "Cash dividend" : "现金分红") : (isEn ? "Reinvest" : "红利再投")}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-1.5 text-[9px] leading-4 text-tmi">
+                {isEn ? "Reinvestment uses the ex-date close as an estimate. Adjusted prices and cumulative NAV are not counted twice." : "红利再投按除息日收盘价估算；复权价和累计净值不会重复计入分红。"}
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-3 border-t border-app-border pt-3">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <p className="text-[10px] font-semibold text-tm">{isEn ? "Transaction costs" : "交易成本"}</p>
+              {matchingHolding?.transactionCostProfile && (
+                <button type="button" onClick={applyHoldingCosts} className="text-[9px] font-semibold text-app-accent">
+                  {isEn ? "Use holding rules" : "使用持仓费率"}
+                </button>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <label>
+                <p className="mb-1 text-[10px] text-tm">{isEn ? "Buy fee (%)" : "买入手续费率 (%)"}</p>
+                {feeRateInput(form.feeRate, (value) => updateForm("feeRate", value))}
+              </label>
+              <label>
+                <p className="mb-1 text-[10px] text-tm">{isEn ? "Sell fee (%)" : "卖出手续费率 (%)"}</p>
+                {feeRateInput(form.sellFeeRate ?? 0, (value) => updateForm("sellFeeRate", value))}
+              </label>
+              <label>
+                <p className="mb-1 text-[10px] text-tm">{isEn ? "Buy tax (%)" : "买入税率 (%)"}</p>
+                {feeRateInput(form.buyTaxRate ?? 0, (value) => updateForm("buyTaxRate", value))}
+              </label>
+              <label>
+                <p className="mb-1 text-[10px] text-tm">{isEn ? "Sell tax rate (%)" : "卖出税率 (%)"}</p>
+                {feeRateInput(form.sellTaxRate ?? 0, (value) => updateForm("sellTaxRate", value))}
+              </label>
+              <label>
+                <p className="mb-1 text-[10px] text-tm">{isEn ? "Dividend tax (%)" : "分红税率 (%)"}</p>
+                {feeRateInput(form.dividendTaxRate ?? 0, (value) => updateForm("dividendTaxRate", value))}
+              </label>
+              <label>
+                <p className="mb-1 text-[10px] text-tm">{isEn ? "Minimum fee" : `最低手续费 (${quoteCurrency})`}</p>
+                {numberInput(form.minimumFee ?? 0, (value) => updateForm("minimumFee", value), "0", 0.01)}
+              </label>
+              <label className="col-span-2 flex min-h-[46px] items-end">
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={form.liquidateAtEnd === true}
+                  onClick={() => updateForm("liquidateAtEnd", !form.liquidateAtEnd)}
+                  className="flex h-[38px] w-full items-center justify-between rounded-xl border border-app-border bg-app-card px-3 text-[10px] font-semibold text-ts"
+                >
+                  <span>{isEn ? "Liquidate at end" : "期末模拟清仓"}</span>
+                  <span className="relative h-5 w-9 rounded-full transition-colors" style={{ background: form.liquidateAtEnd ? "#4F9CF9" : "var(--bg-surface2)" }}>
+                    <span className="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all" style={{ left: form.liquidateAtEnd ? 18 : 2 }} />
+                  </span>
+                </button>
+              </label>
+            </div>
+            <p className="mt-2 text-[9px] leading-4 text-tmi">
+              {form.liquidateAtEnd
+                ? (isEn ? "Ending value deducts sell fees and taxes." : "期末总值将扣除卖出手续费和税费。")
+                : (isEn ? "Ending value is a holding valuation; sell costs are not deducted." : "期末总值为持仓估值，不扣除卖出成本。")}
+            </p>
           </div>
         </div>
 
         {error && (
-          <div className="mt-3 rounded-2xl px-3 py-2" style={{ background: "rgba(242,78,78,0.1)", color: "#F24E4E", fontSize: 12 }}>
+          <div className="mt-3 rounded-xl px-3 py-2" style={{ background: "rgba(242,78,78,0.1)", color: "#F24E4E", fontSize: 12 }}>
             {error}
           </div>
         )}
 
         {result ? (
           <div className="mt-3 flex flex-col gap-3">
-            <div className="rounded-2xl p-3" style={{ background: "var(--bg-card)", border: "1px solid var(--border-sub)" }}>
+            <section className="rounded-xl border border-app-accent/15 bg-app-surface p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-[10px] text-tm">{isEn ? "Total return" : "总收益"}</p>
+                  <p className="mt-0.5 break-words text-[25px] font-bold leading-tight" style={{ color: profitColor(result.totalPnl) }}>
+                    {`${result.totalPnl >= 0 ? "+" : "-"}${formatExactMoney(Math.abs(result.totalPnl), quoteCurrency, 2)}`}
+                  </p>
+                </div>
+                <div className="shrink-0 text-right">
+                  <p className="text-[10px] text-tm">{isEn ? "Return rate" : "总收益率"}</p>
+                  <p className="mt-1 text-sm font-bold" style={{ color: profitColor(result.totalReturn) }}>{formatPercent(result.totalReturn)}</p>
+                </div>
+              </div>
+              <div className="mt-3 grid grid-cols-3 gap-2 border-t border-app-border pt-2.5">
+                <div><p className="text-[9px] text-tmi">{isEn ? "Annualized (MWR)" : "年化收益 (MWR)"}</p><p className="mt-1 text-xs font-bold" style={{ color: profitColor(result.annualizedReturn) }}>{formatPercent(result.annualizedReturn)}</p></div>
+                <div><p className="text-[9px] text-tmi">{isEn ? "Max drawdown" : "最大回撤"}</p><p className="mt-1 text-xs font-bold" style={{ color: profitColor(-result.maxDrawdown) }}>{formatPercent(-result.maxDrawdown)}</p></div>
+                <div><p className="text-[9px] text-tmi">{isEn ? "Trades" : "交易次数"}</p><p className="mt-1 text-xs font-bold text-ts">{result.tradeCount}</p></div>
+              </div>
+              <button type="button" onClick={saveCurrentResult} className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg border border-app-border bg-app-card py-2 text-[10px] font-semibold text-app-accent">
+                <Save size={12} />{isEn ? "Save for comparison" : "保存当前方案用于对比"}
+              </button>
+            </section>
+
+            {(benchmarkResult || benchmarkError) && (
+              <section className="rounded-xl border border-app-border bg-app-card p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold text-tp">{isEn ? "Benchmark comparison" : "基准对比"}</p>
+                  {benchmarkResult && <span className="text-[9px] text-tmi">{benchmarkResult.label}</span>}
+                </div>
+                {benchmarkResult ? (
+                  <div className="mt-3 grid grid-cols-3 gap-2">
+                    <div><p className="text-[9px] text-tmi">{isEn ? "Benchmark" : "基准收益"}</p><p className="mt-1 text-xs font-bold" style={{ color: profitColor(benchmarkResult.totalReturn) }}>{formatPercent(benchmarkResult.totalReturn)}</p></div>
+                    <div><p className="text-[9px] text-tmi">{isEn ? "Excess return" : "超额收益"}</p><p className="mt-1 text-xs font-bold" style={{ color: profitColor(result.totalReturn - benchmarkResult.totalReturn) }}>{formatPercent(result.totalReturn - benchmarkResult.totalReturn)}</p></div>
+                    <div><p className="text-[9px] text-tmi">{isEn ? "Drawdown gap" : "回撤差"}</p><p className="mt-1 text-xs font-bold" style={{ color: profitColor(benchmarkResult.maxDrawdown - result.maxDrawdown) }}>{formatPercent(benchmarkResult.maxDrawdown - result.maxDrawdown)}</p></div>
+                  </div>
+                ) : <p className="mt-2 text-[10px] text-tmi">{benchmarkError}</p>}
+              </section>
+            )}
+
+            <div className="rounded-xl p-3" style={{ background: "var(--bg-card)", border: "1px solid var(--border-sub)" }}>
               <div className="flex items-center justify-between mb-2">
                 <div className="flex items-center gap-2">
                   <TrendingUp size={15} color={chartColor} />
@@ -921,9 +1306,7 @@ export function Backtest() {
                   const dividendCash = Number(point.dividendCash ?? 0);
                   const showBuy = buyAmount > 0.000001;
                   const showDividend = dividendCash > 0.000001;
-                  const money = (value: number) => privacyMode
-                    ? `${currencySymbol(quoteCurrency)}***`
-                    : formatExactMoney(value, quoteCurrency, 2);
+                  const money = (value: number) => formatExactMoney(value, quoteCurrency, 2);
                   const row = (label: string, value: string, color = "#F1F5F9") => (
                     <div style={{ display: "flex", justifyContent: "space-between", gap: 14, lineHeight: 1.55 }}>
                       <span style={{ color: "rgba(226,232,240,0.72)" }}>{label}</span>
@@ -945,33 +1328,64 @@ export function Backtest() {
               <p style={{ color: "var(--text-muted)", fontSize: 10, fontWeight: 700, lineHeight: 1.45, marginTop: 8 }}>
                 {backtestDataNote(form.market, result.priceMode, isEn)}
               </p>
+              <p className="mt-1 text-[9px] leading-4 text-tmi">
+                {isEn ? "Actual coverage" : "实际数据覆盖"}: {displayDate(result.actualStartDate)} - {displayDate(result.actualEndDate)}
+              </p>
+              <p className="text-[9px] leading-4 text-tmi">
+                {isEn ? "Max drawdown period" : "最大回撤区间"}: {result.maxDrawdownStartDate && result.maxDrawdownEndDate
+                  ? `${displayDate(result.maxDrawdownStartDate)} - ${displayDate(result.maxDrawdownEndDate)}`
+                  : (isEn ? "No drawdown" : "无回撤")}
+              </p>
             </div>
 
+            <section className="rounded-xl border border-app-border bg-app-card p-3">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs font-semibold text-tp">{isEn ? "Periodic returns" : "分期收益"}</p>
+                <div className="flex rounded-lg bg-app-surface p-0.5">
+                  {(["month", "year"] as const).map((mode) => (
+                    <button key={mode} type="button" onClick={() => setPeriodView(mode)} className="rounded-md px-2 py-1 text-[9px] font-semibold" style={{ color: periodView === mode ? "#4F9CF9" : "var(--text-muted)", background: periodView === mode ? "var(--bg-card)" : "transparent" }}>
+                      {mode === "month" ? (isEn ? "Monthly" : "月度") : (isEn ? "Yearly" : "年度")}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="mt-2 overflow-hidden rounded-lg border border-app-border">
+                {visiblePeriodReturns.map((row, index) => (
+                  <div key={row.key} className="flex items-center justify-between px-3 py-2 text-[10px]" style={{ borderBottom: index < visiblePeriodReturns.length - 1 ? "1px solid var(--border)" : "none" }}>
+                    <span className="font-medium text-ts">{row.key}</span>
+                    <span className="font-bold" style={{ color: profitColor(row.returnRate) }}>{formatPercent(row.returnRate)}</span>
+                  </div>
+                ))}
+              </div>
+            </section>
+
             <div className="grid grid-cols-2 gap-2">
-              <MetricCard label={isEn ? "Invested" : "投入本金"} value={privacyMode ? `${currencySymbol(quoteCurrency)}***` : formatExactMoney(result.totalInvested, quoteCurrency, 2)} />
+              <MetricCard label={isEn ? "Invested" : "投入本金"} value={formatExactMoney(result.totalInvested, quoteCurrency, 2)} />
               <MetricCard
                 label={isEn ? "Market Value" : "期末市值"}
-                value={privacyMode ? `${currencySymbol(quoteCurrency)}***` : formatExactMoney(result.finalMarketValue, quoteCurrency, 2)}
+                value={formatExactMoney(result.finalMarketValue, quoteCurrency, 2)}
               />
               <MetricCard
-                label={isEn ? "Dividends" : "分红收入"}
-                value={privacyMode ? `${currencySymbol(quoteCurrency)}***` : formatExactMoney(result.totalDividends, quoteCurrency, 2)}
-                color={profitColor(result.totalDividends)}
+                label={result.dividendDataStatus === "explicit" ? (isEn ? "Net dividends" : "税后分红收入") : (isEn ? "Dividends" : "分红收入")}
+                value={result.dividendDataStatus === "embedded"
+                  ? (isEn ? "Included in adjusted return" : "已含在复权/净值收益中")
+                  : result.dividendDataStatus === "unavailable"
+                    ? (isEn ? "Not split by source" : "数据源未拆分")
+                    : result.dividendDataStatus === "not_applicable"
+                      ? (isEn ? "Not applicable" : "不适用")
+                      : formatExactMoney(result.totalDividends, quoteCurrency, 2)}
+                color={result.dividendDataStatus === "explicit" ? profitColor(result.totalDividends) : "var(--text-secondary)"}
               />
-              <MetricCard label={isEn ? "Ending Value" : "期末总值"} value={privacyMode ? `${currencySymbol(quoteCurrency)}***` : formatExactMoney(result.finalValue, quoteCurrency, 2)} />
-              <MetricCard
-                label={isEn ? "Total P/L incl. Div." : "总收益(含分红)"}
-                value={`${result.totalPnl >= 0 ? "+" : "-"}${privacyMode ? `${currencySymbol(quoteCurrency)}--` : formatExactMoney(Math.abs(result.totalPnl), quoteCurrency, 2)}`}
-                color={profitColor(result.totalPnl)}
-              />
-              <MetricCard label={isEn ? "Annualized" : "年化收益"} value={formatPercent(result.annualizedReturn)} color={profitColor(result.annualizedReturn)} />
+              <MetricCard label={result.liquidatedAtEnd ? (isEn ? "Net liquidation value" : "清仓后总值") : (isEn ? "Ending valuation" : "期末持仓估值")} value={formatExactMoney(result.finalValue, quoteCurrency, 2)} />
+              <MetricCard label={isEn ? "Fees" : "累计手续费"} value={formatExactMoney(result.totalFees, quoteCurrency, 2)} color={profitColor(-result.totalFees)} />
+              <MetricCard label={isEn ? "Taxes" : "累计税费"} value={formatExactMoney(result.totalTaxes, quoteCurrency, 2)} color={profitColor(-result.totalTaxes)} />
               <MetricCard label={isEn ? "Price Drawdown" : "价格回撤"} value={formatPercent(-result.marketMaxDrawdown)} color={profitColor(-result.marketMaxDrawdown)} />
               <MetricCard label={isEn ? "Total Drawdown" : "总值回撤"} value={formatPercent(-result.maxDrawdown)} color={profitColor(-result.maxDrawdown)} />
               <MetricCard label={isEn ? "Data Points" : "日线点数"} value={`${result.points.length}`} />
             </div>
           </div>
         ) : (
-          <div className="mt-3 rounded-2xl p-4 text-center" style={{ background: "var(--bg-card)", border: "1px solid var(--border-sub)" }}>
+          <div className="mt-3 rounded-xl p-4 text-center" style={{ background: "var(--bg-card)", border: "1px solid var(--border-sub)" }}>
             <p style={{ color: "var(--text-primary)", fontSize: 13, fontWeight: 800 }}>
               {isEn ? "Run a backtest to see the result." : "输入参数后开始回测。"}
             </p>
@@ -979,6 +1393,102 @@ export function Backtest() {
               {isEn ? "Uses daily historical prices only. Intraday data is intentionally excluded." : "回测只使用日线历史，不使用分时数据。"}
             </p>
           </div>
+        )}
+
+        </div>
+
+        {pageTab === "compare" && savedBacktests.length > 0 && (
+          <section>
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-semibold text-tp">{isEn ? "Saved comparisons" : "已保存方案对比"}</p>
+              <span className="text-[10px] text-tmi">{savedBacktests.length}/8</span>
+            </div>
+            {(comparisonMeta?.mixedCurrencies || comparisonMeta?.mixedRanges) && (
+              <div className="mt-2 rounded-lg border border-app-border bg-app-card px-3 py-2.5 text-[10px] leading-[1.55] text-tm">
+                {comparisonMeta.mixedCurrencies
+                  ? (isEn ? "Different currencies are present. Compare return rates, not absolute amounts." : "方案包含不同币种，绝对金额不可直接比较，建议以收益率为主。")
+                  : (isEn ? "Date ranges differ. Annualized return is more comparable than total return." : "方案的回测区间不同，建议优先比较年化收益率，总收益率仅作参考。")}
+              </div>
+            )}
+            <div className="mt-2 space-y-2">
+              {savedBacktests.map((item) => (
+                <div key={item.id} className="flex items-start gap-2 rounded-xl border border-app-border bg-app-card px-3 py-2.5">
+                  <button type="button" onClick={() => loadSavedBacktest(item)} disabled={!item.form} className="min-w-0 flex-1 text-left disabled:cursor-default focus:outline-none">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate text-[11px] font-semibold text-tp">{item.name}</span>
+                      <span className="shrink-0 text-[12px] font-bold" style={{ color: profitColor(item.totalReturn) }}>{formatPercent(item.totalReturn)}</span>
+                    </div>
+                    <div className="mt-1 flex items-center justify-between gap-2 text-[10px] leading-4 text-tmi">
+                      <span>{item.symbol} · {strategyLabel(item.strategy, isEn)} · {item.startDate.slice(0, 7)} - {item.endDate.slice(0, 7)}</span>
+                      {comparisonMeta && item.totalReturn === comparisonMeta.bestReturn && <span className="shrink-0 rounded bg-[rgba(242,78,78,0.1)] px-1 py-0.5 font-semibold" style={{ color: profitColor(1) }}>{isEn ? "Best return" : "总收益最高"}</span>}
+                    </div>
+
+                    <div className="mt-2.5 grid grid-cols-3 gap-x-2 gap-y-2 border-t border-app-border pt-2.5 text-[10px] leading-[1.35]">
+                      <span className="text-tmi">{isEn ? "P/L" : "收益金额"}</span>
+                      <span className="text-tmi">{isEn ? "Annualized" : "年化收益"}</span>
+                      <span className="text-tmi">{isEn ? "Max DD" : "最大回撤"}</span>
+                      <span className="font-bold" style={{ color: profitColor(item.totalPnl) }}>
+                        {item.totalPnl >= 0 ? "+" : "-"}{formatExactMoney(Math.abs(item.totalPnl), item.currency, 2)}
+                      </span>
+                      <span className="font-bold" style={{ color: profitColor(item.annualizedReturn) }}>
+                        {formatPercent(item.annualizedReturn)}{comparisonMeta && item.annualizedReturn === comparisonMeta.bestAnnualized ? ` · ${isEn ? "Best" : "最高"}` : ""}
+                      </span>
+                      <span className="font-bold" style={{ color: profitColor(-item.maxDrawdown) }}>
+                        {formatPercent(-item.maxDrawdown)}{comparisonMeta && item.maxDrawdown === comparisonMeta.lowestDrawdown ? ` · ${isEn ? "Lowest" : "最低"}` : ""}
+                      </span>
+
+                      <span className="text-tmi">{isEn ? "Invested" : "投入本金"}</span>
+                      <span className="text-tmi">{isEn ? "Ending value" : "期末总值"}</span>
+                      <span className="text-tmi">{isEn ? "Fees / taxes" : "手续费 / 税费"}</span>
+                      <span className="font-semibold text-ts">{item.totalInvested == null ? (isEn ? "Not recorded" : "未记录") : formatExactMoney(item.totalInvested, item.currency, 2)}</span>
+                      <span className="font-semibold text-ts">{item.finalValue == null ? (isEn ? "Not recorded" : "未记录") : formatExactMoney(item.finalValue, item.currency, 2)}</span>
+                      <span className="font-semibold text-ts">{item.totalFees == null || item.totalTaxes == null ? (isEn ? "Not recorded" : "未记录") : `${formatExactMoney(item.totalFees, item.currency, 2)} / ${formatExactMoney(item.totalTaxes, item.currency, 2)}`}</span>
+                    </div>
+
+                    <div className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] leading-4 text-tmi">
+                      <span>{isEn ? "Dividends" : "分红"}: <span style={{ color: item.totalDividends != null && item.dividendDataStatus === "explicit" ? profitColor(item.totalDividends) : "var(--text-micro)", fontWeight: 700 }}>
+                          {item.totalDividends == null
+                            ? (isEn ? "Not recorded" : "未记录")
+                            : item.dividendDataStatus === "embedded"
+                              ? (isEn ? "Included" : "已含在收益中")
+                              : item.dividendDataStatus === "unavailable"
+                                ? (isEn ? "Unavailable" : "未拆分")
+                                : item.dividendDataStatus === "not_applicable"
+                                  ? (isEn ? "N/A" : "不适用")
+                                  : formatExactMoney(item.totalDividends, item.currency, 2)}
+                      </span>
+                      </span>
+                      <span>·</span>
+                      <span>{item.dividendMode == null ? (isEn ? "Dividend mode not recorded" : "分红方式未记录") : item.dividendMode === "reinvest" ? (isEn ? "Dividend reinvestment" : "红利再投") : (isEn ? "Cash dividends" : "现金分红")}</span>
+                      {item.tradeCount != null && <><span>·</span><span>{isEn ? `${item.tradeCount} trades` : `${item.tradeCount} 笔交易`}</span></>}
+                      {item.liquidatedAtEnd != null && <><span>·</span><span>{item.liquidatedAtEnd ? (isEn ? "Liquidated" : "期末清仓") : (isEn ? "Held" : "期末持有")}</span></>}
+                    </div>
+
+                    {item.benchmarkSummary && (
+                      <div className="mt-2.5 rounded-lg bg-app-surface px-2.5 py-2 text-[10px] leading-4 text-tm">
+                        {isEn ? "Benchmark" : "对比基准"} {item.benchmarkSummary.label} {formatPercent(item.benchmarkSummary.totalReturn)} · {isEn ? "Excess" : "超额收益"} <span className="font-bold" style={{ color: profitColor(item.totalReturn - item.benchmarkSummary.totalReturn) }}>{formatPercent(item.totalReturn - item.benchmarkSummary.totalReturn)}</span>
+                      </div>
+                    )}
+                  </button>
+                  <button type="button" onClick={() => persistSavedBacktests(savedBacktests.filter((saved) => saved.id !== item.id))} aria-label={isEn ? "Delete saved backtest" : "删除已保存方案"} className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-tmi">
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+            <p className="mt-2.5 text-[10px] leading-4 text-tmi">{isEn ? "Best labels only compare saved results. Select a row to restore and rerun it." : "“最高/最低”仅在已保存方案内比较。点击方案会恢复参数并自动重新回测。"}</p>
+          </section>
+        )}
+
+        {pageTab === "compare" && savedBacktests.length === 0 && (
+          <section className="flex min-h-[390px] flex-col items-center justify-center px-8 text-center">
+            <Save size={22} color="#4F9CF9" />
+            <p className="mt-3 text-xs font-semibold text-tp">{isEn ? "No saved comparisons" : "还没有已保存方案"}</p>
+            <p className="mt-1.5 text-[10px] leading-4 text-tmi">{isEn ? "Run a backtest and save it to compare return, dividends, annualized return, and drawdown here." : "完成回测后保存方案，可在这里对比收益、分红、年化和回撤。"}</p>
+            <button type="button" onClick={() => setPageTab("backtest")} className="mt-4 rounded-lg bg-app-accent px-4 py-2 text-[10px] font-semibold text-white">
+              {isEn ? "Go to backtest" : "去回测"}
+            </button>
+          </section>
         )}
       </div>
     </div>

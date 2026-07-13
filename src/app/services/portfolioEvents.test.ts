@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { ClosedHolding, Holding } from "../data/mockData";
-import { computeReturnBreakdown, getDailyReturns, getHoldingReturnContributions, getMonthlyReturns, getYearlyReturns, migratePortfolioEvents } from "./portfolioEvents";
+import type { PortfolioEvent } from "./portfolioEvents";
+import { compactPortfolioEventHistory, computeBaselineBreakdown, computeReturnBreakdown, getDailyReturns, getHoldingReturnContributions, getMonthlyReturns, getYearlyReturns, migratePortfolioEvents } from "./portfolioEvents";
 
 function holding(patch: Partial<Holding> = {}): Holding {
   return {
@@ -120,6 +121,50 @@ describe("migratePortfolioEvents", () => {
 
     assert.equal(events.filter((event) => event.type === "fee").length, 1);
     assert.equal(computeReturnBreakdown(events).feePnl, -2);
+  });
+
+  test("migrates recorded sale fees and taxes as separate return events", () => {
+    const events = migratePortfolioEvents([], [closedHolding({
+      cashDividendTotal: 0,
+      realizedPnl: 192,
+      transactionFee: 3,
+      transactionTax: 5,
+    })], []);
+    const breakdown = computeReturnBreakdown(events);
+
+    assert.equal(breakdown.realizedTradingPnl, 200);
+    assert.equal(breakdown.transactionFeePnl, -3);
+    assert.equal(breakdown.taxPnl, -5);
+    assert.equal(breakdown.feePnl, -8);
+    assert.equal(events.filter((event) => event.type === "fee").length, 1);
+    assert.equal(events.filter((event) => event.type === "tax").length, 1);
+  });
+
+  test("reuses an existing manual sell event instead of duplicating it on reload", () => {
+    const existingSell: PortfolioEvent = {
+      id: "manual:sell:h1:2026-07-01:10:120:1",
+      date: "2026-07-01",
+      holdingId: "h1",
+      symbol: "006479",
+      name: "测试基金",
+      market: "FUND",
+      assetType: "fund",
+      type: "sell",
+      quantity: 10,
+      price: 120,
+      amount: 200,
+      amountInBase: 200,
+      currency: "CNY",
+      source: "manual",
+      costBasisAtEvent: 1000,
+      proceeds: 1200,
+      createdAt: "2026-07-01T00:00:00.000Z",
+    };
+    const events = migratePortfolioEvents([], [closedHolding()], [], [existingSell]);
+
+    assert.equal(events.filter((event) => event.type === "sell").length, 1);
+    assert.equal(events.find((event) => event.type === "sell")?.id, existingSell.id);
+    assert.equal(events.find((event) => event.type === "sell")?.relatedEventId, "c1");
   });
 
   test("does not add summary dividends for migrated dividend reinvest, interest, or bond coupon actions", () => {
@@ -282,7 +327,7 @@ describe("return aggregations", () => {
       totalPnl: 178,
     }]);
 
-    assert.equal(daily[0]?.totalPnl, 100);
+    assert.equal(daily[0]?.totalPnl, 0);
     assert.equal(daily[1]?.unrealizedPnlChange, 40);
     assert.equal(daily[1]?.totalPnl, 80);
     assert.equal(daily[2]?.feePnl, -2);
@@ -290,13 +335,13 @@ describe("return aggregations", () => {
 
     const monthly = getMonthlyReturns(daily);
     assert.equal(monthly[0]?.month, "2026-07");
-    assert.equal(monthly[0]?.totalPnl, 180);
+    assert.equal(monthly[0]?.totalPnl, 80);
     assert.equal(monthly[1]?.month, "2026-08");
     assert.equal(monthly[1]?.totalPnl, -2);
 
     const yearly = getYearlyReturns(daily);
     assert.equal(yearly[0]?.year, "2026");
-    assert.equal(yearly[0]?.totalPnl, 178);
+    assert.equal(yearly[0]?.totalPnl, 78);
   });
 
   test("keeps event-only dates in period totals when no snapshot exists", () => {
@@ -323,10 +368,10 @@ describe("return aggregations", () => {
     assert.equal(eventOnly.totalPnl, 12);
     assert.equal(eventOnly.totalAsset, 1000);
     assert.equal(eventOnly.incompleteBreakdown, true);
-    assert.equal(getMonthlyReturns(daily)[0]?.totalPnl, 112);
+    assert.equal(getMonthlyReturns(daily)[0]?.totalPnl, 12);
   });
 
-  test("includes the imported holding baseline in tracked cumulative returns", () => {
+  test("treats the first imported snapshot as a baseline instead of same-day profit", () => {
     const daily = getDailyReturns([], [{
       date: "2026-07-01",
       totalAsset: 1200,
@@ -336,9 +381,24 @@ describe("return aggregations", () => {
       migratedBaseline: true,
     }]);
 
-    assert.equal(daily[0]?.unrealizedPnlChange, 200);
-    assert.equal(daily[0]?.totalPnl, 200);
+    assert.equal(daily[0]?.unrealizedPnlChange, 0);
+    assert.equal(daily[0]?.totalPnl, 0);
     assert.equal(daily[0]?.incompleteBreakdown, true);
+  });
+
+  test("preserves pruned returns in a dated baseline", () => {
+    const events: PortfolioEvent[] = [
+      { id: "old-sell", date: "2026-01-01", type: "sell", amount: 20, amountInBase: 20, currency: "CNY", source: "manual", costBasisAtEvent: 100, createdAt: "2026-01-01T00:00:00.000Z" },
+      { id: "old-tax", date: "2026-01-01", type: "tax", amount: -2, amountInBase: -2, currency: "CNY", source: "manual", createdAt: "2026-01-01T00:00:01.000Z" },
+      { id: "new-div", date: "2026-02-01", type: "cash_dividend", amount: 5, amountInBase: 5, currency: "CNY", source: "auto", createdAt: "2026-02-01T00:00:00.000Z" },
+    ];
+    const compacted = compactPortfolioEventHistory(events, { daily: {}, realizedCostBasis: 0 }, 1);
+    assert.deepEqual(compacted.events.map((event) => event.id), ["new-div"]);
+    assert.equal(computeBaselineBreakdown(compacted.baseline).realizedTradingPnl, 20);
+    assert.equal(computeBaselineBreakdown(compacted.baseline).taxPnl, -2);
+    assert.equal(compacted.baseline.realizedCostBasis, 100);
+    const daily = getDailyReturns(compacted.events, [], compacted.baseline);
+    assert.equal(daily.find((row) => row.date === "2026-01-01")?.totalPnl, 18);
   });
 
   test("calculates period holding ranking from holding snapshots and realized events", () => {

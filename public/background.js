@@ -2,6 +2,31 @@ const OPEN_MODE_KEY = "asset-helper:open-mode";
 const DEFAULT_MODE = "popup";
 const SIDE_PANEL_PATH = "index.html?view=sidepanel";
 const POPUP_PATH = "index.html";
+const SNAPSHOT_ALARM = "asset-helper:daily-snapshot-reminder";
+const SNAPSHOT_DUE_KEY = "asset-helper:snapshot-due-dates:v1";
+
+function localYMD(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+async function ensureSnapshotAlarm() {
+  const existing = await chrome.alarms.get(SNAPSHOT_ALARM);
+  if (existing) return;
+  const next = new Date();
+  next.setHours(18, 0, 0, 0);
+  if (next.getTime() <= Date.now()) next.setDate(next.getDate() + 1);
+  chrome.alarms.create(SNAPSHOT_ALARM, { when: next.getTime(), periodInMinutes: 24 * 60 });
+}
+
+async function markSnapshotDue(date = localYMD()) {
+  const data = await chrome.storage.local.get(SNAPSHOT_DUE_KEY);
+  const current = Array.isArray(data[SNAPSHOT_DUE_KEY]) ? data[SNAPSHOT_DUE_KEY] : [];
+  const dates = [...new Set([...current, date])].sort().slice(-31);
+  await chrome.storage.local.set({ [SNAPSHOT_DUE_KEY]: dates });
+}
 
 function normalizeMode(mode) {
   return mode === "sidepanel" ? "sidepanel" : "popup";
@@ -45,47 +70,39 @@ async function applyOpenMode(mode) {
 }
 
 async function openMode(mode, sender) {
-  const normalized = await setOpenMode(mode);
+  const normalized = normalizeMode(mode);
+  await applyOpenMode(normalized);
   if (normalized === "sidepanel") {
-    if (chrome.sidePanel?.open) {
-      const senderWindowId = sender?.tab?.windowId;
-      let windowId = typeof senderWindowId === "number" ? senderWindowId : undefined;
-      if (typeof windowId !== "number" && chrome.windows?.getCurrent) {
-        const currentWindow = await chrome.windows.getCurrent();
-        windowId = typeof currentWindow?.id === "number" ? currentWindow.id : undefined;
-      }
-      if (typeof windowId === "number") {
-        await chrome.sidePanel.open({ windowId });
-      }
+    if (!chrome.sidePanel?.open) throw new Error("sidepanel_unavailable");
+    const senderWindowId = sender?.tab?.windowId;
+    let windowId = typeof senderWindowId === "number" ? senderWindowId : undefined;
+    if (typeof windowId !== "number" && chrome.windows?.getCurrent) {
+      const currentWindow = await chrome.windows.getCurrent();
+      windowId = typeof currentWindow?.id === "number" ? currentWindow.id : undefined;
     }
+    if (typeof windowId !== "number") throw new Error("window_unavailable");
+    await chrome.sidePanel.open({ windowId });
+    await chrome.storage.local.set({ [OPEN_MODE_KEY]: normalized });
     return;
   }
 
-  // Switching to popup: set the popup path and try to open it. The
-  // currently-open side panel will be closed by the caller (window.close()
-  // from the side panel page) or by Chrome when the popup opens.
-  if (chrome.sidePanel?.setPanelBehavior) {
-    try {
-      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
-    } catch { /* ignore */ }
-  }
-  try {
-    await chrome.action.setPopup({ popup: POPUP_PATH });
-  } catch { /* ignore */ }
-
-  if (chrome.action.openPopup) {
-    try {
-      await chrome.action.openPopup();
-    } catch { /* openPopup may fail without a user gesture */ }
-  }
+  if (!chrome.action?.openPopup) throw new Error("open_popup_unavailable");
+  await chrome.action.openPopup();
+  await chrome.storage.local.set({ [OPEN_MODE_KEY]: normalized });
 }
 
 chrome.runtime.onInstalled.addListener(() => {
   void getOpenMode().then(applyOpenMode).catch(() => applyOpenMode(DEFAULT_MODE));
+  void ensureSnapshotAlarm();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   void getOpenMode().then(applyOpenMode).catch(() => applyOpenMode(DEFAULT_MODE));
+  void ensureSnapshotAlarm();
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === SNAPSHOT_ALARM) void markSnapshotDue();
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -98,10 +115,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "asset-helper:get-open-mode") {
+    void getOpenMode()
+      .then((mode) => sendResponse({ ok: true, mode }))
+      .catch((error) => sendResponse({ ok: false, reason: error?.message ?? "get_failed" }));
+    return true;
+  }
+
   if (message.type === "asset-helper:open-mode") {
     void openMode(message.mode, sender)
       .then(() => sendResponse({ ok: true, mode: normalizeMode(message.mode) }))
       .catch((error) => sendResponse({ ok: false, reason: error?.message ?? "open_failed" }));
+    return true;
+  }
+
+  if (message.type === "asset-helper:consume-snapshot-due") {
+    void chrome.storage.local.get(SNAPSHOT_DUE_KEY)
+      .then((data) => {
+        const dates = Array.isArray(data[SNAPSHOT_DUE_KEY]) ? data[SNAPSHOT_DUE_KEY] : [];
+        return chrome.storage.local.remove(SNAPSHOT_DUE_KEY).then(() => sendResponse({ ok: true, dates }));
+      })
+      .catch((error) => sendResponse({ ok: false, reason: error?.message ?? "consume_failed" }));
     return true;
   }
 

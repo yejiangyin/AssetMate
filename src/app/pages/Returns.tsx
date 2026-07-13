@@ -17,10 +17,12 @@ import { useApp } from "../context/AppContext";
 import { t } from "../i18n";
 import {
   computeReturnBreakdown,
+  emptyReturnBreakdown,
   getDailyReturns,
   getHoldingReturnContributions,
   getMonthlyReturns,
   getYearlyReturns,
+  mergeReturnBreakdowns,
   type DailyReturn,
   type MonthlyReturn,
   type PortfolioSnapshotInput,
@@ -28,10 +30,10 @@ import {
 } from "../services/portfolioEvents";
 import { toCNY } from "../services/priceRefresher";
 import { formatPercent } from "../utils/numberFormat";
-import { breakdownBarWidth, formatCompactCny, hasMeaningfulReturnData, returnEventValue } from "../utils/returnsPresentation";
+import { breakdownBarWidth, formatCalendarCny, formatCompactCny, hasMeaningfulReturnData, returnEventValue } from "../utils/returnsPresentation";
 
-type ScopeMode = "yesterday" | "month" | "year" | "all";
-type ViewLevel = "day" | "days" | "months" | "years";
+type ScopeMode = "week" | "month" | "year" | "all";
+type ViewLevel = "day" | "week" | "days" | "months" | "years";
 type ReturnRow = DailyReturn | MonthlyReturn | YearlyReturn;
 
 const chartColors = {
@@ -39,6 +41,7 @@ const chartColors = {
   realized: "#31D08B",
   dividend: "#F59E0B",
   fee: "#94A3B8",
+  tax: "#64748B",
 };
 
 function localYMD(date = new Date()) {
@@ -52,6 +55,14 @@ function addLocalDays(ymd: string, amount: number) {
   const [year = 1970, month = 1, day = 1] = ymd.split("-").map(Number);
   const date = new Date(year, month - 1, day);
   date.setDate(date.getDate() + amount);
+  return localYMD(date);
+}
+
+export function startOfLocalWeek(ymd: string) {
+  const [year = 1970, month = 1, day = 1] = ymd.split("-").map(Number);
+  const date = new Date(year, month - 1, day);
+  const mondayOffset = (date.getDay() + 6) % 7;
+  date.setDate(date.getDate() - mondayOffset);
   return localYMD(date);
 }
 
@@ -92,6 +103,14 @@ function sumRows(rows: ReturnRow[]) {
 
 function formatPeriodTitle(key: string, level: ViewLevel, language: "zh" | "en", locale: string) {
   if (level === "years") return language === "en" ? "All Time" : "累计收益";
+  if (level === "week") {
+    const end = addLocalDays(key, 6);
+    const format = (value: string) => {
+      const [year = 1970, month = 1, day = 1] = value.split("-").map(Number);
+      return new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" }).format(new Date(year, month - 1, day));
+    };
+    return `${format(key)} - ${format(end)}`;
+  }
   if (level === "months") return language === "en" ? key : `${key}年`;
   if (level === "days") {
     const [year = 1970, month = 1] = key.split("-").map(Number);
@@ -134,14 +153,6 @@ function hexToRgba(hex: string, alpha: number): string {
   return `rgba(${r},${g},${b},${alpha})`;
 }
 
-function darkenHex(hex: string, amount: number): string {
-  const r = Math.max(0, parseInt(hex.slice(1, 3), 16) - amount);
-  const g = Math.max(0, parseInt(hex.slice(3, 5), 16) - amount);
-  const b = Math.max(0, parseInt(hex.slice(5, 7), 16) - amount);
-  return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
-}
-
-
 function formatMonthShort(monthKey: string, locale: string) {
   const [, month = 1] = monthKey.split("-").map(Number);
   return new Intl.DateTimeFormat(locale, { month: "short" }).format(new Date(2000, month - 1, 1));
@@ -161,6 +172,7 @@ type GridCell = {
 export function Returns() {
   const {
     portfolioEvents,
+    portfolioEventBaseline,
     assetSnapshots,
     holdings,
     stats,
@@ -177,11 +189,12 @@ export function Returns() {
   const copy = text.returns;
   const locale = language === "en" ? "en-US" : "zh-CN";
   const today = localYMD();
-  const yesterday = addLocalDays(today, -1);
+  const currentWeek = startOfLocalWeek(today);
   const currentMonth = today.slice(0, 7);
   const currentYear = today.slice(0, 4);
-  const [scope, setScope] = useState<ScopeMode>("month");
+  const [scope, setScope] = useState<ScopeMode>("week");
   const [path, setPath] = useState<string[]>([]);
+  const [selectedWeek, setSelectedWeek] = useState(currentWeek);
   const [selectedMonth, setSelectedMonth] = useState(currentMonth);
   const [selectedYear, setSelectedYear] = useState(currentYear);
   const [manualRefreshing, setManualRefreshing] = useState(false);
@@ -200,6 +213,7 @@ export function Returns() {
   const handleScopeChange = (next: ScopeMode) => {
     setScope(next);
     setPath([]);
+    if (next === "week") setSelectedWeek(currentWeek);
     if (next === "month") setSelectedMonth(currentMonth);
     if (next === "year") setSelectedYear(currentYear);
   };
@@ -230,16 +244,16 @@ export function Returns() {
   }, [assetSnapshots, holdings, stats, today]);
 
   const dailyRows = useMemo(
-    () => getDailyReturns(portfolioEvents, analysisSnapshots),
-    [analysisSnapshots, portfolioEvents],
+    () => getDailyReturns(portfolioEvents, analysisSnapshots, portfolioEventBaseline),
+    [analysisSnapshots, portfolioEventBaseline, portfolioEvents],
   );
 
   const view = useMemo(() => {
     let level: ViewLevel;
     let key: string;
-    if (scope === "yesterday") {
-      level = "day";
-      key = yesterday;
+    if (scope === "week") {
+      level = path[0] ? "day" : "week";
+      key = path[0] || selectedWeek;
     } else if (scope === "month") {
       level = path[0] ? "day" : "days";
       key = path[0] || selectedMonth;
@@ -256,6 +270,9 @@ export function Returns() {
     if (level === "day") {
       start = key;
       end = key;
+    } else if (level === "week") {
+      start = key;
+      end = addLocalDays(key, 6);
     } else if (level === "days") {
       start = `${key}-01`;
       end = lastDayOfMonth(key);
@@ -272,7 +289,7 @@ export function Returns() {
       end,
       title: formatPeriodTitle(key, level, language, locale),
     };
-  }, [dailyRows, language, locale, path, scope, selectedMonth, selectedYear, today, yesterday]);
+  }, [dailyRows, language, locale, path, scope, selectedMonth, selectedWeek, selectedYear, today]);
 
   const selectedDailyRows = useMemo(
     () => dailyRows.filter((row) => row.date >= view.start && row.date <= view.end),
@@ -289,6 +306,14 @@ export function Returns() {
     [portfolioEvents, view.end, view.start],
   );
   const eventBreakdown = useMemo(() => computeReturnBreakdown(periodEvents), [periodEvents]);
+  const archivedBreakdown = useMemo(() => Object.entries(portfolioEventBaseline.daily)
+    .filter(([date]) => date >= view.start && date <= view.end)
+    .reduce((sum, [, row]) => mergeReturnBreakdowns(sum, row), emptyReturnBreakdown()),
+  [portfolioEventBaseline, view.end, view.start]);
+  const periodBreakdown = useMemo(
+    () => mergeReturnBreakdowns(archivedBreakdown, eventBreakdown),
+    [archivedBreakdown, eventBreakdown],
+  );
   const incompleteCount = selectedDailyRows.filter((row) => row.incompleteBreakdown).length;
   const trackingStart = dailyRows[0]?.date;
   const containsBaseline = selectedDailyRows.some((row) => row.incompleteBreakdown)
@@ -301,13 +326,14 @@ export function Returns() {
     ? Math.max(0, selectedDailyRows[0].totalAsset - selectedDailyRows[0].totalPnl)
     : stats.costBasis;
   const periodRate = startingAsset > 0 ? totals.totalPnl / startingAsset : 0;
-  const realizedIncome = eventBreakdown.realizedTradingPnl + eventBreakdown.dividendPnl + eventBreakdown.feePnl;
+  const realizedIncome = periodBreakdown.realizedTradingPnl + periodBreakdown.dividendPnl + periodBreakdown.feePnl;
 
   const sourceRows = [
     { key: "unrealized", label: copy.unrealizedChange, value: totals.unrealizedPnlChange, color: chartColors.unrealized },
     { key: "realized", label: copy.realizedTrading, value: totals.realizedTradingPnl, color: chartColors.realized },
     { key: "dividend", label: copy.dividendIncome, value: totals.dividendPnl, color: chartColors.dividend },
-    { key: "fee", label: copy.feeTax, value: totals.feePnl, color: chartColors.fee },
+    { key: "fee", label: copy.transactionFee, value: periodBreakdown.transactionFeePnl, color: chartColors.fee },
+    { key: "tax", label: copy.transactionTax, value: periodBreakdown.taxPnl, color: chartColors.tax },
   ];
 
   const identityById = useMemo(() => {
@@ -330,9 +356,27 @@ export function Returns() {
     ...row,
     ...(identityById.get(row.id) ?? { name: row.id, symbol: "-" }),
   })), [analysisSnapshots, identityById, portfolioEvents, view.end, view.start]);
-  const rankIsEstimated = rankRows.some((row) => row.incompleteBreakdown);
+  const rankIsEstimated = rankRows.some((row) => row.incompleteBreakdown)
+    || Object.keys(portfolioEventBaseline.daily).some((date) => date >= view.start && date <= view.end);
 
   const gridCells = useMemo<GridCell[]>(() => {
+    if (view.level === "week") {
+      const rowByDate = new Map(selectedDailyRows.map((row) => [row.date, row]));
+      return Array.from({ length: 7 }, (_, index) => {
+        const date = addLocalDays(view.key, index);
+        const row = rowByDate.get(date);
+        const startingAsset = priorTotalAsset(dailyRows, date);
+        return {
+          key: date,
+          label: String(Number(date.slice(-2))),
+          totalPnl: row?.totalPnl ?? 0,
+          rate: cellRate(row?.totalPnl ?? 0, startingAsset),
+          row,
+          disabled: date > today,
+          isToday: date === today,
+        };
+      });
+    }
     if (view.level === "days") {
       const [year = 1970, month = 1] = view.key.split("-").map(Number);
       const firstWeekday = (new Date(year, month - 1, 1).getDay() + 6) % 7;
@@ -404,17 +448,16 @@ export function Returns() {
   };
   const navigateToDay = (date: string) => {
     if (date > today) return;
-    if (scope === "yesterday") {
-      setScope("month");
-      setSelectedMonth(date.slice(0, 7));
-      setPath([date]);
-      return;
-    }
     setPath((current) => current.length > 0 ? [...current.slice(0, -1), date] : [date]);
   };
   const navigatePeriod = (direction: -1 | 1) => {
     if (view.level === "day") {
       navigateToDay(addLocalDays(view.key, direction));
+      return;
+    }
+    if (scope === "week" && path.length === 0) {
+      const next = addLocalDays(selectedWeek, direction * 7);
+      if (next <= currentWeek) setSelectedWeek(next);
       return;
     }
     if (scope === "month" && path.length === 0) {
@@ -427,14 +470,17 @@ export function Returns() {
       if (next <= currentYear) setSelectedYear(next);
     }
   };
-  const canGoBack = scope !== "yesterday" && path.length > 0;
+  const canGoBack = path.length > 0;
   const canDrill = view.level !== "day";
   const showPeriodNavigation = view.level === "day"
+    || (scope === "week" && path.length === 0)
     || (scope === "month" && path.length === 0)
     || (scope === "year" && path.length === 0);
   const nextPeriodDisabled = view.level === "day"
     ? view.key >= today
-    : scope === "month"
+    : scope === "week"
+      ? selectedWeek >= currentWeek
+      : scope === "month"
       ? selectedMonth >= currentMonth
       : selectedYear >= currentYear;
   const dayEvents = periodEvents.filter((event) => returnEventValue(event) !== 0);
@@ -471,25 +517,68 @@ export function Returns() {
             </HeaderIconButton>
           </div>
         </div>
-        <div className="border-b border-app-border px-3 py-2">
-          <div className="grid grid-cols-4 rounded-xl bg-app-card p-1">
-            {(["yesterday", "month", "year", "all"] as ScopeMode[]).map((item) => (
-              <button
-                key={item}
-                type="button"
-                onClick={() => handleScopeChange(item)}
-                className="rounded-lg px-1 py-1.5 text-[11px] font-bold transition-colors"
-                style={{
-                  color: scope === item ? "#4F9CF9" : "var(--text-muted)",
-                  background: scope === item ? "rgba(79,156,249,0.14)" : "transparent",
-                  border: scope === item ? "1px solid rgba(79,156,249,0.22)" : "1px solid transparent",
-                }}
-              >
-                {copy.scopes[item]}
-              </button>
-            ))}
+        {path.length === 0 && (
+          <div className="border-b border-app-border px-3 py-2">
+            <div className="grid grid-cols-4 rounded-xl bg-app-card p-1">
+              {(["week", "month", "year", "all"] as ScopeMode[]).map((item) => (
+                <button
+                  key={item}
+                  type="button"
+                  onClick={() => handleScopeChange(item)}
+                  className="rounded-lg px-1 py-1.5 text-[11px] font-bold transition-colors"
+                  style={{
+                    color: scope === item ? "#4F9CF9" : "var(--text-muted)",
+                    background: scope === item ? "rgba(79,156,249,0.14)" : "transparent",
+                    border: scope === item ? "1px solid rgba(79,156,249,0.22)" : "1px solid transparent",
+                  }}
+                >
+                  {copy.scopes[item]}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+        )}
+        {!isPortfolioEmpty && (
+          <div className="flex min-h-11 shrink-0 items-center justify-between gap-2 border-b border-app-border px-4">
+            <div className="flex min-w-0 items-center gap-1.5">
+              {canGoBack && (
+                <button
+                  type="button"
+                  onClick={() => setPath((current) => current.slice(0, -1))}
+                  aria-label={copy.back}
+                  title={copy.back}
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-app-card text-tm"
+                >
+                  <ChevronLeft size={15} />
+                </button>
+              )}
+              <span className="truncate text-xs font-semibold text-ts">{view.title}</span>
+            </div>
+            {showPeriodNavigation ? (
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => navigatePeriod(-1)}
+                  aria-label={copy.previousPeriod}
+                  title={copy.previousPeriod}
+                  className="flex h-7 w-7 items-center justify-center rounded-lg bg-app-card text-tm"
+                >
+                  <ChevronLeft size={14} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => navigatePeriod(1)}
+                  disabled={nextPeriodDisabled}
+                  aria-label={copy.nextPeriod}
+                  title={copy.nextPeriod}
+                  className="flex h-7 w-7 items-center justify-center rounded-lg bg-app-card text-tm disabled:opacity-35"
+                >
+                  <ChevronRight size={14} />
+                </button>
+              </div>
+            ) : trackingStart ? <span className="shrink-0 text-[9px] text-tmi">{copy.trackedSince(trackingStart)}</span> : null}
+          </div>
+        )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-5 pt-3" style={{ scrollbarWidth: "none", overscrollBehaviorY: "contain" }}>
@@ -510,46 +599,6 @@ export function Returns() {
           </section>
         ) : (
           <>
-        <div className="mb-2 flex min-h-7 items-center justify-between gap-2 px-0.5">
-          <div className="flex min-w-0 items-center gap-1.5">
-            {canGoBack && (
-              <button
-                type="button"
-                onClick={() => setPath((current) => current.slice(0, -1))}
-                aria-label={copy.back}
-                title={copy.back}
-                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-app-card text-tm"
-              >
-                <ChevronLeft size={15} />
-              </button>
-            )}
-            <span className="truncate text-xs font-semibold text-ts">{view.title}</span>
-          </div>
-          {showPeriodNavigation ? (
-            <div className="flex shrink-0 items-center gap-1">
-              <button
-                type="button"
-                onClick={() => navigatePeriod(-1)}
-                aria-label={copy.previousPeriod}
-                title={copy.previousPeriod}
-                className="flex h-7 w-7 items-center justify-center rounded-lg bg-app-card text-tm"
-              >
-                <ChevronLeft size={14} />
-              </button>
-              <button
-                type="button"
-                onClick={() => navigatePeriod(1)}
-                disabled={nextPeriodDisabled}
-                aria-label={copy.nextPeriod}
-                title={copy.nextPeriod}
-                className="flex h-7 w-7 items-center justify-center rounded-lg bg-app-card text-tm disabled:opacity-35"
-              >
-                <ChevronRight size={14} />
-              </button>
-            </div>
-          ) : trackingStart ? <span className="shrink-0 text-[9px] text-tmi">{copy.trackedSince(trackingStart)}</span> : null}
-        </div>
-
         {incompleteCount > 0 && (
           <div className="mb-3 flex gap-2 rounded-xl border px-3 py-2" style={{ borderColor: "rgba(245,158,11,0.24)", background: "rgba(245,158,11,0.07)" }}>
             <AlertCircle size={14} color="#F59E0B" className="mt-0.5 shrink-0" />
@@ -566,7 +615,7 @@ export function Returns() {
             {signedMoney(totals.totalPnl)}
           </p>
           <div className="mt-3 grid grid-cols-3 gap-2 border-t border-app-border pt-2.5">
-            <Metric label={copy.periodRate} value={privacyMode ? "--" : formatPercent(periodRate, 2, locale)} color={profitColor(periodRate)} />
+            <Metric label={copy.periodRate} value={formatPercent(periodRate, 2, locale)} color={profitColor(periodRate)} />
             <Metric label={copy.realizedIncome} value={signedMoney(realizedIncome)} color={profitColor(realizedIncome)} />
             <Metric label={copy.positiveDays} value={copy.dayCount(positiveDays, activeDays)} color="var(--text-secondary)" />
           </div>
@@ -582,50 +631,57 @@ export function Returns() {
             <SectionHeader icon={<CalendarDays size={14} color="#4F9CF9" />} title={copy.calendar} meta={view.title} />
             <div className="rounded-xl border border-app-border bg-app-card p-2">
               {gridCells.length > 0 ? (
-                <div className={`grid ${view.level === "days" ? "grid-cols-7 gap-1" : "grid-cols-3 gap-1.5"}`}>
-                  {view.level === "days" && copy.weekday.map((weekday, index) => (
-                    <span key={`wd-${index}`} className="pb-1.5 text-center text-[9px] font-medium text-tmi">{weekday}</span>
+                <div className={`grid ${view.level === "days" || view.level === "week" ? "grid-cols-7 gap-1" : "grid-cols-3 gap-1.5"}`}>
+                  {(view.level === "days" || view.level === "week") && copy.weekday.map((weekday, index) => (
+                    <span key={`wd-${index}`} className="pb-1.5 text-center text-[9px] font-semibold text-tm">{weekday}</span>
                   ))}
                   {gridCells.map((cell, index) => {
                     if (cell.blank) return <span key={`blank-${index}`} />;
-                    const isDays = view.level === "days";
+                    const isDays = view.level === "days" || view.level === "week";
                     const rawColor = cell.totalPnl !== 0 ? profitColor(cell.totalPnl) : "";
-                    const moneyColor = rawColor ? darkenHex(rawColor, 35) : "var(--text-micro)";
                     const absRate = Math.min(Math.abs(cell.rate), 1);
-                    const bgIntensity = 0.07 + absRate * 0.15;
+                    const bgIntensity = 0.035 + absRate * 0.07;
                     return (
                       <button
                         key={cell.key ?? `cell-${index}`}
                         type="button"
                         disabled={cell.disabled}
                         onClick={() => handleCellClick(cell)}
-                        className={`min-w-0 text-center transition-colors ${isDays ? "rounded-md p-1" : "rounded-lg p-2"}`}
+                        aria-current={cell.isToday ? "date" : undefined}
+                        className={`group min-w-0 text-left transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-app-accent ${isDays ? "rounded-md px-1.5 py-1" : "rounded-lg p-2"}`}
                         style={{
-                          minHeight: isDays ? 48 : 58,
+                          minHeight: isDays ? 56 : 58,
                           background: cell.disabled
-                            ? "var(--bg-surface2)"
+                            ? "transparent"
                             : cell.totalPnl !== 0
-                              ? hexToRgba(moneyColor, bgIntensity)
-                              : "var(--bg-surface2)",
-                          opacity: cell.disabled ? 0.4 : 1,
-                          border: "1px solid transparent",
+                              ? hexToRgba(rawColor, bgIntensity)
+                              : "transparent",
+                          opacity: cell.disabled ? 0.28 : 1,
+                          border: cell.isToday
+                            ? "1px solid rgba(79,156,249,0.42)"
+                            : rawColor
+                              ? `1px solid ${hexToRgba(rawColor, 0.12)}`
+                              : "1px solid transparent",
                         }}
                       >
-                        <span className={`block leading-tight text-tmi ${isDays ? "text-left text-[9px]" : "text-[11px] font-medium"}`}>
+                        <span
+                          className={`inline-flex leading-tight ${isDays ? "min-h-4 items-center text-[9px] font-semibold" : "text-[11px] font-medium"}`}
+                          style={{ color: cell.isToday ? "#4F9CF9" : "var(--text-muted)" }}
+                        >
                           {cell.label}
                         </span>
                         <span
                           className={`mt-1 block font-bold leading-tight break-words ${isDays ? "text-[9px]" : "text-[12px]"}`}
-                          style={{ color: moneyColor }}
+                          style={{ color: rawColor || "var(--text-micro)" }}
                         >
-                          {cell.row && cell.totalPnl !== 0 ? signedMoney(cell.totalPnl) : "-"}
+                          {cell.row && cell.totalPnl !== 0 ? formatCalendarCny(cell.totalPnl, privacyMode, locale) : "-"}
                         </span>
                         {cell.row && cell.totalPnl !== 0 && (
                           <span
                             className={`mt-0.5 block leading-tight ${isDays ? "text-[8px]" : "text-[9px]"}`}
-                            style={{ color: moneyColor }}
+                            style={{ color: rawColor }}
                           >
-                            {privacyMode ? "--" : formatPercent(cell.rate, 2, locale)}
+                            {formatPercent(cell.rate, 2, locale)}
                           </span>
                         )}
                       </button>
@@ -700,7 +756,7 @@ export function Returns() {
                     currency: "CNY",
                   }, locale)}</span>
                   <span className="mt-1 block truncate text-[10px] font-bold" style={{ color: cell.row ? profitColor(cell.row.totalPnl) : "var(--text-micro)" }}>
-                    {cell.row && cell.row.totalPnl !== 0 ? signedMoney(cell.row.totalPnl) : "-"}
+                    {cell.row && cell.row.totalPnl !== 0 ? formatCalendarCny(cell.row.totalPnl, privacyMode, locale) : "-"}
                   </span>
                 </button>
               ))}
@@ -738,6 +794,7 @@ export function Returns() {
           <div className="overflow-hidden rounded-xl border border-app-border bg-app-card">
             {rankRows.map((row, index) => {
               const realized = row.realizedTradingPnl + row.dividendPnl + row.feePnl;
+              const contributionRate = startingAsset > 0 ? row.totalPnl / startingAsset : 0;
               return (
                 <div key={row.id} className="flex items-center gap-2 px-3 py-2.5" style={{ borderBottom: index < rankRows.length - 1 ? "1px solid var(--border)" : "none" }}>
                   <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-[9px] font-bold" style={{ color: index < 3 ? "#F59E0B" : "var(--text-micro)", background: index < 3 ? "rgba(245,158,11,0.10)" : "var(--bg-surface2)" }}>
@@ -749,7 +806,12 @@ export function Returns() {
                       {row.symbol} · {copy.shortUnrealized} {signedMoney(row.unrealizedPnlChange)} · {copy.rankRealized} {signedMoney(realized)}
                     </p>
                   </div>
-                  <span className="shrink-0 text-xs font-bold" style={{ color: profitColor(row.totalPnl) }}>{signedMoney(row.totalPnl)}</span>
+                  <div className="shrink-0 text-right">
+                    <span className="block text-xs font-bold" style={{ color: profitColor(row.totalPnl) }}>{signedMoney(row.totalPnl)}</span>
+                    <span className="mt-0.5 block text-[9px] font-semibold" style={{ color: profitColor(contributionRate) }}>
+                      {copy.rankContribution} {formatPercent(contributionRate, 2, locale)}
+                    </span>
+                  </div>
                 </div>
               );
             })}

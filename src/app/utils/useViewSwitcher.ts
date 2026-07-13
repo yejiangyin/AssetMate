@@ -1,6 +1,6 @@
 import { useCallback } from "react";
 import { useApp } from "../context/AppContext";
-import { getExtensionViewMode, openExtensionMode, syncExtensionOpenMode, type ExtensionOpenMode } from "./extensionOpenMode";
+import { getExtensionViewMode, openExtensionMode, type ExtensionOpenMode } from "./extensionOpenMode";
 
 function closeCurrentWindow(delay = 0) {
   if (typeof window === "undefined") return;
@@ -23,18 +23,20 @@ export function useViewSwitcher(onError?: () => void) {
     : (language === "en" ? "Switch to side panel" : "切换为右侧面板");
 
   const switchToMode = useCallback((mode: ExtensionOpenMode) => {
-    setDefaultOpenMode(mode);
-    if (mode === currentView) return;
-
-    if (currentView === "sidepanel" && mode === "popup") {
-      void syncExtensionOpenMode(mode)
-        .then(() => closeCurrentWindow())
-        .catch(() => onError?.());
+    if (mode === currentView) {
+      setDefaultOpenMode(mode);
       return;
     }
 
     void openExtensionMode(mode)
-      .then(() => closeCurrentWindow(150))
+      .then((result) => {
+        if (!result.ok) {
+          onError?.();
+          return;
+        }
+        setDefaultOpenMode(mode);
+        closeCurrentWindow(150);
+      })
       .catch(() => onError?.());
   }, [currentView, onError, setDefaultOpenMode]);
 

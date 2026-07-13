@@ -11,6 +11,13 @@ export type BacktestInput = {
   /** Recurring investment amount per period (month / week / day). */
   monthlyAmount: number;
   feeRate: number;
+  sellFeeRate?: number;
+  buyTaxRate?: number;
+  sellTaxRate?: number;
+  dividendTaxRate?: number;
+  minimumFee?: number;
+  liquidateAtEnd?: boolean;
+  dividendMode?: "cash" | "reinvest";
 };
 
 export type BacktestPricePoint = {
@@ -38,6 +45,12 @@ export type BacktestPoint = {
   value: number;
   pnl: number;
   returnRate: number;
+  unitValue: number;
+};
+
+export type BacktestPeriodReturn = {
+  key: string;
+  returnRate: number;
 };
 
 export type BacktestResult = {
@@ -52,6 +65,19 @@ export type BacktestResult = {
   /** Drawdown of total value including accumulated cash dividends. */
   maxDrawdown: number;
   totalDividends: number;
+  grossDividends: number;
+  dividendDataStatus: "explicit" | "embedded" | "unavailable" | "not_applicable";
+  totalFees: number;
+  totalTaxes: number;
+  tradeCount: number;
+  actualStartDate: string;
+  actualEndDate: string;
+  liquidatedAtEnd: boolean;
+  dividendMode: "cash" | "reinvest";
+  maxDrawdownStartDate: string;
+  maxDrawdownEndDate: string;
+  monthlyReturns: BacktestPeriodReturn[];
+  yearlyReturns: BacktestPeriodReturn[];
   priceMode: "adjusted" | "cash_dividend";
   points: BacktestPoint[];
 };
@@ -122,11 +148,18 @@ function calculateXirr(cashFlows: Array<{ date: string; amount: number }>) {
   return (low + high) / 2;
 }
 
-function buyShares(amount: number, price: number, feeRate: number) {
+function transactionCost(amount: number, feeRate: number, taxRate: number, minimumFee: number) {
+  const safeAmount = normalizeAmount(amount);
+  const fee = safeAmount > 0 && feeRate > 0 ? Math.max(safeAmount * feeRate, minimumFee) : 0;
+  const tax = safeAmount > 0 && taxRate > 0 ? safeAmount * taxRate : 0;
+  return { fee, tax };
+}
+
+function buyShares(amount: number, price: number, feeRate: number, taxRate: number, minimumFee: number) {
   const gross = normalizeAmount(amount);
   if (gross <= 0 || price <= 0) return 0;
-  const fee = gross * Math.max(0, feeRate);
-  return Math.max(0, gross - fee) / price;
+  const { fee, tax } = transactionCost(gross, feeRate, taxRate, minimumFee);
+  return Math.max(0, gross - fee - tax) / price;
 }
 
 /** Returns the period key for a recurring strategy, or "" for lump_sum. */
@@ -139,6 +172,22 @@ function periodKey(strategy: BacktestStrategy, date: string): string {
 
 function isDcaStrategy(strategy: BacktestStrategy): strategy is "monthly_dca" | "weekly_dca" | "daily_dca" {
   return strategy === "monthly_dca" || strategy === "weekly_dca" || strategy === "daily_dca";
+}
+
+function aggregatePeriodReturns(points: BacktestPoint[], keyForDate: (date: string) => string) {
+  const result: BacktestPeriodReturn[] = [];
+  let previousUnitValue = 1;
+  let index = 0;
+  while (index < points.length) {
+    const key = keyForDate(points[index]!.date);
+    let end = index;
+    while (end + 1 < points.length && keyForDate(points[end + 1]!.date) === key) end += 1;
+    const endingUnitValue = points[end]!.unitValue;
+    result.push({ key, returnRate: previousUnitValue > 0 ? endingUnitValue / previousUnitValue - 1 : 0 });
+    previousUnitValue = endingUnitValue;
+    index = end + 1;
+  }
+  return result;
 }
 
 export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[]): BacktestResult {
@@ -159,19 +208,45 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
   if (!prices.length) {
     throw new Error("NO_PRICE_DATA");
   }
+  const adjustedPointCount = prices.filter((point) => point.adjusted).length;
+  if (adjustedPointCount > 0 && adjustedPointCount < prices.length) {
+    throw new Error("MIXED_PRICE_MODE");
+  }
 
   const feeRate = Number.isFinite(input.feeRate) ? Math.max(0, input.feeRate) : 0;
+  const sellFeeRate = Number.isFinite(input.sellFeeRate) ? Math.max(0, input.sellFeeRate ?? 0) : feeRate;
+  const buyTaxRate = Number.isFinite(input.buyTaxRate) ? Math.max(0, input.buyTaxRate ?? 0) : 0;
+  const sellTaxRate = Number.isFinite(input.sellTaxRate) ? Math.max(0, input.sellTaxRate ?? 0) : 0;
+  const dividendTaxRate = Number.isFinite(input.dividendTaxRate) ? Math.max(0, input.dividendTaxRate ?? 0) : 0;
+  const minimumFee = Number.isFinite(input.minimumFee) ? Math.max(0, input.minimumFee ?? 0) : 0;
   const initialAmount = normalizeAmount(input.initialAmount);
   const recurringAmount = normalizeAmount(input.monthlyAmount);
-  const priceMode = prices.some((point) => point.adjusted) ? "adjusted" : "cash_dividend";
+  const priceMode = adjustedPointCount === prices.length ? "adjusted" : "cash_dividend";
+  const dividendDataStatus: BacktestResult["dividendDataStatus"] = priceMode === "adjusted"
+    ? "embedded"
+    : input.market === "FUND"
+      ? "unavailable"
+      : ["CRYPTO", "GOLD", "INDEX", "FX", "COMMODITY"].includes(input.market)
+        ? "not_applicable"
+        : "explicit";
   let shares = 0;
   let invested = 0;
   let cashDividends = 0;
+  let totalDividendIncome = 0;
+  let grossDividendIncome = 0;
   let lastInvestmentPeriod = "";
-  let peakValue = 0;
-  let peakMarketValue = 0;
   let maxDrawdown = 0;
   let marketMaxDrawdown = 0;
+  let navUnits = 0;
+  let peakNav = 0;
+  let peakNavDate = "";
+  let maxDrawdownStartDate = "";
+  let maxDrawdownEndDate = "";
+  let marketNavUnits = 0;
+  let peakMarketNav = 0;
+  let totalFees = 0;
+  let totalTaxes = 0;
+  let tradeCount = 0;
   const cashFlows: Array<{ date: string; amount: number }> = [];
 
   const points = prices.map((point, index) => {
@@ -181,12 +256,29 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
 
     // Ex-dividend cash belongs only to shares already held before this date.
     // Buy orders for the same date are applied after the dividend credit.
-    const dividendCash = priceMode === "adjusted" ? 0 : shares * point.dividend;
-    cashDividends += dividendCash;
+    const grossDividendCash = priceMode === "adjusted" ? 0 : shares * point.dividend;
+    const dividendTax = grossDividendCash * dividendTaxRate;
+    const dividendCash = Math.max(0, grossDividendCash - dividendTax);
+    grossDividendIncome += grossDividendCash;
+    totalDividendIncome += dividendCash;
+    totalTaxes += dividendTax;
+    if (input.dividendMode === "reinvest" && dividendCash > 0) {
+      shares += dividendCash / point.price;
+    } else {
+      cashDividends += dividendCash;
+    }
+    const valueBeforeFlow = shares * point.price + cashDividends;
+    const marketValueBeforeFlow = shares * point.price;
 
+    let externalFlow = 0;
     if (input.strategy === "lump_sum" && index === 0 && initialAmount > 0) {
-      shares += buyShares(initialAmount, point.price, feeRate);
+      const { fee, tax } = transactionCost(initialAmount, feeRate, buyTaxRate, minimumFee);
+      shares += buyShares(initialAmount, point.price, feeRate, buyTaxRate, minimumFee);
       invested += initialAmount;
+      externalFlow += initialAmount;
+      totalFees += fee;
+      totalTaxes += tax;
+      tradeCount += 1;
       cashFlows.push({ date: point.date, amount: -initialAmount });
     }
 
@@ -195,13 +287,23 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
       // Initial amount counts as this period's investment so the recurring
       // buy is skipped on the first trading day to avoid double-investing.
       if (index === 0 && initialAmount > 0) {
-        shares += buyShares(initialAmount, point.price, feeRate);
+        const { fee, tax } = transactionCost(initialAmount, feeRate, buyTaxRate, minimumFee);
+        shares += buyShares(initialAmount, point.price, feeRate, buyTaxRate, minimumFee);
         invested += initialAmount;
+        externalFlow += initialAmount;
+        totalFees += fee;
+        totalTaxes += tax;
+        tradeCount += 1;
         cashFlows.push({ date: point.date, amount: -initialAmount });
         lastInvestmentPeriod = currentPeriod;
       } else if (currentPeriod && currentPeriod !== lastInvestmentPeriod && recurringAmount > 0) {
-        shares += buyShares(recurringAmount, point.price, feeRate);
+        const { fee, tax } = transactionCost(recurringAmount, feeRate, buyTaxRate, minimumFee);
+        shares += buyShares(recurringAmount, point.price, feeRate, buyTaxRate, minimumFee);
         invested += recurringAmount;
+        externalFlow += recurringAmount;
+        totalFees += fee;
+        totalTaxes += tax;
+        tradeCount += 1;
         cashFlows.push({ date: point.date, amount: -recurringAmount });
         lastInvestmentPeriod = currentPeriod;
       }
@@ -209,13 +311,31 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
 
     const marketValue = shares * point.price;
     const value = marketValue + cashDividends;
-    if (value > peakValue) peakValue = value;
-    if (peakValue > 0) {
-      maxDrawdown = Math.max(maxDrawdown, (peakValue - value) / peakValue);
+    if (externalFlow > 0) {
+      const unitPriceBeforeFlow = navUnits > 0 ? valueBeforeFlow / navUnits : 1;
+      navUnits += unitPriceBeforeFlow > 0 ? externalFlow / unitPriceBeforeFlow : externalFlow;
     }
-    if (marketValue > peakMarketValue) peakMarketValue = marketValue;
-    if (peakMarketValue > 0) {
-      marketMaxDrawdown = Math.max(marketMaxDrawdown, (peakMarketValue - marketValue) / peakMarketValue);
+    const nav = navUnits > 0 ? value / navUnits : 0;
+    if (nav > peakNav) {
+      peakNav = nav;
+      peakNavDate = point.date;
+    }
+    if (peakNav > 0) {
+      const drawdown = (peakNav - nav) / peakNav;
+      if (drawdown > maxDrawdown) {
+        maxDrawdown = drawdown;
+        maxDrawdownStartDate = peakNavDate;
+        maxDrawdownEndDate = point.date;
+      }
+    }
+    if (externalFlow > 0) {
+      const marketUnitPriceBeforeFlow = marketNavUnits > 0 ? marketValueBeforeFlow / marketNavUnits : 1;
+      marketNavUnits += marketUnitPriceBeforeFlow > 0 ? externalFlow / marketUnitPriceBeforeFlow : externalFlow;
+    }
+    const marketNav = marketNavUnits > 0 ? marketValue / marketNavUnits : 0;
+    if (marketNav > peakMarketNav) peakMarketNav = marketNav;
+    if (peakMarketNav > 0) {
+      marketMaxDrawdown = Math.max(marketMaxDrawdown, (peakMarketNav - marketNav) / peakMarketNav);
     }
     const pnl = value - invested;
     return {
@@ -232,6 +352,7 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
       value,
       pnl,
       returnRate: invested > 0 ? pnl / invested : 0,
+      unitValue: nav,
     };
   });
 
@@ -241,7 +362,29 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
   }
   const totalInvested = finalPoint.invested;
   const finalMarketValue = finalPoint.marketValue;
-  const finalValue = finalPoint.value;
+  let finalValue = finalPoint.value;
+  if (input.liquidateAtEnd && finalMarketValue > 0) {
+    const valueBeforeLiquidation = finalValue;
+    const saleCosts = transactionCost(finalMarketValue, sellFeeRate, sellTaxRate, minimumFee);
+    totalFees += saleCosts.fee;
+    totalTaxes += saleCosts.tax;
+    tradeCount += 1;
+    finalValue -= saleCosts.fee + saleCosts.tax;
+    finalPoint.value = finalValue;
+    finalPoint.pnl = finalValue - totalInvested;
+    finalPoint.returnRate = totalInvested > 0 ? finalPoint.pnl / totalInvested : 0;
+    finalPoint.unitValue = valueBeforeLiquidation > 0
+      ? finalPoint.unitValue * finalValue / valueBeforeLiquidation
+      : finalPoint.unitValue;
+    if (peakNav > 0) {
+      const liquidationDrawdown = (peakNav - finalPoint.unitValue) / peakNav;
+      if (liquidationDrawdown > maxDrawdown) {
+        maxDrawdown = liquidationDrawdown;
+        maxDrawdownStartDate = peakNavDate;
+        maxDrawdownEndDate = finalPoint.date;
+      }
+    }
+  }
   const totalPnl = finalValue - totalInvested;
   const totalReturn = totalInvested > 0 ? totalPnl / totalInvested : 0;
   const annualizedReturn = totalInvested > 0 && finalValue > 0
@@ -257,7 +400,20 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
     annualizedReturn,
     marketMaxDrawdown,
     maxDrawdown,
-    totalDividends: finalPoint.cashDividends,
+    totalDividends: totalDividendIncome,
+    grossDividends: grossDividendIncome,
+    dividendDataStatus,
+    totalFees,
+    totalTaxes,
+    tradeCount,
+    actualStartDate: prices[0]!.date,
+    actualEndDate: finalPoint.date,
+    liquidatedAtEnd: input.liquidateAtEnd === true,
+    dividendMode: input.dividendMode === "reinvest" ? "reinvest" : "cash",
+    maxDrawdownStartDate,
+    maxDrawdownEndDate,
+    monthlyReturns: aggregatePeriodReturns(points, monthKey),
+    yearlyReturns: aggregatePeriodReturns(points, (date) => dateKey(date).slice(0, 4)),
     priceMode,
     points,
   };

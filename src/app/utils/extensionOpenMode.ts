@@ -7,9 +7,11 @@ type ChromeRuntimeLike = {
   lastError?: { message?: string };
   sendMessage?: (
     message: unknown,
-    callback: (response: { ok?: boolean; reason?: string } | undefined) => void,
+    callback: (response: ExtensionMessageResponse | undefined) => void,
   ) => void;
 };
+
+type ExtensionMessageResponse = { ok?: boolean; reason?: string; dates?: string[]; mode?: ExtensionOpenMode };
 
 type ChromeApiLike = {
   runtime?: ChromeRuntimeLike;
@@ -46,13 +48,13 @@ function getChromeApi() {
   return (globalThis as { chrome?: ChromeApiLike }).chrome ?? null;
 }
 
-export function sendExtensionOpenModeMessage(type: string, payload: Record<string, unknown> = {}) {
+export function sendExtensionOpenModeMessage(type: string, payload: Record<string, unknown> = {}): Promise<ExtensionMessageResponse> {
   const runtime = getChromeRuntime();
   const sendMessage = runtime?.sendMessage;
   if (!sendMessage) return Promise.resolve({ ok: false, reason: "runtime_unavailable" });
-  return new Promise<{ ok?: boolean; reason?: string }>((resolve) => {
+  return new Promise<ExtensionMessageResponse>((resolve) => {
     try {
-      sendMessage({ type, ...payload }, (response: { ok?: boolean; reason?: string } | undefined) => {
+      sendMessage({ type, ...payload }, (response: ExtensionMessageResponse | undefined) => {
         const lastError = getChromeApi()?.runtime?.lastError;
         if (lastError) {
           resolve({ ok: false, reason: lastError.message });
@@ -68,6 +70,14 @@ export function sendExtensionOpenModeMessage(type: string, payload: Record<strin
 
 export function syncExtensionOpenMode(mode: ExtensionOpenMode) {
   return sendExtensionOpenModeMessage("asset-helper:set-open-mode", { mode });
+}
+
+export function getConfiguredExtensionOpenMode() {
+  return sendExtensionOpenModeMessage("asset-helper:get-open-mode");
+}
+
+export function consumeSnapshotDueDates() {
+  return sendExtensionOpenModeMessage("asset-helper:consume-snapshot-due");
 }
 
 async function getCurrentWindowId() {
@@ -105,20 +115,16 @@ async function openSidePanelFromCurrentGesture() {
 
 async function openPopupFromCurrentGesture() {
   const chromeApi = getChromeApi();
+  if (!chromeApi?.action?.setPopup) return { ok: false, reason: "popup_unavailable" };
+  if (!chromeApi.action.openPopup) return { ok: false, reason: "open_popup_unavailable" };
   try {
     // Stop the side panel from reopening on action click; the popup takes over.
     if (chromeApi?.sidePanel?.setPanelBehavior) {
       await chromeApi.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
     }
     // Restore the popup path so clicking the toolbar icon opens the popup.
-    if (chromeApi?.action?.setPopup) {
-      await chromeApi.action.setPopup({ popup: "index.html" });
-    }
-    if (chromeApi?.action?.openPopup) {
-      try {
-        await chromeApi.action.openPopup();
-      } catch { /* openPopup may fail */ }
-    }
+    await chromeApi.action.setPopup({ popup: "index.html" });
+    await chromeApi.action.openPopup();
     return { ok: true };
   } catch (error) {
     return { ok: false, reason: error instanceof Error ? error.message : "open_popup_failed" };
