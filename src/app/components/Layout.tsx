@@ -20,6 +20,28 @@ const tabs = [
   { to: "/settings", key: "settings" as const, icon: Settings },
 ];
 
+export function extensionLayoutDimensions(isSidePanel: boolean): CSSProperties {
+  if (isSidePanel) {
+    return {
+      width: "100vw",
+      height: "100vh",
+      minWidth: 320,
+      minHeight: 0,
+      maxHeight: "100vh",
+    };
+  }
+  // Chrome derives a popup's initial viewport from its document content.
+  // Viewport-relative min() values create a circular dependency and can
+  // collapse a newly restored popup to a tiny square.
+  return {
+    width: 400,
+    height: 600,
+    minWidth: 400,
+    minHeight: 600,
+    maxHeight: 600,
+  };
+}
+
 /** Inner layout — can safely call useApp() because AppProvider is its parent */
 function LayoutInner() {
   const { detailTarget, closeDetail, dcaPanelOpen, closeDCAPanel, tc, language, storageError } = useApp();
@@ -29,11 +51,7 @@ function LayoutInner() {
   const accent = "var(--app-accent, #4F9CF9)";
   const isSidePanel = getExtensionViewMode() === "sidepanel";
   const rootStyle = useMemo(() => ({
-    width: isSidePanel ? "100vw" : "min(400px, 100vw)",
-    height: isSidePanel ? "100vh" : "min(600px, 100vh)",
-    minWidth: isSidePanel ? 320 : "min(320px, 100vw)",
-    minHeight: isSidePanel ? 0 : "min(480px, 100vh)",
-    maxHeight: "100vh",
+    ...extensionLayoutDimensions(isSidePanel),
     background: tc.bg,
     fontFamily: "'Inter', system-ui, sans-serif",
     "--bg": tc.bg,
