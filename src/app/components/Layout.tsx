@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useLocation } from "react-router";
-import { LayoutDashboard, BarChart2, Settings, Globe, Calculator, TrendingUp, AlertTriangle } from "lucide-react";
+import { LayoutDashboard, BarChart2, Settings, Globe, Microscope, TrendingUp, AlertTriangle } from "lucide-react";
 import { AnimatePresence } from "motion/react";
 import { useEffect, useMemo, useRef } from "react";
 import type { CSSProperties } from "react";
@@ -16,7 +16,7 @@ const tabs = [
   { to: "/holdings", key: "holdings" as const, icon: BarChart2 },
   { to: "/returns",  key: "returns" as const, icon: TrendingUp },
   { to: "/market",   key: "market" as const, icon: Globe },
-  { to: "/backtest", key: "backtest" as const, icon: Calculator },
+  { to: "/research", key: "research" as const, icon: Microscope },
   { to: "/settings", key: "settings" as const, icon: Settings },
 ];
 
@@ -90,7 +90,7 @@ function LayoutInner() {
         <div
           role="alert"
           className="shrink-0 flex items-start gap-2 px-3 py-2 text-[11px] leading-4"
-          style={{ color: "#B45309", background: "#FFF7E6", borderBottom: "1px solid #F7C873" }}
+          style={{ color: "#F59E0B", background: "rgba(245,158,11,0.1)", borderBottom: "1px solid rgba(245,158,11,0.2)" }}
         >
           <AlertTriangle size={14} className="mt-0.5 shrink-0" />
           <span>{storageError}</span>

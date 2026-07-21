@@ -771,7 +771,7 @@ function PlanForm({
           {t(language).common.cancel}
         </button>
         <button onClick={handleSave} disabled={saving} className="flex-1 rounded-xl py-2.5"
-          style={{ background: saving ? "var(--bg-card)" : "linear-gradient(135deg,#2563EB,#7C3AED)", color: saving ? "var(--text-micro)" : "#fff", fontSize: 13, fontWeight: 600 }}>
+          style={{ background: saving ? "var(--bg-card)" : "linear-gradient(135deg,#4F9CF9,#7C3AED)", color: saving ? "var(--text-micro)" : "#fff", fontSize: 13, fontWeight: 600 }}>
           {saving ? t(language).common.saving : text.savePlan}
         </button>
       </div>
@@ -927,7 +927,7 @@ export function DCAPanel() {
                   disabled={holdings.length === 0}
                   className="flex items-center gap-1 rounded-lg px-2.5 py-1.5"
                   style={{
-                    background: holdings.length === 0 ? tc.bgCard : "linear-gradient(135deg,#2563EB,#7C3AED)",
+                    background: holdings.length === 0 ? tc.bgCard : "linear-gradient(135deg,#4F9CF9,#7C3AED)",
                     color: holdings.length === 0 ? tc.textMicro : "#fff",
                     fontSize: 12,
                   }}>

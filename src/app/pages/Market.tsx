@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useEffect, useRef } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef, memo } from "react";
 import { TrendingUp, TrendingDown, RefreshCw, Globe } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { useApp } from "../context/AppContext";
@@ -30,6 +30,8 @@ interface IndexEntry {
   yahooSymbol:  string;
   displaySymbol:string;
   chartAvailable?: boolean;
+  refreshedAt?: number;
+  refreshError?: "network" | "unsupported";
 }
 
 function sparklineDataFromPoints(points: ChartPoint[]) {
@@ -356,7 +358,9 @@ function fmtChange(entry: IndexEntry, color: string, language: "zh" | "en") {
   if (changeAmount == null || changeRate == null || !Number.isFinite(changeAmount) || !Number.isFinite(changeRate)) {
     return (
       <span style={{ color: "var(--text-micro)", fontSize: 10, fontWeight: 500 }}>
-        {t(language).common.noData}
+        {entry.refreshError === "network"
+          ? (language === "en" ? "Refresh failed" : "刷新失败")
+          : (language === "en" ? "Waiting for data" : "等待数据")}
       </span>
     );
   }
@@ -377,13 +381,18 @@ function fmtChange(entry: IndexEntry, color: string, language: "zh" | "en") {
 /* ═══════════════════════════════════════════════════════
    IndexCard
 ══════════════════════════════════════════════════════════ */
-function IndexCard({ entry, catColor, onPress }: {
+const IndexCard = memo(function IndexCard({ entry, catColor, onPress }: {
   entry:    IndexEntry;
   catColor: string;
-  onPress:  () => void;
+  onPress:  (entry: IndexEntry) => void;
 }) {
   const { profitColor, language } = useApp();
   const text = t(language);
+  const sourceStatus = entry.refreshError === "network"
+    ? (language === "en" ? "Yahoo · refresh failed, showing last value" : "Yahoo · 刷新失败，保留上次数据")
+    : entry.refreshedAt
+      ? `Yahoo · ${timeLabel(new Date(entry.refreshedAt))}`
+      : (language === "en" ? "Yahoo · waiting for first refresh" : "Yahoo · 等待首次刷新");
   const [hovered, setHovered] = useState(false);
   const resolvedRate = entry.changeAmount != null && Number.isFinite(entry.changeAmount)
     ? entry.changeAmount
@@ -404,7 +413,7 @@ function IndexCard({ entry, catColor, onPress }: {
     <motion.button
       initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}
       whileTap={{ scale: 0.98 }}
-      onClick={onPress}
+      onClick={() => onPress(entry)}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       className="relative w-full rounded-xl overflow-hidden px-3 py-2.5 text-left transition-all"
@@ -438,7 +447,7 @@ function IndexCard({ entry, catColor, onPress }: {
               : <TrendingDown size={10} color={c} />}
             {fmtChange(entry, c, language)}
           </div>
-          <span style={{ color: "var(--text-micro)", fontSize: 9, marginTop: 2, display: "block" }}>{entry.unit}</span>
+          <span style={{ color: "var(--text-micro)", fontSize: 9, marginTop: 2, display: "block" }}>{entry.unit} · {sourceStatus}</span>
         </div>
         {/* Right: sparkline */}
         <div style={{ width: 120, flexShrink: 0, marginTop: 4 }}>
@@ -456,7 +465,7 @@ function IndexCard({ entry, catColor, onPress }: {
       </div>
     </motion.button>
   );
-}
+});
 
 /* ═══════════════════════════════════════════════════════
    Market page
@@ -489,18 +498,36 @@ export function Market() {
 
   const doRefresh = useCallback(async (
     current: IndexEntry[],
-    force = false,
+    bypassMemoryCache = false,
     syncedAt = 0,
     showSpinner = false,
   ) => {
     const refreshSeq = ++refreshSeqRef.current;
     if (showSpinner) setRefreshing(true);
+    const source = current.length ? current : INDICES;
+    // Streaming progressive updates: accumulate completed entries and flush to UI at most every 150ms,
+    // so cards refresh one-by-one instead of freezing until all 27 indices finish.
+    const refreshedById = new Map<string, IndexEntry>();
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    const flush = () => {
+      flushTimer = null;
+      if (refreshSeq !== refreshSeqRef.current) return;
+      setIndices((currentItems) => {
+        if (refreshSeq !== refreshSeqRef.current) return currentItems;
+        if (refreshedById.size === 0) return currentItems;
+        const baseItems = currentItems.length ? currentItems : source;
+        return baseItems.map((item) => refreshedById.get(item.id) ?? item);
+      });
+    };
+    const scheduleFlush = () => {
+      if (flushTimer) return;
+      flushTimer = setTimeout(flush, 150);
+    };
     try {
-      const source = current.length ? current : INDICES;
-      const settled = await mapWithConcurrency<IndexEntry, IndexEntry>(source, 6, async (entry) => {
+      await mapWithConcurrency<IndexEntry, IndexEntry>(source, 8, async (entry) => {
         try {
           const market = marketForEntry(entry);
-          const chart = await fetchDetailChart(entry.yahooSymbol, market, "fs", force);
+          const chart = await fetchDetailChart(entry.yahooSymbol, market, "fs", false, bypassMemoryCache);
           const q = chart.quote;
           const nextValue = q.price > 0 ? q.price : null;
           const normalizedChange = Number.isFinite(q.change) ? q.change : null;
@@ -534,10 +561,14 @@ export function Market() {
               : [],
             detailPoints: hasChart ? chart.points : entry.detailPoints,
             chartAvailable: hasChart,
+            refreshedAt: Date.now(),
+            refreshError: undefined,
           };
+          refreshedById.set(nextEntry.id, nextEntry);
+          scheduleFlush();
           return nextEntry;
         } catch {
-          return {
+          const errorEntry = {
             ...entry,
             currentValue: entry.currentValue ?? null,
             changeAmount: entry.changeAmount ?? null,
@@ -545,14 +576,15 @@ export function Market() {
             data: entry.data,
             detailPoints: entry.detailPoints,
             chartAvailable: entry.chartAvailable ?? false,
+            refreshError: "network" as const,
           };
+          refreshedById.set(errorEntry.id, errorEntry);
+          scheduleFlush();
+          return errorEntry;
         }
       });
-      // Merge fulfilled results back into the current list so transient failures
-      // keep the previous entry instead of disappearing from the grid.
-      const refreshedById = new Map(settled
-        .filter((result): result is PromiseFulfilledResult<IndexEntry> => result.status === "fulfilled")
-        .map((result) => [result.value.id, result.value]));
+      // Final flush: catch any results scheduled but not yet flushed, then write cache.
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
       if (refreshSeq !== refreshSeqRef.current) return;
       setIndices((currentItems) => {
         if (refreshSeq !== refreshSeqRef.current) return currentItems;
@@ -567,7 +599,11 @@ export function Market() {
         return nextItems;
       });
     } finally {
-      if (showSpinner && refreshSeq === refreshSeqRef.current) setRefreshing(false);
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      // Always clear the spinner for the call that set it. If a newer background sync
+      // (showSpinner=false) took over the sequence, it never set refreshing=true, so
+      // we must clear ours — otherwise the spinner stays stuck forever.
+      if (showSpinner) setRefreshing(false);
     }
   }, []);
 
@@ -672,7 +708,7 @@ export function Market() {
     return Array.from(map.entries()).map(([key, items]) => ({ key, items }));
   }, [activeTab, filtered]);
 
-  const handlePress = (entry: IndexEntry) => {
+  const handlePress = useCallback((entry: IndexEntry) => {
     openDetail({
       yahooSymbol:   entry.yahooSymbol,
       displaySymbol: entry.displaySymbol,
@@ -691,10 +727,10 @@ export function Market() {
       } : undefined,
       decimals:       entry.category === "汇率" ? 5 : 3,
     });
-  };
+  }, [openDetail, language]);
 
   /* summary stats for header */
-  const activeMoves = indices
+  const activeMoves = useMemo(() => indices
     .map((entry) => {
       if (typeof entry.changeRate === "number" && Number.isFinite(entry.changeRate) && entry.changeRate !== 0) {
         return entry.changeRate;
@@ -704,7 +740,7 @@ export function Market() {
       }
       return null;
     })
-    .filter((value): value is number => value != null);
+    .filter((value): value is number => value != null), [indices]);
   const upCount   = activeMoves.filter((value) => value > 0).length;
   const downCount = activeMoves.filter((value) => value < 0).length;
   const upColor = profitColor(1);
@@ -817,12 +853,12 @@ export function Market() {
                         key={entry.id}
                         initial={{ opacity: 0, x: -6 }}
                         animate={{ opacity: 1, x: 0 }}
-                        transition={{ delay: i * 0.03 }}
+                        transition={{ delay: Math.min(i * 0.02, 0.12) }}
                       >
                         <IndexCard
                           entry={entry}
                           catColor={catColor}
-                          onPress={() => handlePress(entry)}
+                          onPress={handlePress}
                         />
                       </motion.div>
                     ))}

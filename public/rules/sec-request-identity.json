@@ -1,0 +1,38 @@
+[
+  {
+    "id": 1001,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "User-Agent",
+          "operation": "set",
+          "value": "AssetMate/2.0.0 (contact: https://github.com/yejiangyin/AssetMate/issues)"
+        }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||data.sec.gov/",
+      "resourceTypes": ["xmlhttprequest"]
+    }
+  },
+  {
+    "id": 1002,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "User-Agent",
+          "operation": "set",
+          "value": "AssetMate/2.0.0 (contact: https://github.com/yejiangyin/AssetMate/issues)"
+        }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||www.sec.gov/",
+      "resourceTypes": ["xmlhttprequest"]
+    }
+  }
+]

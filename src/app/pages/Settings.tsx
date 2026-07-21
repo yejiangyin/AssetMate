@@ -1,11 +1,12 @@
 import { useRef, useState, useEffect, useLayoutEffect } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { useNavigate } from "react-router";
 import type { LucideIcon } from "lucide-react";
 import {
   DollarSign, Clock, Eye, Download, Upload, Trash2,
   RefreshCw, Moon, Sun, Monitor, ChevronRight, Check, Shield,
-  Zap, AlertCircle, CalendarClock, Languages, PanelRight,
+  Zap, AlertCircle, CalendarClock, Languages, PanelRight, PlugZap,
 } from "lucide-react";
 import { useApp } from "../context/AppContext";
 import type { ThemeColors } from "../context/AppContext";
@@ -15,9 +16,14 @@ import type { ExtensionOpenMode } from "../utils/extensionOpenMode";
 import { useViewSwitcher } from "../utils/useViewSwitcher";
 import { getTradingCalendarStatus, refreshTradingCalendar } from "../services/tradingCalendar";
 import { t, type AppCopy } from "../i18n";
+import {
+  clearResearchLibrary,
+  exportResearchBackup,
+  importResearchBackup,
+} from "../research/storage";
 
 const refreshValues = [0, 1, 5, 15, 30, 60] as const;
-const MAX_IMPORT_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_IMPORT_FILE_BYTES = 100 * 1024 * 1024;
 type SettingsCopy = AppCopy["settings"];
 type ToastVariant = "success" | "error";
 
@@ -60,9 +66,9 @@ function SettingRow({
 }
 
 /* ─── ToggleSwitch ───────────────────────────────────── */
-function ToggleSwitch({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
+function ToggleSwitch({ value, onChange, label }: { value: boolean; onChange: (v: boolean) => void; label: string }) {
   return (
-    <button onClick={() => onChange(!value)} className="rounded-full transition-all duration-200"
+    <button type="button" role="switch" aria-checked={value} aria-label={label} title={label} onClick={() => onChange(!value)} className="rounded-full transition-all duration-200"
       style={{
         width: 36, height: 20,
         background: value ? "#4F9CF9" : "var(--border)",
@@ -210,6 +216,7 @@ function ThemePreview({ tc }: { tc: ThemeColors }) {
 
 /* ─── Main Settings ──────────────────────────────────── */
 export function Settings() {
+  const navigate = useNavigate();
   const {
     defaultPrivacyMode, setDefaultPrivacyMode,
     colorScheme, setColorScheme,
@@ -229,6 +236,7 @@ export function Settings() {
   const [toastMessage, setToastMessage] = useState("");
   const [toastVariant, setToastVariant] = useState<ToastVariant>("success");
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [clearResearchToo, setClearResearchToo] = useState(false);
   const [calendarStatus, setCalendarStatus] = useState(() => getTradingCalendarStatus());
   const [calendarRefreshing, setCalendarRefreshing] = useState(false);
   const text = t(language).settings;
@@ -263,20 +271,40 @@ export function Settings() {
     };
   }, []);
 
-  const handleExport = () => {
+  const downloadCompleteBackup = async () => {
+    const portfolioBackup = JSON.parse(exportPortfolio()) as { data?: Record<string, unknown> };
+    portfolioBackup.data = {
+      ...(portfolioBackup.data ?? {}),
+      research: await exportResearchBackup(),
+    };
+    const blob = new Blob([JSON.stringify(portfolioBackup, null, 2)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `asset-helper-complete-${localDateYMD(new Date())}.json`;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    window.setTimeout(() => {
+      a.remove();
+      URL.revokeObjectURL(url);
+    }, 0);
+  };
+
+  const handleClearAllData = async () => {
+    if (clearResearchToo) await downloadCompleteBackup();
+    clearLocalData();
+    if (clearResearchToo) {
+      await clearResearchLibrary({ includeSettings: true, includeApiKey: true });
+    }
+    setShowClearConfirm(false);
+    setClearResearchToo(false);
+    showToast(text.clearOk);
+  };
+
+  const handleExport = async () => {
     try {
-      const blob = new Blob([exportPortfolio()], { type: "application/json;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `asset-helper-${localDateYMD(new Date())}.json`;
-      a.style.display = "none";
-      document.body.appendChild(a);
-      a.click();
-      window.setTimeout(() => {
-        a.remove();
-        URL.revokeObjectURL(url);
-      }, 0);
+      await downloadCompleteBackup();
       showToast(text.exportOk);
     } catch {
       showToast(text.exportFail, "error");
@@ -304,7 +332,12 @@ export function Settings() {
         showToast(text.importTooLarge, "error");
         return;
       }
-      const result = importPortfolio(await file.text());
+      const raw = await file.text();
+      const result = importPortfolio(raw);
+      if (result.ok) {
+        const parsed = JSON.parse(raw) as { data?: { research?: unknown }; research?: unknown };
+        await importResearchBackup(parsed.data?.research ?? parsed.research);
+      }
       showToast(result.ok ? text.importOk : result.error ?? text.importFail, result.ok ? "success" : "error");
     } catch {
       showToast(text.importFail, "error");
@@ -359,7 +392,7 @@ export function Settings() {
           </SettingRow>
 
           <SettingRow icon={Eye} label={text.privacy} description={text.privacyDesc} iconColor="#8B5CF6" tc={tc}>
-            <ToggleSwitch value={defaultPrivacyMode} onChange={setDefaultPrivacyMode} />
+            <ToggleSwitch value={defaultPrivacyMode} onChange={setDefaultPrivacyMode} label={text.privacy} />
           </SettingRow>
 
           <SettingRow icon={PanelRight} label={text.openMode} description={text.openModeDesc} iconColor="#4F9CF9" tc={tc}>
@@ -456,6 +489,32 @@ export function Settings() {
         </button>
       </div>
 
+      {/* ── AI Research Connection ── */}
+      <div className="mt-4 px-3">
+        <p style={{ color: tc.textMuted, fontSize: 11, fontWeight: 500, marginBottom: 6, paddingLeft: 2 }}>
+          {language === "en" ? "AI Research" : "AI 投研"}
+        </p>
+        <button
+          type="button"
+          onClick={() => navigate("/settings/ai")}
+          className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition-colors"
+          style={{ background: tc.bgCard, border: `1px solid ${tc.border}` }}
+          onMouseEnter={(event) => (event.currentTarget.style.borderColor = "rgba(79,156,249,0.3)")}
+          onMouseLeave={(event) => (event.currentTarget.style.borderColor = tc.border)}
+        >
+          <div className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-lg" style={{ background: "rgba(79,156,249,0.12)" }}>
+            <PlugZap size={14} color="#4F9CF9" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p style={{ color: tc.textPrimary, fontSize: 13 }}>{language === "en" ? "AI research connections" : "AI 投研连接"}</p>
+            <p className="truncate" style={{ color: tc.textMuted, fontSize: 10, marginTop: 1 }}>
+              {language === "en" ? "Manage model APIs, models and external web search" : "管理大模型 API、模型与外部联网搜索"}
+            </p>
+          </div>
+          <ChevronRight size={14} color={tc.textMuted} />
+        </button>
+      </div>
+
       {/* ── Refresh Settings ── */}
       <div className="mt-4 px-3">
         <p style={{ color: tc.textMuted, fontSize: 11, fontWeight: 500, marginBottom: 6, paddingLeft: 2 }}>{text.refresh}</p>
@@ -465,10 +524,10 @@ export function Settings() {
               options={refreshOptions} />
           </SettingRow>
           <SettingRow icon={RefreshCw} label={text.tradeTimeOnly} description={text.tradeTimeOnlyDesc} iconColor="#14B8A6" tc={tc}>
-            <ToggleSwitch value={tradeTimeOnly} onChange={setTradeTimeOnly} />
+            <ToggleSwitch value={tradeTimeOnly} onChange={setTradeTimeOnly} label={text.tradeTimeOnly} />
           </SettingRow>
           <SettingRow icon={DollarSign} label={text.dividendReinvest} description={text.dividendReinvestDesc} iconColor="#31D08B" tc={tc}>
-            <ToggleSwitch value={dividendReinvest} onChange={setDividendReinvest} />
+            <ToggleSwitch value={dividendReinvest} onChange={setDividendReinvest} label={text.dividendReinvest} />
           </SettingRow>
           <SettingRow
             icon={CalendarClock}
@@ -500,7 +559,7 @@ export function Settings() {
         <p style={{ color: tc.textMuted, fontSize: 11, fontWeight: 500, marginBottom: 6, paddingLeft: 2 }}>{text.data}</p>
         <SectionCard tc={tc}>
           <SettingRow icon={Download} label={text.exportData} description={text.exportDesc} iconColor="#31D08B" tc={tc}>
-            <button onClick={handleExport}
+            <button onClick={() => void handleExport()}
               className="flex items-center gap-1 rounded-lg px-2.5 py-1.5"
               style={{ background: "rgba(49,208,139,0.1)", color: "#31D08B", fontSize: 11 }}>
               <Download size={11} /> {text.exportAction}
@@ -583,13 +642,34 @@ export function Settings() {
               <p style={{ color: tc.textMuted, fontSize: 13, marginBottom: 16 }}>
                 {text.clearDesc}
               </p>
+              <label
+                className="mb-4 flex cursor-pointer items-start gap-2.5 rounded-xl px-3 py-2.5"
+                style={{ background: "rgba(242,78,78,0.06)", border: "1px solid rgba(242,78,78,0.16)" }}
+              >
+                <input
+                  type="checkbox"
+                  checked={clearResearchToo}
+                  onChange={(event) => setClearResearchToo(event.target.checked)}
+                  className="mt-0.5 h-4 w-4 accent-[#F24E4E]"
+                />
+                <span className="min-w-0">
+                  <span className="block text-[12px] font-semibold" style={{ color: tc.textPrimary }}>
+                    {language === "en" ? "Also reset research and connection settings" : "同时重置投研与连接设置"}
+                  </span>
+                  <span className="mt-1 block text-[10px] leading-4" style={{ color: tc.textMuted }}>
+                    {language === "en"
+                      ? "A complete backup without API keys will be downloaded first. Saved keys will be removed and must be entered again."
+                      : "执行前会自动下载不含 API Key 的完整备份；已保存密钥会被清除，之后需要重新填写。"}
+                  </span>
+                </span>
+              </label>
               <div className="flex gap-2">
-                <button onClick={() => setShowClearConfirm(false)}
+                <button onClick={() => { setShowClearConfirm(false); setClearResearchToo(false); }}
                   className="flex-1 rounded-xl py-2.5"
                   style={{ background: "var(--bg-control)", color: tc.textSecondary, fontSize: 13 }}>
                   {text.cancel}
                 </button>
-                <button onClick={() => { clearLocalData(); setShowClearConfirm(false); showToast(text.clearOk); }}
+                <button onClick={() => void handleClearAllData()}
                   className="flex-1 rounded-xl py-2.5"
                   style={{ background: "rgba(242,78,78,0.15)", color: "#F24E4E", fontSize: 13 }}>
                   {text.confirmClear}

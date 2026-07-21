@@ -8,8 +8,10 @@ const NOTICE_EVENT_TYPES = new Set<PortfolioEvent["type"]>([
   "interest",
   "bond_coupon",
 ]);
-const DISMISSED_NOTICE_STORAGE_KEY = "asset-helper:dismissed-corporate-action-notices:v1";
+export const DISMISSED_NOTICE_STORAGE_KEY = "asset-helper:dismissed-corporate-action-notices:v1";
+const DISMISSED_NOTICE_CHANGE_EVENT = "asset-helper:corporate-action-notices-changed";
 const MAX_DISMISSED_NOTICE_KEYS = 200;
+export const CORPORATE_ACTION_NOTICE_RETENTION_DAYS = 7;
 
 function localYMD(date: Date) {
   const year = date.getFullYear();
@@ -56,15 +58,30 @@ export function writeDismissedCorporateActionNoticeKeys(keys: readonly string[])
       DISMISSED_NOTICE_STORAGE_KEY,
       JSON.stringify([...keys].slice(-MAX_DISMISSED_NOTICE_KEYS)),
     );
+    window.dispatchEvent(new Event(DISMISSED_NOTICE_CHANGE_EVENT));
   } catch {
     // Notification acknowledgement is non-critical.
   }
 }
 
+export function subscribeDismissedCorporateActionNotices(listener: (keys: string[]) => void) {
+  if (typeof window === "undefined") return () => undefined;
+  const sync = () => listener(readDismissedCorporateActionNoticeKeys());
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === DISMISSED_NOTICE_STORAGE_KEY) sync();
+  };
+  window.addEventListener("storage", onStorage);
+  window.addEventListener(DISMISSED_NOTICE_CHANGE_EVENT, sync);
+  return () => {
+    window.removeEventListener("storage", onStorage);
+    window.removeEventListener(DISMISSED_NOTICE_CHANGE_EVENT, sync);
+  };
+}
+
 export function getRecentCorporateActionNotices(
   events: PortfolioEvent[],
   today = new Date(),
-  days = 30,
+  days = CORPORATE_ACTION_NOTICE_RETENTION_DAYS,
   dismissedKeys: ReadonlySet<string> = new Set(),
 ) {
   const end = localYMD(today);

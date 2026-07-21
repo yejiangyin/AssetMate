@@ -1,4 +1,4 @@
-import { useId, type ReactNode } from "react";
+import { memo, useId, type ReactNode } from "react";
 import { AreaChart, Area, ResponsiveContainer, Tooltip, YAxis } from "recharts";
 import { formatFixedNumber } from "../utils/numberFormat";
 
@@ -14,7 +14,7 @@ interface SparklineChartProps {
   tooltip?: (point: SparklineDatum) => ReactNode;
 }
 
-export function SparklineChart({ data, color, height = 36, tooltip }: SparklineChartProps) {
+export const SparklineChart = memo(function SparklineChart({ data, color, height = 36, tooltip }: SparklineChartProps) {
   const uid = useId().replace(/:/g, "");
   const gradId = `grad-${uid}`;
   const safeData = data
@@ -51,12 +51,12 @@ export function SparklineChart({ data, color, height = 36, tooltip }: SparklineC
             active && payload && payload.length ? (
               <div
                 style={{
-                  background: "rgba(15,23,42,0.95)",
-                  border: "1px solid rgba(255,255,255,0.1)",
+                  background: "var(--bg-card, rgba(15,23,42,0.95))",
+                  border: "1px solid var(--border, rgba(255,255,255,0.1))",
                   borderRadius: 6,
                   padding: "3px 8px",
                   fontSize: 11,
-                  color: "#F1F5F9",
+                  color: "var(--text-primary, #F1F5F9)",
                   pointerEvents: "none",
                 }}
               >
@@ -70,4 +70,4 @@ export function SparklineChart({ data, color, height = 36, tooltip }: SparklineC
       </AreaChart>
     </ResponsiveContainer>
   );
-}
+});

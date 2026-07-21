@@ -7,8 +7,9 @@ const Dashboard = lazy(() => import("./pages/Dashboard").then((module) => ({ def
 const Holdings = lazy(() => import("./pages/Holdings").then((module) => ({ default: module.Holdings })));
 const Returns = lazy(() => import("./pages/Returns").then((module) => ({ default: module.Returns })));
 const Market = lazy(() => import("./pages/Market").then((module) => ({ default: module.Market })));
-const Backtest = lazy(() => import("./pages/Backtest").then((module) => ({ default: module.Backtest })));
+const ResearchHub = lazy(() => import("./pages/ResearchHub").then((module) => ({ default: module.ResearchHub })));
 const Settings = lazy(() => import("./pages/Settings").then((module) => ({ default: module.Settings })));
+const AISettings = lazy(() => import("./pages/AISettings").then((module) => ({ default: module.AISettings })));
 
 function readRouteLanguage() {
   try {
@@ -82,8 +83,10 @@ export const appRoutes = [
       { path: "holdings", Component: withSuspense(Holdings)  },
       { path: "returns",  Component: withSuspense(Returns)   },
       { path: "market",   Component: withSuspense(Market)    },
-      { path: "backtest", Component: withSuspense(Backtest)  },
+      { path: "research", Component: withSuspense(ResearchHub) },
+      { path: "backtest", element: <Navigate to="/research?tab=backtest" replace /> },
       { path: "settings", Component: withSuspense(Settings)  },
+      { path: "settings/ai", Component: withSuspense(AISettings) },
       { path: "*",        element: <Navigate to="/" replace /> },
     ],
   },

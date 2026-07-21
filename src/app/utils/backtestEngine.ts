@@ -224,9 +224,9 @@ export function runBacktest(input: BacktestInput, rawPrices: BacktestPricePoint[
   const priceMode = adjustedPointCount === prices.length ? "adjusted" : "cash_dividend";
   const dividendDataStatus: BacktestResult["dividendDataStatus"] = priceMode === "adjusted"
     ? "embedded"
-    : input.market === "FUND"
+    : String(input.market).toUpperCase() === "FUND"
       ? "unavailable"
-      : ["CRYPTO", "GOLD", "INDEX", "FX", "COMMODITY"].includes(input.market)
+      : ["CRYPTO", "GOLD", "INDEX", "FX", "COMMODITY"].includes(String(input.market).toUpperCase())
         ? "not_applicable"
         : "explicit";
   let shares = 0;

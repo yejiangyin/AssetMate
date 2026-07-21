@@ -1,7 +1,8 @@
 import { useState, useEffect, useId, useCallback, useRef, useMemo, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import {
-  ArrowLeft, RefreshCw, Wifi, WifiOff,
+  ArrowLeft, BrainCircuit, RefreshCw, Wifi, WifiOff,
 } from "lucide-react";
+import { useNavigate } from "react-router";
 import {
   AreaChart, Area, BarChart, Bar,
   XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine,
@@ -29,6 +30,16 @@ const EMPTY_DETAIL_TARGET: DetailTarget = {
   market: "US",
   assetType: "stock",
 };
+
+let researchHubPreload: Promise<unknown> | null = null;
+
+function preloadResearchHub() {
+  researchHubPreload ??= import("../pages/ResearchHub").catch((error) => {
+    researchHubPreload = null;
+    throw error;
+  });
+  return researchHubPreload;
+}
 
 /* ─── market badge ───────────────────────────────────── */
 function getDetailBadge(market: string, assetType: string | undefined, language: Language) {
@@ -281,7 +292,7 @@ function actionMarkerFromEvent(event: CorporateActionEvent, language: Language, 
     date: event.date,
     label,
     title,
-    color: isResolution ? (isDividendResolution ? "#3B82F6" : "#7C3AED") : isDividend ? "#F59E0B" : "#8B5CF6",
+    color: isResolution ? (isDividendResolution ? "#4F9CF9" : "#7C3AED") : isDividend ? "#F59E0B" : "#8B5CF6",
     details,
   };
 }
@@ -1004,7 +1015,6 @@ function ChartNavigator({
     window.addEventListener("pointerup", stopDrag);
     window.addEventListener("pointercancel", stopDrag);
     return () => {
-      dragStateRef.current = null;
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", stopDrag);
       window.removeEventListener("pointercancel", stopDrag);
@@ -1338,6 +1348,7 @@ function sessionQuoteFromDisplayQuote(
 export function StockDetail() {
   const { detailTarget, closeDetail, colorScheme, lastRefreshAt, language } = useApp();
   const text = t(language);
+  const navigate = useNavigate();
 
   // Keep last valid target so the component can still render during AnimatePresence exit
   const lastTargetRef = useRef<typeof detailTarget>(null);
@@ -1557,6 +1568,23 @@ export function StockDetail() {
   }, [detailTarget, detailTargetKey, language, lastRefreshAt, load]);
 
   useEffect(() => {
+    if (!detailTarget) return;
+    const win = window as typeof window & {
+      requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    const warmResearchRoute = () => {
+      void preloadResearchHub().catch(() => null);
+    };
+    if (win.requestIdleCallback) {
+      const idleId = win.requestIdleCallback(warmResearchRoute, { timeout: 1200 });
+      return () => win.cancelIdleCallback?.(idleId);
+    }
+    const timeoutId = window.setTimeout(warmResearchRoute, 180);
+    return () => window.clearTimeout(timeoutId);
+  }, [detailTarget]);
+
+  useEffect(() => {
     if (!detailTarget || range === "fs") {
       actionRequestSeqRef.current += 1;
       setDetailActionEvents([]);
@@ -1696,14 +1724,14 @@ export function StockDetail() {
     });
   }, [chartPoints.length, defaultChartWindow, hasNavigableChart, windowContextKey]);
 
-  const handleNavigatorChange = (next: { startIndex?: number; endIndex?: number }) => {
+  const handleNavigatorChange = useCallback((next: { startIndex?: number; endIndex?: number }) => {
     if (typeof next.startIndex !== "number" || typeof next.endIndex !== "number") return;
     if (next.endIndex <= next.startIndex) return;
     setChartWindow({
       startIndex: Math.max(0, next.startIndex),
       endIndex: Math.min(chartPoints.length - 1, next.endIndex),
     });
-  };
+  }, [chartPoints.length]);
   const priceSource = areaChartData.length > 0 ? areaChartData : visiblePoints;
   const linePrices = priceSource.map((p) => p.price).filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
   const minP = linePrices.length ? Math.min(...linePrices) * 0.995 : 0;
@@ -1735,6 +1763,18 @@ export function StockDetail() {
   const primaryName = resolvedNames.find(hasChineseName) ?? resolvedNames[0] ?? displaySymbol;
   const secondaryName = resolvedNames.find((item) => normalizeDisplayName(item) !== normalizeDisplayName(primaryName)) ?? "";
   const resolvedName = secondaryName ? `${primaryName} · ${secondaryName}` : primaryName;
+  const openResearch = () => {
+    const params = new URLSearchParams({
+      tab: "ai",
+      symbol: displayTarget.yahooSymbol || displaySymbol,
+      name: resolvedName,
+      market,
+      assetType: assetType || "stock",
+    });
+    void preloadResearchHub().catch(() => null);
+    closeDetail();
+    navigate(`/research?${params.toString()}`);
+  };
   const decimals = displayTarget.decimals ?? (market === "FUND" ? 4 : 3);
   const syncedFsDisplayQuote = getLatestSyncedQuote({
     symbol: displayTarget.yahooSymbol,
@@ -1852,10 +1892,14 @@ export function StockDetail() {
 
   return (
     <motion.div
-      initial={{ x: "100%" }}
-      animate={{ x: 0 }}
-      exit={{ x: "100%" }}
-      transition={{ type: "spring", damping: 30, stiffness: 340 }}
+      initial="enter"
+      animate="center"
+      exit="exit"
+      variants={{
+        enter: { x: "100%" },
+        center: { x: 0, transition: { type: "spring", damping: 34, stiffness: 420, mass: 0.82 } },
+        exit: { x: "100%", transition: { type: "tween", ease: [0.32, 0, 0.67, 0], duration: 0.16 } },
+      }}
       className="absolute inset-0 flex flex-col"
       style={{ background: "var(--bg)", zIndex: 60 }}
     >
@@ -1892,20 +1936,32 @@ export function StockDetail() {
           </p>
         </div>
 
-        <button
-          onClick={handleRefresh}
-          className="rounded-lg p-1.5"
-          aria-label={text.common.refresh}
-          aria-busy={spinning}
-          disabled={spinning}
-          style={{ background: "var(--bg-card)" }}
-        >
-          <RefreshCw
-            size={14}
-            color={spinning ? "#4F9CF9" : "var(--text-muted)"}
-            className={spinning ? "animate-spin-smooth" : undefined}
-          />
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={openResearch}
+            onFocus={() => void preloadResearchHub().catch(() => null)}
+            onPointerEnter={() => void preloadResearchHub().catch(() => null)}
+            className="flex size-[30px] items-center justify-center rounded-lg bg-app-card text-tm transition-colors hover:text-app-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(79,156,249,0.24)]"
+            aria-label={language === "en" ? "Research this asset" : "研究该标的"}
+            title={language === "en" ? "AI Research" : "AI 研究"}
+          >
+            <BrainCircuit size={14} />
+          </button>
+          <button
+            type="button"
+            onClick={handleRefresh}
+            className={`flex size-[30px] items-center justify-center rounded-lg bg-app-card transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(79,156,249,0.24)] disabled:cursor-not-allowed disabled:opacity-70 ${spinning ? "text-app-accent" : "text-tm hover:text-app-accent"}`}
+            aria-label={text.common.refresh}
+            aria-busy={spinning}
+            disabled={spinning}
+          >
+            <RefreshCw
+              size={14}
+              className={spinning ? "animate-spin-smooth" : undefined}
+            />
+          </button>
+        </div>
       </div>
 
       {/* ── Scrollable body ── */}

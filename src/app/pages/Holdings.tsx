@@ -1,8 +1,9 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo, memo } from "react";
 import {
   Search, Plus, Minus, X, Pencil, Trash2, ChevronDown, Check,
-  Loader2, Wifi, WifiOff, LineChart, RefreshCw, Circle,
+  LineChart, RefreshCw, Circle,
   ChevronRight, BarChart2, CalendarClock, Repeat2, Eye, EyeOff,
+  CloudDownload, Keyboard, Upload, Cpu, History,
 } from "lucide-react";
 import { DCAPlan, HoldingAdjustmentInput, HoldingInput, useApp } from "../context/AppContext";
 import { Holding, Group, ClosedHolding, type TransactionCostProfile } from "../data/mockData";
@@ -16,7 +17,7 @@ import { resolveHoldingTradeStatus, tradeStatusLabel, cleanTradeSource, cleanTra
 import { getMarketBadgeWithBg } from "../utils/marketBadge";
 import { normalizeHoldingSymbol, normalizeHoldingType } from "../utils/holdingHelpers";
 import { canSaveHoldingForm } from "../utils/holdingForm";
-import { useSecuritySearch } from "../utils/useSecuritySearch";
+import { SecuritySearchInput } from "../components/SecuritySearchInput";
 import { estimateTransactionCosts, normalizeTransactionCostProfile } from "../utils/transactionCosts";
 import {
   assetTypeLabel,
@@ -26,6 +27,7 @@ import {
   translateTradeText,
 } from "../i18n";
 import type { Language } from "../context/AppContext";
+import type { PortfolioEvent } from "../services/portfolioEvents";
 
 /* ─── constants ──────────────────────────────────────── */
 function getSecurityBadge(market: string, assetType?: string, language: Language = "zh") {
@@ -199,6 +201,88 @@ function formatHoldingQuantity(value: number | undefined | null) {
   return formatExactNumber(value, 2, 2);
 }
 
+const REALIZED_HISTORY_EVENT_TYPES = new Set<PortfolioEvent["type"]>([
+  "cash_dividend",
+  "dividend_reinvest",
+  "interest",
+  "bond_coupon",
+  "fee",
+  "tax",
+]);
+
+function realizedEventLabel(type: PortfolioEvent["type"], language: Language) {
+  const isEn = language === "en";
+  switch (type) {
+    case "cash_dividend": return isEn ? "Cash dividend" : "现金分红";
+    case "dividend_reinvest": return isEn ? "Dividend reinvestment" : "红利再投";
+    case "interest": return isEn ? "Interest" : "利息";
+    case "bond_coupon": return isEn ? "Bond coupon" : "债券票息";
+    case "fee": return isEn ? "Fee" : "手续费";
+    case "tax": return isEn ? "Tax" : "税费";
+    default: return isEn ? "Realized event" : "已实现流水";
+  }
+}
+
+function realizedEventSourceLabel(event: PortfolioEvent, language: Language) {
+  const isEn = language === "en";
+  const note = event.note?.trim().toLowerCase() ?? "";
+  if (note === "initial buy transaction cost" || note === "buy transaction cost") {
+    return isEn ? "Calculated from the buy record" : "根据买入记录自动计算";
+  }
+  if (note === "sell transaction cost") {
+    return isEn ? "Calculated from the sell record" : "根据卖出记录自动计算";
+  }
+  if (note === "dca transaction cost") {
+    return isEn ? "Calculated from the DCA record" : "根据定投记录自动计算";
+  }
+  if (note === "automatic dividend withholding tax") {
+    return isEn ? "Calculated from the dividend record" : "根据分红记录自动计算";
+  }
+  if (note === "inferred aggregate transaction cost from legacy closed holding") {
+    return isEn ? "Reconstructed from a historical close record" : "根据历史清仓记录补算";
+  }
+  switch (event.source) {
+    case "auto": return isEn ? "Synced automatically from market data" : "由行情数据自动同步";
+    case "manual": return isEn ? "Entered directly by the user" : "用户手动录入";
+    case "import": return isEn ? "Imported record" : "导入记录";
+    case "system": return isEn ? "Generated automatically by the system" : "系统自动生成";
+    case "migration": return isEn ? "Migrated historical record" : "历史数据迁移";
+    default: return "";
+  }
+}
+
+function RealizedSourceIcon({ source }: { source: PortfolioEvent["source"] }) {
+  const Icon = source === "auto" ? CloudDownload
+    : source === "manual" ? Keyboard
+      : source === "import" ? Upload
+        : source === "migration" ? History
+          : Cpu;
+  return <Icon size={11} aria-hidden="true" />;
+}
+
+function realizedEventNoteLabel(note: string | undefined, language: Language) {
+  const value = note?.trim();
+  if (!value || value.toLowerCase() === "auto") return "";
+  const normalized = value.toLowerCase();
+  const isEn = language === "en";
+  const knownNotes: Record<string, [string, string]> = {
+    "auto dividend reinvest": ["分红已按设置自动再投资", "Dividend automatically reinvested"],
+    "auto dividend reinvest, net of dividend withholding tax": ["分红已按税后净额自动再投资", "Net dividend automatically reinvested after withholding tax"],
+    "automatic dividend withholding tax": ["现金分红预扣税", "Dividend withholding tax"],
+    "initial buy transaction cost": ["首次买入交易费用", "Initial buy transaction cost"],
+    "buy transaction cost": ["买入交易费用", "Buy transaction cost"],
+    "sell transaction cost": ["卖出交易费用", "Sell transaction cost"],
+    "dca transaction cost": ["定投交易费用", "DCA transaction cost"],
+    "migrated cashdividendtotal summary": ["历史累计分红迁移记录", "Migrated cumulative dividend record"],
+    "migrated closed holding cashdividendtotal summary": ["历史已清仓分红迁移记录", "Migrated closed-holding dividend record"],
+    "migrated recorded transaction fee": ["历史手续费迁移记录", "Migrated transaction-fee record"],
+    "migrated recorded transaction tax": ["历史税费迁移记录", "Migrated transaction-tax record"],
+    "inferred aggregate transaction cost from legacy closed holding": ["根据历史清仓记录补算的交易费用", "Transaction cost inferred from a legacy closed holding"],
+  };
+  const translated = knownNotes[normalized];
+  return translated ? translated[isEn ? 1 : 0] : value;
+}
+
 function holdingUnitPriceDecimals(h: Holding) {
   if (h.market === "FUND" || h.assetType === "fund") return 4;
   if (h.market === "A" && (h.assetType === "etf" || h.assetType === "bond")) return 3;
@@ -212,36 +296,58 @@ function holdingUnitPriceDecimals(h: Holding) {
 
 function ClosedHoldingsView({
   items,
+  events,
   baseCurrency,
   privacyMode,
   profitColor,
   onDelete,
+  onEditEvent,
+  onDeleteEvent,
   language,
 }: {
   items: ClosedHolding[];
+  events: PortfolioEvent[];
   baseCurrency: string;
   privacyMode: boolean;
   profitColor: (value: number) => string;
   onDelete: (id: string) => void;
+  onEditEvent: (event: PortfolioEvent) => void;
+  onDeleteEvent: (event: PortfolioEvent) => void;
   language: Language;
 }) {
   const PAGE_SIZE = 80;
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
-  const sorted = useMemo(() => {
-    return [...items].sort((a, b) => `${b.closedAt}_${b.id}`.localeCompare(`${a.closedAt}_${a.id}`));
-  }, [items]);
-  const visibleItems = sorted.slice(0, visibleCount);
+  const rows = useMemo(() => {
+    const closedRows = items.map((item) => ({
+      kind: "closed" as const,
+      id: `closed:${item.id}`,
+      date: item.closedAt || "",
+      createdAt: `${item.closedAt || ""}T23:59:59`,
+      item,
+    }));
+    const eventRows = events.map((event) => ({
+      kind: "event" as const,
+      id: `event:${event.id}`,
+      date: event.date || "",
+      createdAt: event.createdAt || `${event.date || ""}T00:00:00`,
+      event,
+    }));
+    return [...closedRows, ...eventRows].sort((a, b) => (
+      b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)
+    ));
+  }, [events, items]);
+  const visibleRows = rows.slice(0, visibleCount);
 
   useEffect(() => {
-    setVisibleCount((current) => Math.min(current, Math.max(PAGE_SIZE, sorted.length)));
-  }, [sorted.length]);
+    setVisibleCount((current) => Math.min(current, Math.max(PAGE_SIZE, rows.length)));
+  }, [rows.length]);
 
   const emptyText = language === "en" ? "No realized records yet" : "暂无已实现记录";
   const subtitle = language === "en"
-    ? "Sell and close records keep realized P/L with recorded fees, taxes, and applicable dividends."
-    : "卖出和清仓后会在这里保留已实现收益，并展示已记录的手续费、税费和适用分红。";
+    ? "Sell, close, dividend, reinvestment, fee and tax records are collected here."
+    : "卖出、清仓、现金分红、红利再投、手续费和税费都会汇总到这里。";
 
-  if (!sorted.length) {
+  if (!rows.length) {
     return (
       <div className="flex flex-col items-center justify-center py-14 gap-2 px-6 text-center">
         <BarChart2 size={30} color="var(--text-micro)" />
@@ -253,8 +359,109 @@ function ClosedHoldingsView({
 
   return (
     <div className="flex flex-col gap-2 px-3 py-3">
-      {visibleItems.map((item) => {
-        const pnl = convertAmount(item.realizedPnl, item.currency, baseCurrency);
+      {visibleRows.map((row) => {
+        if (row.kind === "event") {
+          const event = row.event;
+          const amountInBase = Number.isFinite(event.amountInBase)
+            ? event.amountInBase
+            : convertAmount(event.amount, event.currency, "CNY");
+          const pnl = convertAmount(amountInBase, "CNY", baseCurrency);
+          const color = profitColor(pnl);
+          const isReinvest = event.type === "dividend_reinvest";
+          const displayNote = realizedEventNoteLabel(event.note, language);
+          const sourceLabel = realizedEventSourceLabel(event, language);
+          return (
+            <div
+              key={row.id}
+              className="rounded-2xl p-3"
+              style={{ background: "var(--bg-card)", border: "1px solid var(--border-sub)" }}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <p className="truncate" style={{ color: "var(--text-primary)", fontSize: 14, fontWeight: 800 }}>
+                      {event.name || event.symbol || (language === "en" ? "Unlinked holding" : "未关联标的")}
+                    </p>
+                    {event.symbol && <span style={{ color: "var(--text-muted)", fontSize: 10, fontWeight: 700 }}>{event.symbol}</span>}
+                  </div>
+                  <p style={{ color: "var(--text-micro)", fontSize: 10, marginTop: 3 }}>
+                    {realizedEventLabel(event.type, language)} · {event.date || "-"}
+                    {event.market ? ` · ${marketLabel(event.market, language)}` : ""}
+                    {event.assetType ? ` · ${assetTypeLabel(event.assetType, language)}` : ""}
+                  </p>
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button onClick={() => onEditEvent(event)} className="flex size-7 items-center justify-center rounded-lg bg-app-surface2 text-tm hover:text-app-accent" title={language === "en" ? "Correct record" : "纠正记录"}>
+                    <Pencil size={12} />
+                  </button>
+                  <button onClick={() => onDeleteEvent(event)} className="flex size-7 items-center justify-center rounded-lg text-app-danger" style={{ background: "rgba(242,78,78,0.1)" }} title={language === "en" ? "Delete record" : "删除记录"}>
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              </div>
+
+              <div className={`grid ${isReinvest ? "grid-cols-3" : "grid-cols-1"} gap-2 mt-3`}>
+                <div>
+                  <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{language === "en" ? "Amount" : "金额"}</p>
+                  <p className="truncate" style={{ color, fontSize: 12, fontWeight: 800 }}>
+                    {pnlSign(pnl)}{privacyMode ? `${currencySymbol(baseCurrency)}--` : formatSummaryMoney(pnl, baseCurrency)}
+                  </p>
+                </div>
+                {isReinvest && (
+                  <>
+                    <div>
+                      <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{language === "en" ? "Quantity" : "份额/数量"}</p>
+                      <p className="truncate" style={{ color: "var(--text-secondary)", fontSize: 11, fontWeight: 700 }}>
+                        {event.quantity != null && event.quantity > 0 ? formatHoldingQuantity(event.quantity) : "—"}
+                      </p>
+                    </div>
+                    <div>
+                      <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{language === "en" ? "Price/NAV" : "价格/净值"}</p>
+                      <p className="truncate" style={{ color: "var(--text-secondary)", fontSize: 11, fontWeight: 700 }}>
+                        {event.price != null && event.price > 0 ? formatExactMoney(event.price, event.currency, 4) : "—"}
+                      </p>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {(isReinvest || event.estimatedAmount != null || event.rateUsed != null || displayNote) && (
+                <div className="mt-3 rounded-xl px-3 py-2" style={{ background: "var(--bg-surface2)" }}>
+                  {isReinvest && (
+                    <p style={{ color: "var(--text-secondary)", fontSize: 11, fontWeight: 700 }}>
+                      {language === "en" ? "Marked as dividend reinvestment" : "已标识为红利再投"}
+                    </p>
+                  )}
+                  {event.estimatedAmount != null && event.estimatedAmount > 0 && (
+                    <p style={{ color: "var(--text-micro)", fontSize: 10, marginTop: 3 }}>
+                      {language === "en" ? "Gross dividend" : "税前/核减前金额"}：
+                      {privacyMode ? `${currencySymbol(event.currency)}--` : formatExactMoney(event.estimatedAmount, event.currency, 2)}
+                    </p>
+                  )}
+                  {event.rateUsed != null && event.rateUsed > 0 && (
+                    <p style={{ color: "var(--text-micro)", fontSize: 10, marginTop: 3 }}>
+                      {language === "en" ? "Applied rate" : "适用比例"}：{formatPercent(event.rateUsed)}
+                    </p>
+                  )}
+                  {displayNote && (
+                    <p className="truncate" style={{ color: "var(--text-micro)", fontSize: 10, marginTop: 3 }}>
+                      {displayNote}
+                    </p>
+                  )}
+                </div>
+              )}
+              {sourceLabel && (
+                <div className="mt-2 flex items-center gap-1.5" style={{ color: "var(--text-micro)", fontSize: 10 }}>
+                  <RealizedSourceIcon source={event.source} />
+                  <span>{sourceLabel}</span>
+                </div>
+              )}
+            </div>
+          );
+        }
+
+        const item = row.item;
+        const pnl = convertAmount(item.realizedPnl - (item.cashDividendTotal ?? 0), item.currency, baseCurrency);
         const proceeds = convertAmount(item.proceeds, item.currency, baseCurrency);
         const costBasis = convertAmount(item.costBasis, item.currency, baseCurrency);
         const transactionFee = item.transactionFee == null
@@ -342,14 +549,7 @@ function ClosedHoldingsView({
 
             <div className="mt-3 rounded-xl px-3 py-2 flex items-center justify-between" style={{ background: `${color}12` }}>
               <span style={{ color: "var(--text-muted)", fontSize: 11 }}>
-                {language === "en" ? "Realized P/L" : "已实现收益"}
-                {(item.cashDividendTotal ?? 0) > 0 && (
-                  <span style={{ marginLeft: 5, color: "var(--text-micro)" }}>
-                    {item.dividendReinvest
-                      ? (language === "en" ? "incl. dividend (reinvested)" : "含分红（红利再投）")
-                      : (language === "en" ? "incl. dividend" : "含分红")}
-                  </span>
-                )}
+                {language === "en" ? "Sale P/L" : "卖出交易收益"}
               </span>
               <span className="truncate" style={{ color, fontSize: 13, fontWeight: 800 }}>
                 {pnlSign(pnl)}{privacyMode ? `${currencySymbol(baseCurrency)}--` : formatSummaryMoney(pnl, baseCurrency)}
@@ -361,15 +561,15 @@ function ClosedHoldingsView({
           </div>
         );
       })}
-      {visibleCount < sorted.length && (
+      {visibleCount < rows.length && (
         <button
-          onClick={() => setVisibleCount((count) => Math.min(count + PAGE_SIZE, sorted.length))}
+          onClick={() => setVisibleCount((count) => Math.min(count + PAGE_SIZE, rows.length))}
           className="rounded-xl py-2.5"
           style={{ background: "var(--bg-card)", border: "1px solid var(--border-sub)", color: "#4F9CF9", fontSize: 12, fontWeight: 700 }}
         >
           {language === "en"
-            ? `Show more (${sorted.length - visibleCount})`
-            : `加载更多（剩余 ${sorted.length - visibleCount} 条）`}
+            ? `Show more (${rows.length - visibleCount})`
+            : `加载更多（剩余 ${rows.length - visibleCount} 条）`}
         </button>
       )}
     </div>
@@ -425,111 +625,6 @@ function Sel<T extends string>({ value, onChange, options, style }: {
   );
 }
 
-/* ─── Autocomplete with live API ─────────────────────── */
-function AutoInput({
-  value, onChange, onSelect, placeholder, marketFilter,
-}: {
-  value: string; onChange: (v: string) => void; onSelect: (r: LiveResult) => void | Promise<void>; placeholder?: string;
-  marketFilter?: Market;
-}) {
-  const { language } = useApp();
-  const text = t(language);
-  const wrapRef  = useRef<HTMLDivElement>(null);
-  const { apiOk, hits, loading, open, setOpen, scheduleSearch } = useSecuritySearch(value, marketFilter);
-
-  const handleChange = (v: string) => {
-    onChange(v);
-    scheduleSearch(v, marketFilter);
-  };
-
-  useEffect(() => {
-    const close = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", close);
-    return () => { document.removeEventListener("mousedown", close); };
-  }, [setOpen]);
-
-  return (
-    <div ref={wrapRef} style={{ position: "relative" }}>
-      <div style={{ position: "relative" }}>
-        <input type="text" value={value} onChange={(e) => handleChange(e.target.value)}
-          onFocus={() => { if (value && hits.length) setOpen(true); }}
-          placeholder={placeholder}
-          style={{
-            width: "100%", height: 38, background: "var(--bg-card)",
-            border: `1px solid ${open ? "rgba(79,156,249,0.45)" : "var(--border)"}`,
-            borderRadius: 10, padding: "0 32px 0 12px", color: "var(--text-primary)",
-            fontSize: 13, outline: "none", boxSizing: "border-box",
-          }} />
-        <div style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)" }}>
-          {loading
-            ? <Loader2 size={13} color="#4F9CF9" className="animate-spin-smooth" />
-            : apiOk === true  ? <Wifi    size={12} color="#31D08B" />
-            : apiOk === false ? <WifiOff size={12} color="var(--text-muted)" />
-            : null}
-        </div>
-      </div>
-
-      <AnimatePresence>
-        {open && hits.length > 0 && (
-          <motion.div initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.12 }}
-            style={{
-              position: "absolute", top: "calc(100% + 5px)", left: 0, right: 0,
-              background: "var(--bg-overlay)", border: "1px solid rgba(79,156,249,0.2)",
-              borderRadius: 12, boxShadow: "var(--menu-shadow)", zIndex: 999, overflow: "hidden",
-            }}>
-            {hits.map((r, idx) => {
-              const normalizedType = normalizeHoldingType(r.symbol, r.name, r.market, r.assetType);
-              const badge = getSecurityBadge(normalizedType.market, normalizedType.assetType, language);
-              return (
-                <button key={`${r.market}:${r.symbol}:${idx}`}
-                  onMouseDown={(e) => { e.preventDefault(); onSelect(r); setOpen(false); }}
-                  className="w-full px-3 py-2.5 text-left"
-                  style={{ borderBottom: `1px solid ${idx < hits.length - 1 ? "var(--border)" : "transparent"}` }}
-                  onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(79,156,249,0.09)")}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
-                  <div className="flex items-start justify-between gap-2">
-                    <span style={{ color: "var(--text-primary)", fontSize: 13, fontWeight: 700, lineHeight: 1.35, flex: 1, minWidth: 0 }}>
-                      {r.name}
-                    </span>
-                    <span style={{ color: r.price > 0 ? "#4F9CF9" : "var(--text-micro)", fontSize: 12, fontWeight: 700, whiteSpace: "nowrap" }}>
-                      {r.price > 0 ? formatExactMoney(r.price, r.currency) : text.holdings.waitingQuote}
-                    </span>
-                  </div>
-                  <div className="mt-1 flex items-center gap-1.5 min-w-0">
-                    <span style={{ color: "var(--text-secondary)", fontSize: 12, fontWeight: 700 }}>{r.symbol}</span>
-                    <span style={{ fontSize: 9, fontWeight: 700, padding: "2px 5px", borderRadius: 4,
-                      color: badge?.color ?? "var(--text-secondary)", background: badge?.bg ?? "rgba(148,163,184,0.1)" }}>
-                      {badge?.label ?? r.market}
-                    </span>
-                    {r.exchange && (
-                      <span style={{ color: "var(--text-micro)", fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {r.exchange}
-                      </span>
-                    )}
-                    <span className="ml-auto" style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3,
-                      background: r.source === "live" && r.price > 0 ? "rgba(49,208,139,0.1)" : "rgba(100,116,139,0.1)",
-                      color:      r.source === "live" && r.price > 0 ? "#31D08B"               : "var(--text-muted)" }}>
-                      {r.source === "live" && r.price > 0 ? text.common.live : r.source === "live" ? text.common.matched : text.common.local}
-                    </span>
-                  </div>
-                </button>
-              );
-            })}
-            <div style={{ padding: "4px 12px", borderTop: "1px solid var(--border-sub)",
-              background: "var(--bg-surface2)", display: "flex", justifyContent: "space-between" }}>
-              <span style={{ color: "var(--text-micro)", fontSize: 10 }}>Yahoo Finance · Tencent · EastMoney · CoinGecko · Binance · OKX</span>
-              <span style={{ color: "var(--text-micro)", fontSize: 10 }}>{text.common.referenceOnly}</span>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
-  );
-}
-
 /* ─── PnL preview strip ──────────────────────────────── */
 function PnLPreview({ form, cashDividendTotal = 0 }: { form: HoldingInput; cashDividendTotal?: number }) {
   const { profitColor, language } = useApp();
@@ -565,6 +660,17 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
   const { language } = useApp();
   const text = t(language);
   const [form, setForm] = useState<HoldingInput>(initial);
+  // String drafts for numeric fields so users can type "0.5" without the
+  // leading "0" disappearing (parseFloat("0")||0 = 0, and 0||"" = "").
+  const [numberDraft, setNumberDraft] = useState({
+    quantity: initial.quantity ? String(initial.quantity) : "",
+    costPrice: initial.costPrice ? String(initial.costPrice) : "",
+    currentPrice: initial.currentPrice ? String(initial.currentPrice) : "",
+  });
+  const setNumberField = (k: "quantity" | "costPrice" | "currentPrice", v: string) => {
+    setNumberDraft((d) => ({ ...d, [k]: v }));
+    set(k, v === "" ? 0 : parseFloat(v) || 0);
+  };
   const [costProfileDraft, setCostProfileDraft] = useState(() => ({
     buyFeeRate: ratePercentValue(initial.transactionCostProfile?.buyFeeRate),
     sellFeeRate: ratePercentValue(initial.transactionCostProfile?.sellFeeRate),
@@ -633,6 +739,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
     // Clear the previously selected security so stale cross-market data
     // doesn't get saved alongside the new scope.
     setSecurityQuery("");
+    setNumberDraft({ quantity: "", costPrice: "", currentPrice: "" });
     setForm((f) => ({
       ...f,
       symbol: "",
@@ -651,6 +758,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
     const normalizedType = normalizeHoldingType(r.symbol, r.name, r.market, r.assetType);
     const normalizedSymbol = normalizeHoldingSymbol(r.symbol, normalizedType.market);
     setSecurityQuery(`${r.name} (${r.symbol})`);
+    if (r.price > 0) setNumberDraft((d) => ({ ...d, currentPrice: String(r.price) }));
     setForm((f) => ({
       ...f,
       symbol: normalizedSymbol,
@@ -671,6 +779,9 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
     void fetchLivePrice(r.symbol, r.market, r.coinId).then((quote) => {
       if (requestSeq !== requestSeqRef.current) return;
       if (!quote || quote.price <= 0) return;
+      setNumberDraft((d) => (
+        d.currentPrice === String(quote.price) ? d : { ...d, currentPrice: String(quote.price) }
+      ));
       setForm((f) => (
         f.symbol === normalizedSymbol && f.market === normalizedType.market
           ? { ...f, currentPrice: quote.price, currency: quote.currency || f.currency }
@@ -724,7 +835,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
                 style={{ width: 96, flexShrink: 0 }} />
             </Field>
             <Field label={text.holdings.security} className="flex-1 min-w-0">
-              <AutoInput value={securityQuery} onChange={setSecurityQuery}
+              <SecuritySearchInput value={securityQuery} onChange={setSecurityQuery}
                 onSelect={handleSelect} placeholder={text.holdings.searchSecurityPlaceholder}
                 marketFilter={marketScope || undefined} />
             </Field>
@@ -785,15 +896,15 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
           <p style={{ color: "#4F9CF9", fontSize: 11, fontWeight: 600, marginTop: 2 }}>{text.holdings.holdingInfo}</p>
 
           <Field label={text.holdings.quantity}>
-            <Input type="number" value={form.quantity || ""} onChange={(v) => set("quantity", parseFloat(v) || 0)} placeholder={language === "en" ? "e.g. 100" : "例：100"} />
+            <Input type="number" value={numberDraft.quantity} onChange={(v) => setNumberField("quantity", v)} placeholder={language === "en" ? "e.g. 100" : "例：100"} />
           </Field>
 
           <div className="grid grid-cols-2 gap-2">
             <Field label={text.holdings.costPrice}>
-              <Input type="number" value={form.costPrice || ""} onChange={(v) => set("costPrice", parseFloat(v) || 0)} placeholder={language === "en" ? "Avg cost" : "买入均价"} />
+              <Input type="number" value={numberDraft.costPrice} onChange={(v) => setNumberField("costPrice", v)} placeholder={language === "en" ? "Avg cost" : "买入均价"} />
             </Field>
             <Field label={text.holdings.currentPrice}>
-              <Input type="number" value={form.currentPrice || ""} onChange={(v) => set("currentPrice", parseFloat(v) || 0)} placeholder={language === "en" ? "Latest quote" : "最新报价"} />
+              <Input type="number" value={numberDraft.currentPrice} onChange={(v) => setNumberField("currentPrice", v)} placeholder={language === "en" ? "Latest quote" : "最新报价"} />
             </Field>
           </div>
 
@@ -834,7 +945,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
             onSave(normalizeHoldingForm({ ...form, transactionCostProfile: costProfileForSave }));
           }} disabled={!valid || saving} className="w-full rounded-xl py-3 flex items-center justify-center gap-2 shrink-0"
             style={{
-              background: valid && !saving ? "linear-gradient(135deg, #2563EB 0%, #7C3AED 100%)" : "var(--bg-card)",
+              background: valid && !saving ? "linear-gradient(135deg, #4F9CF9 0%, #7C3AED 100%)" : "var(--bg-card)",
               color: valid && !saving ? "#fff" : "var(--text-micro)", fontSize: 13, fontWeight: 600, marginBottom: 8,
               cursor: valid && !saving ? "pointer" : "not-allowed",
             }}>
@@ -1172,7 +1283,7 @@ function AdjustSheet({
             disabled={!valid || saving}
             className="w-full rounded-xl py-3"
             style={{
-              background: valid && !saving ? (mode === "buy" ? "linear-gradient(135deg, #2563EB, #7C3AED)" : "rgba(242,78,78,0.15)") : "var(--bg-card)",
+              background: valid && !saving ? (mode === "buy" ? "linear-gradient(135deg, #4F9CF9, #7C3AED)" : "rgba(242,78,78,0.15)") : "var(--bg-card)",
               color: valid && !saving ? (mode === "buy" ? "#fff" : "#F24E4E") : "var(--text-micro)",
               fontSize: 13,
               fontWeight: 600,
@@ -1187,12 +1298,12 @@ function AdjustSheet({
 }
 
 /* ─── Holding card ───────────────────────────────────── */
-function HoldingCard({
+const HoldingCard = memo(function HoldingCard({
   h, groups, dcaPlans, onEdit, onDelete, onQuote, onDCA, onBuy, onSell, isSelected, onSelect,
 }: {
   h: Holding; groups: Group[]; isSelected: boolean;
   dcaPlans: DCAPlan[];
-  onEdit: () => void; onDelete: () => void; onQuote: () => void; onDCA: () => void; onBuy: () => void; onSell: () => void; onSelect: () => void;
+  onEdit: (h: Holding) => void; onDelete: (id: string) => void; onQuote: (h: Holding) => void; onDCA: (h: Holding) => void; onBuy: (h: Holding) => void; onSell: (h: Holding) => void; onSelect: (id: string) => void;
 }) {
   const { profitColor, privacyMode, language } = useApp();
   const text = t(language).holdings;
@@ -1248,7 +1359,7 @@ function HoldingCard({
         borderColor,
         transition:        "background 0.15s, border-color 0.15s",
       }}>
-      <button className="w-full text-left px-3 pt-3 pb-2" onClick={onSelect}>
+      <button className="w-full text-left px-3 pt-3 pb-2" onClick={() => onSelect(h.id)}>
         <div className="flex items-start">
           <div className="flex-1 min-w-0 mr-2">
             <div className="flex items-center gap-2 mb-0.5">
@@ -1350,27 +1461,27 @@ function HoldingCard({
         }}
       >
         <div className="px-3 py-2 grid grid-cols-3 gap-2" style={{ minHeight: 88 }}>
-          <button onClick={onQuote} className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 flex-1 justify-center"
+          <button onClick={() => onQuote(h)} className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 flex-1 justify-center"
             style={{ background: "rgba(167,139,250,0.1)", color: "#A78BFA", fontSize: 11 }}>
             <LineChart size={11} /> {text.quote}
           </button>
-          <button onClick={onBuy} className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 flex-1 justify-center"
+          <button onClick={() => onBuy(h)} className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 flex-1 justify-center"
             style={{ background: "rgba(49,208,139,0.1)", color: "#31D08B", fontSize: 11 }}>
             <Plus size={11} /> {text.buy}
           </button>
-          <button onClick={onSell} className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 flex-1 justify-center"
+          <button onClick={() => onSell(h)} className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 flex-1 justify-center"
             style={{ background: "rgba(245,158,11,0.1)", color: "#F59E0B", fontSize: 11 }}>
             <Minus size={11} /> {text.sell}
           </button>
-          <button onClick={onDCA} className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 flex-1 justify-center"
+          <button onClick={() => onDCA(h)} className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 flex-1 justify-center"
             style={{ background: "rgba(79,156,249,0.1)", color: "#4F9CF9", fontSize: 11 }}>
             <CalendarClock size={11} /> {text.dca}
           </button>
-          <button onClick={onEdit} className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 flex-1 justify-center"
+          <button onClick={() => onEdit(h)} className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 flex-1 justify-center"
             style={{ background: "rgba(79,156,249,0.1)", color: "#4F9CF9", fontSize: 11 }}>
             <Pencil size={11} /> {t(language).common.edit}
           </button>
-          <button onClick={onDelete} className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 flex-1 justify-center"
+          <button onClick={() => onDelete(h.id)} className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 flex-1 justify-center"
             style={{ background: "rgba(242,78,78,0.08)", color: "#F24E4E", fontSize: 11 }}>
             <Trash2 size={11} /> {t(language).common.delete}
           </button>
@@ -1378,7 +1489,7 @@ function HoldingCard({
       </div>
     </motion.div>
   );
-}
+});
 
 /* ─── Groups view ────────────────────────────────────── */
 function GroupsView({ groups, holdings, dcaPlans, baseCurrency, selectedId, onSelectHolding, onEditHolding, onDeleteHolding, onQuote, onDCA, onBuy, onSell }: {
@@ -1544,13 +1655,13 @@ function GroupsView({ groups, holdings, dcaPlans, baseCurrency, selectedId, onSe
                               groups={groups}
                               dcaPlans={dcaPlans}
                               isSelected={selectedId === h.id}
-                              onSelect={() => onSelectHolding(h.id)}
-                              onEdit={() => onEditHolding(h)}
-                              onDelete={() => onDeleteHolding(h.id)}
-                              onQuote={() => onQuote(h)}
-                              onDCA={() => onDCA(h)}
-                              onBuy={() => onBuy(h)}
-                              onSell={() => onSell(h)}
+                              onSelect={onSelectHolding}
+                              onEdit={onEditHolding}
+                              onDelete={onDeleteHolding}
+                              onQuote={onQuote}
+                              onDCA={onDCA}
+                              onBuy={onBuy}
+                              onSell={onSell}
                             />
                           </div>
                         );
@@ -1671,7 +1782,7 @@ function NewGroupSheet({
             onClose();
           }}
             disabled={!name.trim() || saving} className="w-full rounded-xl py-3"
-            style={{ background: name.trim() && !saving ? "linear-gradient(135deg, #2563EB, #7C3AED)" : "var(--bg-card)",
+            style={{ background: name.trim() && !saving ? "linear-gradient(135deg, #4F9CF9, #7C3AED)" : "var(--bg-card)",
               color: name.trim() && !saving ? "white" : "var(--text-micro)", fontSize: 13, fontWeight: 600 }}>
             {saving ? t(language).common.saving : saveLabel}
           </button>
@@ -1686,8 +1797,9 @@ function NewGroupSheet({
 ══════════════════════════════════════════════════════════ */
 export function Holdings() {
   const { holdings, closedHoldings, groups, privacyMode, profitColor, currency,
-    addHolding, updateHolding, adjustHolding, removeHolding, removeClosedHolding, addGroup, updateGroup, removeGroup,
-    openDetail, refresh, isRefreshing, lastRefreshed, lastRefreshAt, lastRefreshError, dcaPlans, openDCAPanel, togglePrivacy, language } = useApp();
+    addHolding, updateHolding, adjustHolding, removeHolding, removeClosedHolding, updatePortfolioEvent, removePortfolioEvent, addGroup, updateGroup, removeGroup,
+    openDetail, refresh, isRefreshing, lastRefreshed, lastRefreshAt, lastRefreshError, dcaPlans, openDCAPanel, togglePrivacy, language,
+    portfolioEvents } = useApp();
   const text = t(language);
 
   const [viewMode,     setViewMode]     = useState<"current" | "closed">("current");
@@ -1701,6 +1813,11 @@ export function Holdings() {
   const [adjustTarget, setAdjustTarget] = useState<{ holding: Holding; mode: "buy" | "sell" } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [deleteClosedTarget, setDeleteClosedTarget] = useState<string | null>(null);
+  const [deleteEventTarget, setDeleteEventTarget] = useState<PortfolioEvent | null>(null);
+  const [editEventTarget, setEditEventTarget] = useState<PortfolioEvent | null>(null);
+  const [editEventAmount, setEditEventAmount] = useState("");
+  const [editEventDate, setEditEventDate] = useState("");
+  const [editEventNote, setEditEventNote] = useState("");
   const [deleteGroupTarget, setDeleteGroupTarget] = useState<Group | null>(null);
   const [editingGroup, setEditingGroup] = useState<Group | null>(null);
   const [showNewGroup, setShowNewGroup] = useState(false);
@@ -1775,6 +1892,32 @@ export function Holdings() {
     });
   }, [activeGroup, closedHoldings, search]);
 
+  const holdingById = useMemo(() => new Map(holdings.map((holding) => [holding.id, holding])), [holdings]);
+  const closedById = useMemo(() => new Map(closedHoldings.map((holding) => [holding.id, holding])), [closedHoldings]);
+  const filteredRealizedEvents = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return portfolioEvents.filter((event) => {
+      if (!REALIZED_HISTORY_EVENT_TYPES.has(event.type)) return false;
+      // Sale fees/taxes are already included in their closed-position summary
+      // and are shown inside that card. Keeping them as standalone rows would
+      // count the same cost twice in the realized-income header.
+      if ((event.type === "fee" || event.type === "tax") && event.relatedEventId && closedById.has(event.relatedEventId)) {
+        return false;
+      }
+      const linkedHolding = event.holdingId ? holdingById.get(event.holdingId) : undefined;
+      const linkedClose = event.relatedEventId ? closedById.get(event.relatedEventId) : undefined;
+      const groupId = event.groupId ?? linkedHolding?.groupId ?? linkedClose?.groupId ?? "";
+      if (activeGroup === "__ungrouped" && groupId) return false;
+      if (activeGroup !== "ALL" && activeGroup !== "__ungrouped" && groupId !== activeGroup) return false;
+      if (query) {
+        const symbol = (event.symbol || linkedHolding?.symbol || "").toLowerCase();
+        const name = (event.name || linkedHolding?.name || "").toLowerCase();
+        if (!symbol.includes(query) && !name.includes(query)) return false;
+      }
+      return true;
+    });
+  }, [activeGroup, closedById, holdingById, portfolioEvents, search]);
+
   /* ── strip stats: reflect current tab/filter context, all values in CNY ── */
   const stripStats = useMemo(() => {
     const source = filtered;
@@ -1788,15 +1931,27 @@ export function Holdings() {
   const closedStripStats = useMemo(() => {
     const proceeds = filteredClosedHoldings.reduce((s, h) => s + convertAmount(h.proceeds, h.currency, currency), 0);
     const cost     = filteredClosedHoldings.reduce((s, h) => s + convertAmount(h.costBasis, h.currency, currency), 0);
-    const pnl      = filteredClosedHoldings.reduce((s, h) => s + convertAmount(h.realizedPnl, h.currency, currency), 0);
-    return { proceeds, cost, pnl };
-  }, [currency, filteredClosedHoldings]);
+    // Legacy ClosedHolding.realizedPnl includes its lifetime cash dividends.
+    // Dividends are represented by event rows, so remove them from the close
+    // summary before merging the two ledgers.
+    const closedPnl = filteredClosedHoldings.reduce((s, h) => (
+      s + convertAmount(h.realizedPnl - (h.cashDividendTotal ?? 0), h.currency, currency)
+    ), 0);
+    const eventPnl = filteredRealizedEvents.reduce((sum, event) => {
+      const amountInBase = Number.isFinite(event.amountInBase)
+        ? event.amountInBase
+        : convertAmount(event.amount, event.currency, "CNY");
+      return sum + convertAmount(amountInBase, "CNY", currency);
+    }, 0);
+    return { proceeds, cost, pnl: closedPnl + eventPnl };
+  }, [currency, filteredClosedHoldings, filteredRealizedEvents]);
+  const realizedRecordCount = filteredClosedHoldings.length + filteredRealizedEvents.length;
 
   const stripTodayColor = profitColor(stripStats.todayPnl);
   const stripCumulColor = profitColor(stripStats.cumulPnl);
   const stripClosedPnlColor = profitColor(closedStripStats.pnl);
 
-  const openQuote = (h: Holding) => {
+  const openQuote = useCallback((h: Holding) => {
     openDetail({
       yahooSymbol: toYahooSymbol(h.symbol, h.market),
       displaySymbol: h.symbol,
@@ -1812,7 +1967,28 @@ export function Holdings() {
         exchange: "Holding",
       },
     });
-  };
+  }, [openDetail]);
+
+  // Stable handlers for HoldingCard — avoids creating new closures on every render,
+  // which would defeat React.memo and re-render all 500+ cards on each price tick.
+  const handleSelectHolding = useCallback((id: string) => {
+    setSelectedId((current) => current === id ? null : id);
+  }, []);
+  const handleEditHolding = useCallback((h: Holding) => {
+    setEditTarget(h); setSheetMode("edit"); setSelectedId(null);
+  }, []);
+  const handleDeleteHolding = useCallback((id: string) => {
+    setDeleteTarget(id);
+  }, []);
+  const handleDCA = useCallback((h: Holding) => {
+    setSelectedId(null); openDCAPanel(h.id);
+  }, [openDCAPanel]);
+  const handleBuy = useCallback((h: Holding) => {
+    setSelectedId(null); setAdjustTarget({ holding: h, mode: "buy" });
+  }, []);
+  const handleSell = useCallback((h: Holding) => {
+    setSelectedId(null); setAdjustTarget({ holding: h, mode: "sell" });
+  }, []);
 
   const handleSave = (input: HoldingInput) => {
     if (sheetMode === "edit" && editTarget) updateHolding(editTarget.id, input);
@@ -1853,9 +2029,14 @@ export function Holdings() {
         <div className="flex items-center justify-between px-4"
           style={{ height: 50, borderBottom: "1px solid var(--border)" }}>
           <span style={{ color: "var(--text-primary)", fontSize: 14, fontWeight: 600 }}>{text.holdings.title}</span>
-          <div className="flex items-center gap-2">
-            <span style={{ color: lastRefreshError ? "var(--danger)" : "var(--text-muted)", fontSize: 11 }}>
-              {lastRefreshError || lastRefreshed}
+          <div className="ml-2 flex min-w-0 items-center gap-2">
+            <span
+              className="max-w-[70px] truncate"
+              title={lastRefreshError || lastRefreshed}
+              aria-label={lastRefreshError || lastRefreshed}
+              style={{ color: lastRefreshError ? "#D97706" : "var(--text-muted)", fontSize: 11, fontWeight: lastRefreshError ? 600 : 400 }}
+            >
+              {lastRefreshError ? (language === "en" ? "Sync issue" : "同步异常") : lastRefreshed}
             </span>
             <button onClick={togglePrivacy}
               className="flex items-center justify-center rounded-lg"
@@ -1879,10 +2060,10 @@ export function Holdings() {
               />
             </button>
             <button onClick={() => openDCAPanel()}
-              className="flex items-center justify-center rounded-lg"
-              style={{ width: 30, height: 30, background: "rgba(79,156,249,0.08)" }}
+              className="flex size-[30px] items-center justify-center rounded-lg bg-app-card text-tm transition-colors hover:text-app-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(79,156,249,0.24)]"
+              aria-label={text.dca.title}
               title={text.dca.title}>
-              <CalendarClock size={13} color="#4F9CF9" />
+              <CalendarClock size={13} />
             </button>
             <button onClick={() => setSheetMode("add")}
               className="flex items-center gap-1 rounded-lg px-2.5 py-1.5"
@@ -1960,7 +2141,7 @@ export function Holdings() {
                 fontWeight: 700,
               }}
             >
-              {item.label}{item.key === "closed" ? ` · ${filteredClosedHoldings.length}${filteredClosedHoldings.length !== closedHoldings.length ? `/${closedHoldings.length}` : ""}` : ""}
+              {item.label}{item.key === "closed" ? ` · ${realizedRecordCount}` : ""}
             </button>
           ))}
         </div>
@@ -2034,7 +2215,7 @@ export function Holdings() {
 
             <div className="flex items-center gap-2 px-3 mb-1">
               <span style={{ color: "var(--text-muted)", fontSize: 11 }}>
-                {language === "en" ? `${filteredClosedHoldings.length} records` : `${filteredClosedHoldings.length} 条记录`}
+                {language === "en" ? `${realizedRecordCount} records` : `${realizedRecordCount} 条记录`}
               </span>
               <span style={{ color: "var(--text-micro)", fontSize: 10 }}>·</span>
               <span style={{ color: "var(--text-micro)", fontSize: 10 }}>
@@ -2048,10 +2229,18 @@ export function Holdings() {
 
             <ClosedHoldingsView
               items={filteredClosedHoldings}
+              events={filteredRealizedEvents}
               baseCurrency={currency}
               privacyMode={privacyMode}
               profitColor={profitColor}
               onDelete={(id) => setDeleteClosedTarget(id)}
+              onEditEvent={(event) => {
+                setEditEventTarget(event);
+                setEditEventAmount(String(Math.abs(event.amount)));
+                setEditEventDate(event.date);
+                setEditEventNote(event.note ?? "");
+              }}
+              onDeleteEvent={setDeleteEventTarget}
               language={language}
             />
           </>
@@ -2211,13 +2400,13 @@ export function Holdings() {
                   dcaPlans={dcaPlans}
                   baseCurrency={currency}
                   selectedId={selectedId}
-                  onSelectHolding={(id) => setSelectedId(selectedId === id ? null : id)}
-                  onEditHolding={(h) => { setEditTarget(h); setSheetMode("edit"); setSelectedId(null); }}
-                  onDeleteHolding={(id) => setDeleteTarget(id)}
+                  onSelectHolding={handleSelectHolding}
+                  onEditHolding={handleEditHolding}
+                  onDeleteHolding={handleDeleteHolding}
                   onQuote={openQuote}
-                  onDCA={(holding) => { setSelectedId(null); openDCAPanel(holding.id); }}
-                  onBuy={(holding) => { setSelectedId(null); setAdjustTarget({ holding, mode: "buy" }); }}
-                  onSell={(holding) => { setSelectedId(null); setAdjustTarget({ holding, mode: "sell" }); }}
+                  onDCA={handleDCA}
+                  onBuy={handleBuy}
+                  onSell={handleSell}
                 />
               </LayoutGroup>
             ) : (
@@ -2225,18 +2414,18 @@ export function Holdings() {
                 <LayoutGroup>
                   <AnimatePresence>
                     {filtered.map((h, i) => (
-	                      <motion.div key={h.id} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ delay: Math.min(i * 0.015, 0.18) }}>
+	                      <motion.div key={h.id} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ delay: Math.min(i * 0.015, 0.12) }}>
                         <HoldingCard
                           h={h} groups={groups}
                           dcaPlans={dcaPlans}
                           isSelected={selectedId === h.id}
-                          onSelect={() => setSelectedId(selectedId === h.id ? null : h.id)}
-                          onEdit={() => { setEditTarget(h); setSheetMode("edit"); setSelectedId(null); }}
-                          onDelete={() => setDeleteTarget(h.id)}
-                          onQuote={() => openQuote(h)}
-                          onDCA={() => { setSelectedId(null); openDCAPanel(h.id); }}
-                          onBuy={() => { setSelectedId(null); setAdjustTarget({ holding: h, mode: "buy" }); }}
-                          onSell={() => { setSelectedId(null); setAdjustTarget({ holding: h, mode: "sell" }); }}
+                          onSelect={handleSelectHolding}
+                          onEdit={handleEditHolding}
+                          onDelete={handleDeleteHolding}
+                          onQuote={openQuote}
+                          onDCA={handleDCA}
+                          onBuy={handleBuy}
+                          onSell={handleSell}
                         />
                       </motion.div>
                     ))}
@@ -2261,7 +2450,7 @@ export function Holdings() {
               <div className="flex justify-center mt-3">
                 <button onClick={() => setSheetMode("add")}
                   className="flex items-center gap-2 rounded-full px-5 py-2.5"
-                  style={{ background: "linear-gradient(135deg, #2563EB, #7C3AED)", color: "white", fontSize: 12, fontWeight: 600, boxShadow: "0 4px 16px rgba(79,156,249,0.3)" }}>
+                  style={{ background: "linear-gradient(135deg, #4F9CF9, #7C3AED)", color: "white", fontSize: 12, fontWeight: 600, boxShadow: "0 4px 16px rgba(79,156,249,0.3)" }}>
                   <Plus size={14} strokeWidth={2.5} /> {text.holdings.addNewHolding}
                 </button>
               </div>
@@ -2371,6 +2560,78 @@ export function Holdings() {
                 <button onClick={() => { removeClosedHolding(deleteClosedTarget); setDeleteClosedTarget(null); }}
                   className="flex-1 rounded-xl py-2.5"
                   style={{ background: "rgba(242,78,78,0.15)", color: "#F24E4E", fontSize: 13, fontWeight: 600 }}>{text.common.confirmDelete}</button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {editEventTarget && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="absolute inset-0 flex items-center justify-center px-6"
+            style={{ background: "var(--scrim)", zIndex: 50 }}>
+            <motion.div initial={{ scale: 0.96, y: 8 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.96, y: 8 }}
+              className="w-full rounded-2xl p-5"
+              style={{ background: "var(--bg-overlay)", border: "1px solid var(--border)" }}>
+              <p style={{ color: "var(--text-primary)", fontSize: 15, fontWeight: 700 }}>
+                {language === "en" ? "Correct realized record" : "纠正已实现流水"}
+              </p>
+              <p className="mt-1 mb-4" style={{ color: "var(--text-muted)", fontSize: 11, lineHeight: 1.5 }}>
+                {language === "en" ? "The linked holding ledger will be updated at the same time." : "保存后会同步修正关联持仓账本，不会只改显示。"}
+              </p>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label={language === "en" ? "Amount" : "金额"}>
+                  <Input type="number" min="0" step="0.01" value={editEventAmount} onChange={setEditEventAmount} />
+                </Field>
+                <Field label={language === "en" ? "Date" : "日期"}>
+                  <Input type="date" value={editEventDate} onChange={setEditEventDate} />
+                </Field>
+              </div>
+              <div className="mt-3">
+                <Field label={language === "en" ? "Note" : "备注"}>
+                  <Input value={editEventNote} onChange={setEditEventNote} />
+                </Field>
+              </div>
+              <div className="mt-5 flex gap-2">
+                <button onClick={() => setEditEventTarget(null)} className="flex-1 rounded-xl py-2.5"
+                  style={{ background: "var(--bg-surface2)", color: "var(--text-secondary)", fontSize: 13 }}>{text.common.cancel}</button>
+                <button
+                  disabled={!(Number(editEventAmount) > 0) || !isValidYMD(editEventDate)}
+                  onClick={() => {
+                    updatePortfolioEvent(editEventTarget.id, { amount: Number(editEventAmount), date: editEventDate, note: editEventNote });
+                    setEditEventTarget(null);
+                  }}
+                  className="flex-1 rounded-xl py-2.5 disabled:opacity-40"
+                  style={{ background: "#4F9CF9", color: "white", fontSize: 13, fontWeight: 700 }}>
+                  {text.common.save}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {deleteEventTarget && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="absolute inset-0 flex items-center justify-center px-6"
+            style={{ background: "var(--scrim)", zIndex: 50 }}>
+            <motion.div initial={{ scale: 0.96 }} animate={{ scale: 1 }} exit={{ scale: 0.96 }}
+              className="w-full rounded-2xl p-5"
+              style={{ background: "var(--bg-overlay)", border: "1px solid var(--border)" }}>
+              <p style={{ color: "var(--text-primary)", fontSize: 15, fontWeight: 700 }}>
+                {language === "en" ? "Delete realized record?" : "删除这条已实现流水？"}
+              </p>
+              <p className="mt-1 mb-4" style={{ color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>
+                {language === "en" ? "Its linked dividend, fee or tax will also be reversed from the holding ledger." : "关联的分红、手续费或税费也会从持仓账本同步冲销。"}
+              </p>
+              <div className="flex gap-2">
+                <button onClick={() => setDeleteEventTarget(null)} className="flex-1 rounded-xl py-2.5"
+                  style={{ background: "var(--bg-surface2)", color: "var(--text-secondary)", fontSize: 13 }}>{text.common.cancel}</button>
+                <button onClick={() => { removePortfolioEvent(deleteEventTarget.id); setDeleteEventTarget(null); }}
+                  className="flex-1 rounded-xl py-2.5"
+                  style={{ background: "rgba(242,78,78,0.15)", color: "#F24E4E", fontSize: 13, fontWeight: 700 }}>{text.common.confirmDelete}</button>
               </div>
             </motion.div>
           </motion.div>
