@@ -8,7 +8,7 @@
         {
           "header": "User-Agent",
           "operation": "set",
-          "value": "AssetMate/2.0.0 (contact: https://github.com/yejiangyin/AssetMate/issues)"
+          "value": "AssetMate/2.0.1 (contact: https://github.com/yejiangyin/AssetMate/issues)"
         }
       ]
     },
@@ -26,7 +26,7 @@
         {
           "header": "User-Agent",
           "operation": "set",
-          "value": "AssetMate/2.0.0 (contact: https://github.com/yejiangyin/AssetMate/issues)"
+          "value": "AssetMate/2.0.1 (contact: https://github.com/yejiangyin/AssetMate/issues)"
         }
       ]
     },

@@ -4,8 +4,10 @@ import { Link } from "react-router";
 import {
   AlertCircle,
   CalendarDays,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Eye,
   EyeOff,
   Layers3,
@@ -31,6 +33,7 @@ import {
 import { convertCurrency, toCNY } from "../services/priceRefresher";
 import { formatPercent } from "../utils/numberFormat";
 import { breakdownBarWidth, formatCalendarMoney, formatCompactMoney, hasMeaningfulReturnData, returnEventValue } from "../utils/returnsPresentation";
+import { RETURNS_RANKING_PREVIEW_LIMIT, getVisibleRanking } from "../utils/rankingVisibility";
 
 type ScopeMode = "week" | "month" | "year" | "all";
 type ViewLevel = "day" | "week" | "days" | "months" | "years";
@@ -199,6 +202,7 @@ export function Returns() {
   const [selectedMonth, setSelectedMonth] = useState(currentMonth);
   const [selectedYear, setSelectedYear] = useState(currentYear);
   const [manualRefreshing, setManualRefreshing] = useState(false);
+  const [rankingExpanded, setRankingExpanded] = useState(false);
   const refreshingActive = isRefreshing || manualRefreshing;
 
   useEffect(() => {
@@ -348,17 +352,25 @@ export function Returns() {
     }
     return map;
   }, [holdings, portfolioEvents]);
-  const rankRows = useMemo(() => getHoldingReturnContributions(
+  const allRankRows = useMemo(() => getHoldingReturnContributions(
     portfolioEvents,
     analysisSnapshots,
     view.start,
     view.end,
-  ).slice(0, 8).map((row) => ({
+  ).map((row) => ({
     ...row,
     ...(identityById.get(row.id) ?? { name: row.id, symbol: "-" }),
   })), [analysisSnapshots, identityById, portfolioEvents, view.end, view.start]);
-  const rankIsEstimated = rankRows.some((row) => row.incompleteBreakdown)
+  const rankRows = useMemo(
+    () => getVisibleRanking(allRankRows, rankingExpanded, RETURNS_RANKING_PREVIEW_LIMIT),
+    [allRankRows, rankingExpanded],
+  );
+  const rankIsEstimated = allRankRows.some((row) => row.incompleteBreakdown)
     || Object.keys(portfolioEventBaseline.daily).some((date) => date >= view.start && date <= view.end);
+
+  useEffect(() => {
+    setRankingExpanded(false);
+  }, [view.end, view.start]);
 
   const gridCells = useMemo<GridCell[]>(() => {
     if (view.level === "week") {
@@ -829,6 +841,19 @@ export function Returns() {
                 </div>
               );
             })}
+            {allRankRows.length > RETURNS_RANKING_PREVIEW_LIMIT && (
+              <button
+                type="button"
+                onClick={() => setRankingExpanded((expanded) => !expanded)}
+                aria-expanded={rankingExpanded}
+                className="flex w-full items-center justify-center gap-1.5 border-t border-app-border bg-app-surface2 px-3 py-2.5 text-[11px] font-medium text-app-accent transition-colors hover:bg-app-hover"
+              >
+                {rankingExpanded
+                  ? copy.collapseRank(RETURNS_RANKING_PREVIEW_LIMIT)
+                  : copy.showAllRank(allRankRows.length)}
+                {rankingExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+              </button>
+            )}
             {rankRows.length === 0 && <EmptyState text={copy.noRank} />}
           </div>
         </section>
