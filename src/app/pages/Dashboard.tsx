@@ -10,6 +10,7 @@ import { BrandMark } from "../components/BrandMark";
 import { formatExactMoney, formatPercent } from "../utils/numberFormat";
 import { useViewSwitcher } from "../utils/useViewSwitcher";
 import { getMarketBadge } from "../utils/marketBadge";
+import { DASHBOARD_RANKING_PREVIEW_LIMIT, getVisibleRanking } from "../utils/rankingVisibility";
 import {
   CORPORATE_ACTION_NOTICE_RETENTION_DAYS,
   getRecentCorporateActionNotices,
@@ -220,6 +221,7 @@ export function Dashboard() {
   const [manualRefreshing, setManualRefreshing] = useState(false);
   const [pnlSort, setPnlSort] = useState<"gain" | "loss" | "abs">("gain");
   const [assetFilter, setAssetFilter] = useState("ALL");
+  const [rankingExpanded, setRankingExpanded] = useState(false);
   const [estimatedAssetSeries, setEstimatedAssetSeries] = useState<EstimatedAssetSeries | null>(null);
   const [loadingEstimated, setLoadingEstimated] = useState(false);
   const [noticesExpanded, setNoticesExpanded] = useState(false);
@@ -477,17 +479,25 @@ export function Dashboard() {
     }
   }, [assetFilter, marketTabs]);
 
-  const topMovers = useMemo(() => {
+  const rankedMovers = useMemo(() => {
     const filtered = assetFilter === "ALL" ? holdings : holdings.filter((h) => h.market === assetFilter);
-    const sorted = [...filtered].sort((a, b) => {
+    return [...filtered].sort((a, b) => {
       const av = toCNY(a.todayPnl, a.currency);
       const bv = toCNY(b.todayPnl, b.currency);
       if (pnlSort === "gain") return bv - av;          // 盈利多的在前
       if (pnlSort === "loss") return av - bv;          // 亏损多的在前
       return Math.abs(bv) - Math.abs(av);              // 波动大的在前
     });
-    return sorted.slice(0, 20);
   }, [holdings, pnlSort, assetFilter]);
+
+  const visibleMovers = useMemo(
+    () => getVisibleRanking(rankedMovers, rankingExpanded, DASHBOARD_RANKING_PREVIEW_LIMIT),
+    [rankedMovers, rankingExpanded],
+  );
+
+  useEffect(() => {
+    setRankingExpanded(false);
+  }, [assetFilter, pnlSort]);
 
   const dashboardRefreshing = isRefreshing || manualRefreshing;
   const dismissedNoticeKeySet = useMemo(() => new Set(dismissedNoticeKeys), [dismissedNoticeKeys]);
@@ -904,10 +914,10 @@ export function Dashboard() {
             </div>
           )}
 
-          {topMovers.length > 0 ? (
+          {visibleMovers.length > 0 ? (
           <div className="rounded-xl overflow-hidden bg-app-card border border-app-border">
             <div>
-              {topMovers
+              {visibleMovers
                 .map((item, i, arr) => {
                   const c = profitColor(item.todayPnl);
                   const rankBadge = rankBadgeStyle(i);
@@ -959,6 +969,19 @@ export function Dashboard() {
                   );
                 })}
             </div>
+            {rankedMovers.length > DASHBOARD_RANKING_PREVIEW_LIMIT && (
+              <button
+                type="button"
+                onClick={() => setRankingExpanded((expanded) => !expanded)}
+                aria-expanded={rankingExpanded}
+                className="flex w-full items-center justify-center gap-1.5 border-t border-app-border bg-app-surface2 px-3 py-2.5 text-[11px] font-medium text-app-accent transition-colors hover:bg-app-hover"
+              >
+                {rankingExpanded
+                  ? text.dashboard.collapseRanking(DASHBOARD_RANKING_PREVIEW_LIMIT)
+                  : text.dashboard.showAllRanking(rankedMovers.length)}
+                {rankingExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+              </button>
+            )}
           </div>
           ) : (
             <div className="rounded-xl bg-app-card border border-app-border px-3 py-6 flex items-center justify-center">

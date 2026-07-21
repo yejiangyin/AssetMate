@@ -13,9 +13,9 @@ function getExtensionVersion(): string {
   try {
     // chrome is a global in extension contexts; guard for non-extension builds.
     const manifest = (globalThis as unknown as { chrome?: { runtime?: { getManifest?: () => { version?: string } } } }).chrome?.runtime?.getManifest?.();
-    return manifest?.version ?? "2.0.0";
+    return manifest?.version ?? "2.0.1";
   } catch {
-    return "2.0.0";
+    return "2.0.1";
   }
 }
 
