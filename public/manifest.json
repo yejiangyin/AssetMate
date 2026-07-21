@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "资产助手",
-  "version": "1.0.12",
-  "version_name": "1.0.12",
-  "description": "个人资产与多市场行情查看插件。",
+  "version": "2.0.0",
+  "version_name": "2.0.0",
+  "description": "个人资产、多市场行情、AI 投研与策略回测插件。",
   "permissions": [
     "sidePanel",
     "storage",
-    "alarms"
+    "alarms",
+    "declarativeNetRequest"
   ],
   "icons": {
     "16":  "icons/icon-16.png",
@@ -31,11 +32,25 @@
   "background": {
     "service_worker": "background.js"
   },
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "sec_request_identity",
+        "enabled": true,
+        "path": "rules/sec-request-identity.json"
+      }
+    ]
+  },
   "host_permissions": [
     "https://query1.finance.yahoo.com/v8/finance/*",
     "https://query1.finance.yahoo.com/v1/finance/*",
+    "https://query1.finance.yahoo.com/v1/test/*",
+    "https://query1.finance.yahoo.com/v10/finance/*",
     "https://query2.finance.yahoo.com/v8/finance/*",
     "https://query2.finance.yahoo.com/v1/finance/*",
+    "https://query2.finance.yahoo.com/v1/test/*",
+    "https://query2.finance.yahoo.com/v10/finance/*",
+    "https://fc.yahoo.com/*",
     "https://api.nasdaq.com/api/quote/*",
     "https://api.coingecko.com/api/v3/*",
     "https://searchapi.eastmoney.com/*",
@@ -51,6 +66,18 @@
     "https://web.ifzq.gtimg.cn/appstock/*",
     "https://open.er-api.com/v6/*",
     "https://api.binance.com/api/v3/*",
-    "https://www.okx.com/api/v5/*"
+    "https://www.okx.com/api/v5/*",
+    "https://api.tavily.com/*",
+    "https://api.search.brave.com/*",
+    "https://api.exa.ai/*",
+    "https://open.feedcoopapi.com/*",
+    "https://datapro.hqd.cn-beijing.volces.com/*",
+    "https://data.sec.gov/*",
+    "https://www.sec.gov/*"
+  ],
+  "optional_host_permissions": [
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "https://*/*"
   ]
 }

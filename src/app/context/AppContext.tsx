@@ -8,7 +8,6 @@ import {
   PortfolioEvent,
   PortfolioEventBaseline,
   PortfolioEventSource,
-  amountInBase,
   buildBuyEvent,
   buildPortfolioEventFromCorporateAction,
   buildSellEvent,
@@ -21,7 +20,7 @@ import {
   normalizePortfolioEventBaseline,
   ymdFromEventValue,
 } from "../services/portfolioEvents";
-import { normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction } from "../utils/holdingHelpers";
+import { normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction, reverseCorporateAction } from "../utils/holdingHelpers";
 import { dedupeDCAExecutions, hydratePlans, repairDCAData, settleDueDCAPlans, syncPlanWithHolding, computeNextExec } from "../utils/dcaEngine";
 import { safeUUID } from "../utils/safeId";
 import { consumeSnapshotDueDates, DEFAULT_OPEN_MODE, getConfiguredExtensionOpenMode, normalizeOpenMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
@@ -372,6 +371,7 @@ interface AppState {
   lastRefreshAt:   number;
   lastRefreshError: string;
   storageError:     string;
+  loadFailed:       boolean;
   detailTarget:    DetailTarget | null;
   dcaPlans:        DCAPlan[];
   dcaExecutions:   DCAExecution[];
@@ -407,6 +407,8 @@ interface AppContextType extends AppState {
   adjustHolding:      (id: string, input: HoldingAdjustmentInput) => void;
   removeHolding:      (id: string) => void;
   removeClosedHolding: (id: string) => void;
+  updatePortfolioEvent: (id: string, patch: Pick<PortfolioEvent, "date" | "amount" | "note">) => void;
+  removePortfolioEvent: (id: string) => void;
   openDetail:         (t: DetailTarget) => void;
   closeDetail:        () => void;
   profitColor:        (v: number) => string;
@@ -423,6 +425,7 @@ interface AppContextType extends AppState {
 const AppContext = createContext<AppContextType | null>(null);
 
 const STORAGE_KEY = "asset-helper:v2";
+const STORAGE_BACKUP_KEY = "asset-helper:v2:backup";
 const SAVED_BACKTESTS_KEY = "asset-helper:saved-backtests:v1";
 const STORAGE_VERSION = 3;
 const REFRESH_META_KEY = "asset-helper:portfolio-refresh-meta:v1";
@@ -443,6 +446,7 @@ const NON_CRITICAL_STORAGE_KEYS = [
   "asset-helper:corporate-actions-cache:v1",
   "asset-helper:corporate-actions-cache:v2",
   "asset-helper:corporate-actions-cache:v3",
+  "asset-helper:corporate-actions-cache:v4",
   "asset-helper:market-page-cache:v1",
   "asset-helper:market-page-cache:v2",
   "asset-helper:market-page-cache:v3",
@@ -692,12 +696,13 @@ function appendDCAExecutionEvents(
 ) {
   const existingExecutionIds = new Set(events.map((event) => event.relatedEventId).filter(Boolean));
   const holdingById = new Map(holdings.map((holding) => [holding.id, holding]));
+  let nextHoldings = holdings;
   const nextEvents = [...events];
   let changed = false;
   for (const execution of executions) {
     if (execution.status !== "executed" || existingExecutionIds.has(execution.id)) continue;
     if (!(execution.quantity && execution.quantity > 0 && execution.price && execution.price > 0)) continue;
-    const holding = holdingById.get(execution.holdingId);
+    let holding = holdingById.get(execution.holdingId);
     if (!holding) continue;
     const date = ymdFromEventValue(execution.actualDate);
     const buyEvent = buildBuyEvent(holding, {
@@ -712,29 +717,32 @@ function appendDCAExecutionEvents(
     const { fee, tax } = estimateTransactionCosts(holding.transactionCostProfile, "buy", tradeAmount);
     for (const [costType, costAmount] of [["fee", fee], ["tax", tax]] as const) {
       if (!(costAmount > 0)) continue;
-      const costDate = date;
-      nextEvents.push({
-        id: `${source}:dca-cost:${execution.id}:${costType}`,
-        date: costDate,
-        holdingId: holding.id,
-        symbol: holding.symbol,
-        name: holding.name,
-        market: holding.market,
-        assetType: holding.assetType,
-        type: costType,
-        amount: -costAmount,
-        amountInBase: amountInBase(-costAmount, holding.currency),
-        currency: holding.currency,
-        source,
-        relatedEventId: execution.id,
-        note: "dca transaction cost",
-        createdAt: `${costDate}T00:00:00.000Z`,
-      });
+      const actionId = `dca:${execution.id}:${costType}`;
+      if (!(holding.corporateActions ?? []).some((action) => action.id === actionId)) {
+        holding = applyHoldingCorporateAction(holding, {
+          id: actionId,
+          type: costType,
+          date,
+          amount: costAmount,
+          source,
+          note: "dca transaction cost",
+        });
+        holdingById.set(holding.id, holding);
+      }
+      const action = holding.corporateActions?.find((item) => item.id === actionId);
+      const costEvent = action ? buildPortfolioEventFromCorporateAction(holding, action, source) : null;
+      if (costEvent) nextEvents.push({ ...costEvent, relatedEventId: execution.id });
     }
     existingExecutionIds.add(execution.id);
     changed = true;
   }
-  return changed ? dedupePortfolioEvents(nextEvents) : events;
+  if (changed) {
+    nextHoldings = holdings.map((holding) => holdingById.get(holding.id) ?? holding);
+  }
+  return {
+    holdings: nextHoldings,
+    portfolioEvents: changed ? dedupePortfolioEvents(nextEvents) : events,
+  };
 }
 
 function hasFundNavRefreshWindow(holdings: Holding[], now = new Date()) {
@@ -776,7 +784,7 @@ function pruneCorporateActionCheckedAt(activeHoldings: Holding[] = [], now = Dat
 async function fetchCorporateActionMap(holdings: Holding[], force = false) {
   const now = Date.now();
   pruneCorporateActionCheckedAt(holdings, now);
-  const entries = await Promise.all(
+  const settled = await Promise.allSettled(
     holdings.map(async (holding) => {
       const key = corporateActionTargetKey(holding);
       const checkedAt = corporateActionCheckedAt.get(key) ?? 0;
@@ -788,7 +796,11 @@ async function fetchCorporateActionMap(holdings: Holding[], force = false) {
       return [holding.id, actions] as const;
     }),
   );
-  return new Map(entries);
+  const entries = settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+  return {
+    actions: new Map(entries),
+    failedCount: settled.filter((result) => result.status === "rejected").length,
+  };
 }
 
 function actionAlreadyApplied(holding: Holding, actionId: string) {
@@ -836,7 +848,7 @@ export function applyAutomaticCorporateActions(
           announcementDate: action.announcementDate,
           source: action.source,
           description: action.description,
-          note: "auto",
+          note: action.source === "eastmoney-stock" ? "auto share bonus / capital transfer" : "auto",
         };
         next = applyHoldingCorporateAction(next, input);
         const latestAction = next.corporateActions?.at(-1);
@@ -849,16 +861,16 @@ export function applyAutomaticCorporateActions(
         if (!(totalAmount > 0)) continue;
         const dividendTaxRate = Math.min(1, Math.max(0, next.transactionCostProfile?.dividendTaxRate ?? 0));
         const dividendTax = totalAmount * dividendTaxRate;
-        const netDividend = totalAmount - dividendTax;
+        const netDividend = Math.max(0, totalAmount - dividendTax);
         const shouldReinvest = canAutoReinvestDividend(next) && (next.dividendReinvest ?? dividendReinvest);
         if (shouldReinvest) {
           const reinvestPrice = resolveFundDividendReinvestPrice(next, action);
-          if (!(reinvestPrice > 0)) continue;
+          if (!(reinvestPrice > 0) || !(netDividend > 0)) continue;
           const input: HoldingCorporateActionInput = {
             id: action.id,
             type: "dividend_reinvest",
             date: postingDate,
-            amount: totalAmount,
+            amount: netDividend,
             shares: netDividend / reinvestPrice,
             price: reinvestPrice,
             recordDate: action.recordDate,
@@ -867,7 +879,9 @@ export function applyAutomaticCorporateActions(
             announcementDate: action.announcementDate,
             source: action.source,
             description: action.description,
-            note: "auto dividend reinvest",
+            estimatedAmount: dividendTax > 0 ? totalAmount : undefined,
+            rateUsed: dividendTax > 0 ? dividendTaxRate : undefined,
+            note: dividendTax > 0 ? "auto dividend reinvest, net of dividend withholding tax" : "auto dividend reinvest",
           };
           next = applyHoldingCorporateAction(next, input);
           const latestAction = next.corporateActions?.at(-1);
@@ -893,24 +907,20 @@ export function applyAutomaticCorporateActions(
           if (event) portfolioEvents.push(event);
         }
         if (dividendTax > 0) {
-          portfolioEvents.push({
-            id: `auto:dividend-tax:${action.id}:${postingDate}`,
-            date: postingDate,
-            holdingId: next.id,
-            symbol: next.symbol,
-            name: next.name,
-            market: next.market,
-            assetType: next.assetType,
+          next = applyHoldingCorporateAction(next, {
+            id: `${action.id}:withholding-tax`,
             type: "tax",
-            amount: -dividendTax,
-            amountInBase: amountInBase(-dividendTax, next.currency),
-            currency: next.currency,
-            source: "auto",
-            corporateActionId: action.id,
+            date: postingDate,
+            amount: dividendTax,
+            source: action.source,
+            description: action.description,
             rateUsed: dividendTaxRate,
+            estimatedAmount: totalAmount,
             note: "automatic dividend withholding tax",
-            createdAt: `${postingDate}T00:00:00.000Z`,
           });
+          const taxAction = next.corporateActions?.at(-1);
+          const taxEvent = taxAction ? buildPortfolioEventFromCorporateAction(next, taxAction, "auto") : null;
+          if (taxEvent) portfolioEvents.push(taxEvent);
         }
         changed = true;
       }
@@ -941,6 +951,7 @@ function defaultState(): AppState {
     lastRefreshAt:   0,
     lastRefreshError: "",
     storageError:     "",
+    loadFailed:       false,
     detailTarget:    null,
     dcaPlans:        hydratePlans(initialDCAPlans),
     dcaExecutions:   [],
@@ -1113,8 +1124,9 @@ function shouldSkipCoordinatedRefresh(now = Date.now()) {
 export function loadInitialState(): AppState {
   const base = defaultState();
   if (typeof window === "undefined") return base;
+  let raw: string | null = null;
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return base;
     const saved = JSON.parse(raw) as Partial<PersistedState>;
     // An empty holdings array means the user explicitly cleared their data
@@ -1202,7 +1214,15 @@ export function loadInitialState(): AppState {
       dcaPanelHoldingId: null,
     };
   } catch {
-    return base;
+    // Back up the unparseable/legacy blob so the user can recover it via export,
+    // and mark the session as load-failed so the persist effect skips overwriting
+    // the user's real (backed-up) data with demo state.
+    if (raw) {
+      try { window.localStorage.setItem(STORAGE_BACKUP_KEY, raw); } catch { /* best effort */ }
+    }
+    return { ...base, loadFailed: true, storageError: base.language === "en"
+      ? "Saved data could not be loaded (it may be corrupted). A backup was saved. Please export a backup and re-import if needed."
+      : "本地数据加载失败（可能已损坏），已自动备份。请导出备份后按需重新导入。" };
   }
 }
 
@@ -1255,7 +1275,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const applyCorporateActionsToLatestState = useCallback((
-    corporateActionMap: Awaited<ReturnType<typeof fetchCorporateActionMap>>,
+    corporateActionMap: Awaited<ReturnType<typeof fetchCorporateActionMap>>["actions"],
   ) => {
     if (!corporateActionMap.size) return;
     const now = new Date();
@@ -1267,20 +1287,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         todayLocalYMD(now),
       );
       const dcaState = applyDCAState(corporateState.holdings, s.dcaPlans, s.dcaExecutions, false);
-      const portfolioEvents = appendDCAExecutionEvents(
+      const dcaLedger = appendDCAExecutionEvents(
         [...s.portfolioEvents, ...corporateState.portfolioEvents],
         dcaState.holdings,
         dcaState.dcaExecutions,
       );
+      const portfolioEvents = dcaLedger.portfolioEvents;
       const eventsChanged = portfolioEvents !== s.portfolioEvents || corporateState.portfolioEvents.length > 0;
       return {
         ...s,
-        holdings: dcaState.holdings,
+        holdings: dcaLedger.holdings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
         portfolioEvents,
         assetSnapshots: corporateState.changed || eventsChanged
-          ? upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, now, s.portfolioEventBaseline)
+          ? upsertPortfolioSnapshot(s.assetSnapshots, dcaLedger.holdings, portfolioEvents, now, s.portfolioEventBaseline)
           : s.assetSnapshots,
       };
     });
@@ -1291,8 +1312,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     if (corporateActionRefreshPromiseRef.current) return corporateActionRefreshPromiseRef.current;
 
     const task = fetchCorporateActionMap(currentHoldings, force)
-      .then(applyCorporateActionsToLatestState)
-      .catch(() => undefined)
+      .then(({ actions, failedCount }) => {
+        applyCorporateActionsToLatestState(actions);
+        if (failedCount > 0) {
+          setState((state) => ({
+            ...state,
+            lastRefreshError: state.language === "en"
+              ? `${failedCount} holding action update${failedCount === 1 ? "" : "s"} failed; other holdings were updated.`
+              : `${failedCount} 个持仓的公司行动同步失败，其余标的已正常更新。`,
+          }));
+        }
+      })
+      .catch(() => {
+        setState((state) => ({
+          ...state,
+          lastRefreshError: state.language === "en"
+            ? "Corporate action updates failed. Price data remains available."
+            : "公司行动同步失败，行情数据仍可正常使用。",
+        }));
+      })
       .finally(() => {
         corporateActionRefreshPromiseRef.current = null;
       });
@@ -1365,14 +1403,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const t   = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}:${String(now.getSeconds()).padStart(2,"0")}`;
         writeRefreshMeta({ startedAt: 0, finishedAt: now.getTime() });
         const dcaState = applyDCAState(updated, s.dcaPlans, s.dcaExecutions, true);
-        const portfolioEvents = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
+        const dcaLedger = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
+        const portfolioEvents = dcaLedger.portfolioEvents;
         return {
           ...s,
-          holdings: dcaState.holdings,
+          holdings: dcaLedger.holdings,
           dcaPlans: dcaState.dcaPlans,
           dcaExecutions: dcaState.dcaExecutions,
           portfolioEvents,
-          assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, now, s.portfolioEventBaseline),
+          assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaLedger.holdings, portfolioEvents, now, s.portfolioEventBaseline),
           isRefreshing: false,
           lastRefreshed: t,
           lastRefreshAt: now.getTime(),
@@ -1429,6 +1468,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+    // If the initial load failed, the in-memory state is demo data. Skip
+    // persisting so we don't overwrite the user's backed-up real data.
+    if (state.loadFailed) return;
     persistedSnapshotRef.current = persistedSnapshot;
     if (persistTimerRef.current != null) window.clearTimeout(persistTimerRef.current);
     persistTimerRef.current = window.setTimeout(() => {
@@ -1441,7 +1483,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setState((current) => current.storageError === storageError ? current : { ...current, storageError });
       persistTimerRef.current = null;
     }, 250);
-  }, [persistedSnapshot]);
+  }, [persistedSnapshot, state.loadFailed]);
 
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
@@ -1555,6 +1597,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   const importPortfolio = useCallback((raw: string) => {
     try {
+      // Back up current data before attempting import, so users can recover if import fails.
+      if (typeof window !== "undefined") {
+        try {
+          const currentRaw = window.localStorage.getItem(STORAGE_KEY);
+          if (currentRaw) window.localStorage.setItem(STORAGE_BACKUP_KEY, currentRaw);
+        } catch { /* best effort */ }
+      }
       const parsed = JSON.parse(raw);
       const data = parsed?.data ?? parsed;
       if (!Array.isArray(data?.holdings)) {
@@ -1578,6 +1627,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         : migratePortfolioEvents(dcaState.holdings, closedHoldings, dcaState.dcaExecutions, importedEvents);
       const nextState: AppState = {
         ...current,
+        loadFailed: false,
+        storageError: "",
         groups: Array.isArray(data.groups) ? data.groups : current.groups,
         holdings: dcaState.holdings,
         closedHoldings,
@@ -1637,14 +1688,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const clearLocalData = useCallback(() => {
     if (typeof window !== "undefined") {
       window.localStorage.removeItem(STORAGE_KEY);
-      // Clear every asset-helper:* cache (chart, market page, fx rates,
-      // corporate actions, trading calendar, fund history …). Scanning by
-      // prefix avoids the list going stale whenever a cache version bumps.
+      // Clear portfolio/runtime caches (chart, market page, FX rates,
+      // corporate actions, trading calendar, fund history …) while keeping
+      // research provider/search connections for the default reset path.
       try {
         const keysToRemove: string[] = [];
         for (let i = 0; i < window.localStorage.length; i += 1) {
           const key = window.localStorage.key(i);
-          if (key && key.startsWith("asset-helper:") && key !== STORAGE_KEY) {
+          if (
+            key &&
+            key.startsWith("asset-helper:") &&
+            key !== STORAGE_KEY &&
+            key !== STORAGE_BACKUP_KEY &&
+            key !== SAVED_BACKTESTS_KEY &&
+            !key.startsWith("asset-helper:research-")
+          ) {
             keysToRemove.push(key);
           }
         }
@@ -1674,51 +1732,49 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       ...s,
       groups:   s.groups.filter((g) => g.id !== id),
       holdings: s.holdings.map((h) => h.groupId === id ? { ...h, groupId: "" } : h),
+      closedHoldings: s.closedHoldings.map((h) => h.groupId === id ? { ...h, groupId: "" } : h),
+      portfolioEvents: s.portfolioEvents.map((event) => event.groupId === id ? { ...event, groupId: "" } : event),
     }));
   }, []);
 
   /* holdings */
   const addHolding = useCallback((input: HoldingInput) => {
-    const h = buildHolding(input, `holding_${safeUUID()}`);
+    let h = buildHolding(input, `holding_${safeUUID()}`);
+    const event = buildBuyEvent(h, {
+      quantity: h.quantity,
+      price: h.costPrice,
+      source: "manual",
+    });
+    const tradeAmount = h.quantity * h.costPrice;
+    const { fee, tax } = estimateTransactionCosts(h.transactionCostProfile, "buy", tradeAmount);
+    const costEvents: PortfolioEvent[] = [];
+    const date = ymdFromEventValue(event.date);
+    for (const [costType, costAmount] of [["fee", fee], ["tax", tax]] as const) {
+      if (!(costAmount > 0)) continue;
+      h = applyHoldingCorporateAction(h, {
+        id: `manual:initial-cost:${h.id}:${costType}`,
+        type: costType,
+        date,
+        amount: costAmount,
+        source: "manual",
+        note: "initial buy transaction cost",
+      });
+      const action = h.corporateActions?.at(-1);
+      const costEvent = action ? buildPortfolioEventFromCorporateAction(h, action, "manual") : null;
+      if (costEvent) costEvents.push(costEvent);
+    }
     setState((s) => {
       const updated = [h, ...s.holdings];
       const dcaState = applyDCAState(updated, s.dcaPlans, s.dcaExecutions);
-      const event = buildBuyEvent(h, {
-        quantity: h.quantity,
-        price: h.costPrice,
-        source: "manual",
-      });
-      const tradeAmount = h.quantity * h.costPrice;
-      const { fee, tax } = estimateTransactionCosts(h.transactionCostProfile, "buy", tradeAmount);
-      const costEvents: PortfolioEvent[] = [];
-      const date = ymdFromEventValue(event.date);
-      for (const [costType, costAmount] of [["fee", fee], ["tax", tax]] as const) {
-        if (!(costAmount > 0)) continue;
-        costEvents.push({
-          id: `manual:initial-cost:${h.id}:${costType}`,
-          date,
-          holdingId: h.id,
-          symbol: h.symbol,
-          name: h.name,
-          market: h.market,
-          assetType: h.assetType,
-          type: costType,
-          amount: -costAmount,
-          amountInBase: amountInBase(-costAmount, h.currency),
-          currency: h.currency,
-          source: "manual",
-          note: "initial buy transaction cost",
-          createdAt: `${date}T00:00:00.000Z`,
-        });
-      }
-      const portfolioEvents = appendDCAExecutionEvents([...s.portfolioEvents, event, ...costEvents], dcaState.holdings, dcaState.dcaExecutions);
+      const dcaLedger = appendDCAExecutionEvents([...s.portfolioEvents, event, ...costEvents], dcaState.holdings, dcaState.dcaExecutions);
+      const portfolioEvents = dcaLedger.portfolioEvents;
       return {
         ...s,
-        holdings: dcaState.holdings,
+        holdings: dcaLedger.holdings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
         portfolioEvents,
-        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaLedger.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
       };
     });
   }, [applyDCAState]);
@@ -1756,14 +1812,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const updatedHoldings = s.holdings.map((x) => (x.id === id ? h : x));
       const updatedPlans = s.dcaPlans.map((plan) => (plan.holdingId === id ? syncPlanWithHolding(plan, h) : plan));
       const dcaState = applyDCAState(updatedHoldings, updatedPlans, s.dcaExecutions);
-      const portfolioEvents = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
+      const dcaLedger = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
+      const portfolioEvents = dcaLedger.portfolioEvents;
       return {
         ...s,
-        holdings: dcaState.holdings,
+        holdings: dcaLedger.holdings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
         portfolioEvents,
-        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaLedger.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
       };
     });
   }, [applyDCAState]);
@@ -1848,19 +1905,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           })
           : null;
       const transactionEvents = event ? [event, ...costEvents] : [];
-      const portfolioEvents = appendDCAExecutionEvents(
+      const dcaLedger = appendDCAExecutionEvents(
         transactionEvents.length > 0 ? [...s.portfolioEvents, ...transactionEvents] : s.portfolioEvents,
         dcaState.holdings,
         dcaState.dcaExecutions,
       );
+      const portfolioEvents = dcaLedger.portfolioEvents;
       return {
         ...s,
-        holdings: dcaState.holdings,
+        holdings: dcaLedger.holdings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
         closedHoldings: nextClosedHoldings,
         portfolioEvents,
-        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaLedger.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
       };
     });
   }, [applyDCAState]);
@@ -1873,24 +1931,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const updatedPlans = s.dcaPlans.filter((plan) => plan.holdingId !== id);
       const updatedExecutions = s.dcaExecutions.filter((item) => item.holdingId !== id);
       const dcaState = applyDCAState(updatedHoldings, updatedPlans, updatedExecutions);
-      const closedHolding = target.quantity > 0 && target.costPrice > 0 ? buildClosedHolding(target) : null;
-      const event = closedHolding
-        ? buildSellEvent(target, {
-          quantity: target.quantity,
-          price: target.currentPrice,
-          source: "manual",
-          relatedEventId: closedHolding.id,
-        })
-        : null;
-      const portfolioEvents = appendDCAExecutionEvents(event ? [...s.portfolioEvents, event] : s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
+      const historicalCloseIds = new Set(
+        s.closedHoldings.filter((item) => item.sourceHoldingId === id).map((item) => item.id),
+      );
+      // Deleting an erroneous/open record must not fabricate a sale. Preserve
+      // events linked to an existing partial/full close, and remove only the
+      // open-position/DCA history that belongs exclusively to this record.
+      const remainingEvents = s.portfolioEvents.filter((event) => (
+        event.holdingId !== id || Boolean(event.relatedEventId && historicalCloseIds.has(event.relatedEventId))
+      ));
+      const dcaLedger = appendDCAExecutionEvents(remainingEvents, dcaState.holdings, dcaState.dcaExecutions);
+      const portfolioEvents = dcaLedger.portfolioEvents;
       return {
         ...s,
-        holdings: dcaState.holdings,
+        holdings: dcaLedger.holdings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
-        closedHoldings: closedHolding ? [closedHolding, ...s.closedHoldings] : s.closedHoldings,
+        closedHoldings: s.closedHoldings,
         portfolioEvents,
-        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaLedger.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
         dcaPanelHoldingId: s.dcaPanelHoldingId === id ? null : s.dcaPanelHoldingId,
       };
     });
@@ -1906,6 +1965,70 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         closedHoldings: s.closedHoldings.filter((item) => item.id !== id),
         portfolioEvents,
         assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, s.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
+      };
+    });
+  }, []);
+
+  const updatePortfolioEvent = useCallback((id: string, patch: Pick<PortfolioEvent, "date" | "amount" | "note">) => {
+    setState((s) => {
+      const currentEvent = s.portfolioEvents.find((event) => event.id === id);
+      if (!currentEvent) return s;
+      const signedAmount = currentEvent.type === "fee" || currentEvent.type === "tax"
+        ? -Math.abs(patch.amount)
+        : Math.abs(patch.amount);
+      let holdings = s.holdings;
+      let nextEvent: PortfolioEvent = {
+        ...currentEvent,
+        date: patch.date,
+        amount: signedAmount,
+        amountInBase: toCNY(signedAmount, currentEvent.currency),
+        note: patch.note?.trim() ?? "",
+      };
+      if (currentEvent.holdingId && currentEvent.corporateActionId) {
+        holdings = holdings.map((holding) => {
+          if (holding.id !== currentEvent.holdingId) return holding;
+          const oldAction = (holding.corporateActions ?? []).find((item) => item.id === currentEvent.corporateActionId);
+          if (!oldAction) return holding;
+          const reversed = reverseCorporateAction(holding, oldAction.id);
+          const corrected = applyHoldingCorporateAction(reversed, {
+            ...oldAction,
+            date: patch.date,
+            amount: Math.abs(signedAmount),
+            note: patch.note?.trim() ?? "",
+          });
+          const correctedAction = (corrected.corporateActions ?? []).find((item) => item.id === oldAction.id);
+          const rebuilt = correctedAction
+            ? buildPortfolioEventFromCorporateAction(corrected, correctedAction, currentEvent.source)
+            : null;
+          if (rebuilt) nextEvent = { ...rebuilt, id: currentEvent.id, date: patch.date, groupId: currentEvent.groupId, createdAt: currentEvent.createdAt };
+          return corrected;
+        });
+      }
+      const portfolioEvents = dedupePortfolioEvents(s.portfolioEvents.map((event) => event.id === id ? nextEvent : event));
+      return {
+        ...s,
+        holdings,
+        portfolioEvents,
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
+      };
+    });
+  }, []);
+
+  const removePortfolioEvent = useCallback((id: string) => {
+    setState((s) => {
+      const target = s.portfolioEvents.find((event) => event.id === id);
+      if (!target) return s;
+      const holdings = target.holdingId && target.corporateActionId
+        ? s.holdings.map((holding) => holding.id === target.holdingId
+          ? reverseCorporateAction(holding, target.corporateActionId!)
+          : holding)
+        : s.holdings;
+      const portfolioEvents = dedupePortfolioEvents(s.portfolioEvents.filter((event) => event.id !== id));
+      return {
+        ...s,
+        holdings,
+        portfolioEvents,
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
       };
     });
   }, []);
@@ -1935,12 +2058,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     plan.nextExecDate = computeNextExec(plan);
 	    setState((s) => {
 	      const dcaState = applyDCAState(s.holdings, [...s.dcaPlans, plan], s.dcaExecutions);
-	      const portfolioEvents = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
+	      const dcaLedger = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
+	      const portfolioEvents = dcaLedger.portfolioEvents;
 	      return {
 	        ...s,
 	        dcaPlans: dcaState.dcaPlans,
 	        dcaExecutions: dcaState.dcaExecutions,
-	        holdings: dcaState.holdings,
+	        holdings: dcaLedger.holdings,
 	        portfolioEvents,
 	        dcaPanelHoldingId: null,
 	      };
@@ -1968,9 +2092,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           return updated;
         });
 	        const dcaState = applyDCAState(s.holdings, nextPlans, s.dcaExecutions);
-	        const portfolioEvents = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
+	        const dcaLedger = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
+	        const portfolioEvents = dcaLedger.portfolioEvents;
 	        return {
-	          holdings: dcaState.holdings,
+	          holdings: dcaLedger.holdings,
 	          dcaPlans: dcaState.dcaPlans,
 	          dcaExecutions: dcaState.dcaExecutions,
 	          portfolioEvents,
@@ -1993,14 +2118,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         p.id === id ? { ...p, enabled: !p.enabled } : p
 	      );
 	      const dcaState = applyDCAState(s.holdings, nextPlans, s.dcaExecutions, true);
-	      const portfolioEvents = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
+	      const dcaLedger = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
+	      const portfolioEvents = dcaLedger.portfolioEvents;
 	      return {
 	        ...s,
-	        holdings: dcaState.holdings,
+	        holdings: dcaLedger.holdings,
 	        dcaPlans: dcaState.dcaPlans,
 	        dcaExecutions: dcaState.dcaExecutions,
 	        portfolioEvents,
-        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaState.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
+        assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaLedger.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
 	      };
 	    });
   }, [applyDCAState]);
@@ -2019,19 +2145,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return v > 0 ? "#31D08B" : "#F24E4E";
   }, [state.colorScheme]);
 
+  const value = useMemo<AppContextType>(() => ({
+    ...state, stats, tc,
+    togglePrivacy, setDefaultPrivacyMode, setColorScheme, setTheme, setCurrency, setLanguage, setRefreshInterval,
+    setTradeTimeOnly, setDividendReinvest, setDefaultOpenMode, refresh,
+    exportPortfolio, importPortfolio, clearLocalData,
+    addGroup, updateGroup, removeGroup,
+    addHolding, updateHolding, adjustHolding, removeHolding, removeClosedHolding, updatePortfolioEvent, removePortfolioEvent,
+    openDetail, closeDetail,
+    profitColor,
+    addDCAPlan, updateDCAPlan, removeDCAPlan, toggleDCAPlan,
+    openDCAPanel, closeDCAPanel,
+  }), [
+    state, stats, tc, profitColor, refresh, exportPortfolio, importPortfolio, clearLocalData,
+    addGroup, updateGroup, removeGroup, addHolding, updateHolding, adjustHolding, removeHolding,
+    removeClosedHolding, updatePortfolioEvent, removePortfolioEvent, openDetail, closeDetail,
+    addDCAPlan, updateDCAPlan, removeDCAPlan, toggleDCAPlan, openDCAPanel, closeDCAPanel,
+    togglePrivacy, setDefaultPrivacyMode, setColorScheme, setTheme, setCurrency, setLanguage,
+    setRefreshInterval, setTradeTimeOnly, setDividendReinvest, setDefaultOpenMode,
+  ]);
+
   return (
-    <AppContext.Provider value={{
-      ...state, stats, tc,
-      togglePrivacy, setDefaultPrivacyMode, setColorScheme, setTheme, setCurrency, setLanguage, setRefreshInterval,
-      setTradeTimeOnly, setDividendReinvest, setDefaultOpenMode, refresh,
-      exportPortfolio, importPortfolio, clearLocalData,
-      addGroup, updateGroup, removeGroup,
-      addHolding, updateHolding, adjustHolding, removeHolding, removeClosedHolding,
-      openDetail, closeDetail,
-      profitColor,
-      addDCAPlan, updateDCAPlan, removeDCAPlan, toggleDCAPlan,
-      openDCAPanel, closeDCAPanel,
-    }}>
+    <AppContext.Provider value={value}>
       {children}
     </AppContext.Provider>
   );

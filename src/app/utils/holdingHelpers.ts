@@ -171,10 +171,12 @@ export function buildHolding(input: HoldingInput, id: string): Holding {
 
 export function applyCorporateAction(current: Holding, input: HoldingCorporateActionInput): Holding {
   const currentCostBasis = current.quantity * current.costPrice;
+  const now = new Date();
+  const localDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   const baseAction = {
     id: input.id || `corp_${safeUUID()}`,
     type: input.type,
-    date: input.date || new Date().toISOString().slice(0, 10),
+    date: input.date || localDate,
     recordDate: input.recordDate,
     exDate: input.exDate,
     payDate: input.payDate,
@@ -277,6 +279,41 @@ export function applyCorporateAction(current: Holding, input: HoldingCorporateAc
       ...(current.corporateActions ?? []),
       { ...baseAction, ratio },
     ].slice(-60),
+  });
+}
+
+/**
+ * Reverse one posted holding action before it is corrected or removed.
+ * Average-cost updates are additive, so removing the action's shares/cost
+ * remains valid even when later buys were posted after it.
+ */
+export function reverseCorporateAction(current: Holding, actionId: string): Holding {
+  const action = (current.corporateActions ?? []).find((item) => item.id === actionId);
+  if (!action) return current;
+  const remaining = (current.corporateActions ?? []).filter((item) => item.id !== actionId);
+  const currentCostBasis = current.quantity * current.costPrice;
+  let quantity = current.quantity;
+  let costBasis = currentCostBasis;
+  let cashDividendTotal = current.cashDividendTotal ?? 0;
+
+  if (action.type === "cash_dividend" || action.type === "interest" || action.type === "bond_coupon") {
+    cashDividendTotal = Math.max(0, cashDividendTotal - Math.max(0, action.amount ?? 0));
+  } else if (action.type === "dividend_reinvest") {
+    const shares = Math.max(0, action.shares ?? 0);
+    quantity = Math.max(0, quantity - shares);
+    costBasis = Math.max(0, costBasis - Math.max(0, action.amount ?? 0));
+    cashDividendTotal = Math.max(0, cashDividendTotal - Math.max(0, action.amount ?? 0));
+  } else if (action.type === "share_dividend") {
+    quantity = Math.max(0, quantity - Math.max(0, action.shares ?? 0));
+  } else if (action.type === "split" && Number(action.ratio) > 0) {
+    quantity = Math.max(0, quantity / Number(action.ratio));
+  }
+
+  return recomputeHoldingMetrics(current, {
+    quantity,
+    costPrice: quantity > 0 ? costBasis / quantity : current.costPrice,
+    cashDividendTotal,
+    corporateActions: remaining,
   });
 }
 

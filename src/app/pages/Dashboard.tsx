@@ -1,22 +1,25 @@
 import { useEffect, useMemo, useId, useState, useCallback, useRef } from "react";
-import { Bell, ChevronDown, ChevronUp, Eye, EyeOff, PanelRightClose, PanelRightOpen, RefreshCw, X } from "lucide-react";
+import { AlertTriangle, Bell, ChevronDown, ChevronUp, Eye, EyeOff, PanelRightClose, PanelRightOpen, RefreshCw, X } from "lucide-react";
 import { useApp } from "../context/AppContext";
 import { motion } from "motion/react";
 import { AreaChart, Area, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { useNavigate } from "react-router";
 import { fetchRecentDailyChart, toYahooSymbol } from "../services/quoteApi";
-import { mapWithConcurrency, toCNY } from "../services/priceRefresher";
+import { convertCurrency, mapWithConcurrency, toCNY } from "../services/priceRefresher";
 import { BrandMark } from "../components/BrandMark";
 import { formatExactMoney, formatPercent } from "../utils/numberFormat";
 import { useViewSwitcher } from "../utils/useViewSwitcher";
 import { getMarketBadge } from "../utils/marketBadge";
 import {
+  CORPORATE_ACTION_NOTICE_RETENTION_DAYS,
   getRecentCorporateActionNotices,
   mergeDismissedCorporateActionNoticeKeys,
   readDismissedCorporateActionNoticeKeys,
+  subscribeDismissedCorporateActionNotices,
   writeDismissedCorporateActionNoticeKeys,
 } from "../utils/corporateActionNotices";
 import { groupName, t } from "../i18n";
+import type { PortfolioEvent } from "../services/portfolioEvents";
 
 const UNGROUPED = { id: "", name: "未分组", color: "var(--text-micro)" };
 const SERIES_DISPLAY_POINTS = 30;
@@ -54,14 +57,72 @@ type EstimatedAssetSeries = {
   points: AssetSeriesPoint[];
 };
 
-function fmtPnl(v: number, priv: boolean, c: string) {
+function fmtPnl(v: number, priv: boolean, c: string, currency: string) {
   const sign = v > 0 ? "+" : v < 0 ? "-" : "";
-  return <span style={{ color: c, whiteSpace: "nowrap" }}>{priv ? `${sign}--` : `${sign}${formatExactMoney(Math.abs(v), "CNY", 2)}`}</span>;
+  const displayValue = convertCurrency(Math.abs(v), "CNY", currency);
+  return <span style={{ color: c, whiteSpace: "nowrap" }}>{priv ? `${sign}--` : `${sign}${formatExactMoney(displayValue, currency, 2)}`}</span>;
 }
 
 function fmtRate(v: number, c: string) {
   const formatted = formatPercent(v, 2);
   return <span style={{ color: c, fontSize: 12 }}>{formatted}</span>;
+}
+
+function formatNoticeMoney(value: number, currency: string, privacyMode: boolean) {
+  const prefix = value < 0 ? "-" : "";
+  return privacyMode ? `${prefix}${currency} --` : `${prefix}${formatExactMoney(Math.abs(value), currency, 2)}`;
+}
+
+function formatNoticeQuantity(value: number) {
+  return value.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 4 });
+}
+
+function formatSplitNotice(ratio: number, language: string) {
+  const isEn = language === "en";
+  if (!(ratio > 0)) return "";
+  if (ratio > 1) {
+    return isEn
+      ? `1 share becomes ${formatNoticeQuantity(ratio)}`
+      : `每 1 股变为 ${formatNoticeQuantity(ratio)} 股`;
+  }
+  if (ratio < 1) {
+    const originalShares = 1 / ratio;
+    return isEn
+      ? `${formatNoticeQuantity(originalShares)} shares become 1`
+      : `每 ${formatNoticeQuantity(originalShares)} 股合为 1 股`;
+  }
+  return isEn ? "1:1 (no quantity change)" : "1:1（数量不变）";
+}
+
+function corporateActionNoticeMeta(event: PortfolioEvent, privacyMode: boolean, language: string) {
+  const isEn = language === "en";
+  const parts: string[] = [];
+  const amount = Number.isFinite(event.amount) ? event.amount : 0;
+  const quantity = Number.isFinite(event.quantity) ? event.quantity ?? 0 : 0;
+  const price = Number.isFinite(event.price) ? event.price ?? 0 : 0;
+
+  if (event.type === "dividend_reinvest") {
+    if (amount > 0) parts.push(`${isEn ? "Net" : "净额"} ${formatNoticeMoney(amount, event.currency, privacyMode)}`);
+    if (quantity > 0) parts.push(`${isEn ? "Shares" : "份额"} ${formatNoticeQuantity(quantity)}`);
+    if (event.estimatedAmount != null && event.estimatedAmount > amount) {
+      parts.push(`${isEn ? "Gross" : "税前"} ${formatNoticeMoney(event.estimatedAmount, event.currency, privacyMode)}`);
+    }
+  } else if (event.type === "cash_dividend" || event.type === "interest" || event.type === "bond_coupon") {
+    if (amount !== 0) parts.push(formatNoticeMoney(amount, event.currency, privacyMode));
+  } else if (event.type === "share_dividend") {
+    if (quantity > 0) parts.push(`${isEn ? "Added" : "新增"} ${formatNoticeQuantity(quantity)} ${isEn ? "shares" : "股"}`);
+  } else if (event.type === "split") {
+    const ratio = quantity > 0 ? quantity : price;
+    if (ratio > 0) {
+      parts.push(event.corporateActionKind === "share_bonus_transfer" && ratio > 1
+        ? (isEn
+            ? `+${formatNoticeQuantity((ratio - 1) * 100)} shares per 100`
+            : `每 10 股送转 ${formatNoticeQuantity((ratio - 1) * 10)} 股`)
+        : formatSplitNotice(ratio, language));
+    }
+  }
+
+  return parts.slice(0, 2).join(" · ");
 }
 
 
@@ -116,7 +177,6 @@ function makeSeriesCacheKey(holdings: ReturnType<typeof useApp>["holdings"]) {
       h.market,
       h.currency,
       h.quantity,
-      h.currentPrice,
     ].join(":"))
     .sort()
     .join("|");
@@ -153,7 +213,7 @@ function writeCachedAssetSeries(cacheKey: string, points: AssetSeriesPoint[]) {
 }
 
 export function Dashboard() {
-  const { stats, holdings, groups, privacyMode, togglePrivacy, refresh, isRefreshing, lastRefreshed, lastRefreshError, profitColor, openDetail, tc, assetSnapshots, portfolioEvents, language } = useApp();
+  const { stats, holdings, groups, privacyMode, togglePrivacy, refresh, isRefreshing, lastRefreshed, lastRefreshError, profitColor, openDetail, tc, assetSnapshots, portfolioEvents, language, currency } = useApp();
   const text = t(language);
   const navigate = useNavigate();
   const heroGradId = useId().replace(/:/g, "");
@@ -163,7 +223,10 @@ export function Dashboard() {
   const [estimatedAssetSeries, setEstimatedAssetSeries] = useState<EstimatedAssetSeries | null>(null);
   const [loadingEstimated, setLoadingEstimated] = useState(false);
   const [noticesExpanded, setNoticesExpanded] = useState(false);
+  const [noticeToday, setNoticeToday] = useState(() => new Date());
   const [dismissedNoticeKeys, setDismissedNoticeKeys] = useState(readDismissedCorporateActionNoticeKeys);
+
+  useEffect(() => subscribeDismissedCorporateActionNotices(setDismissedNoticeKeys), []);
 
   const rankBadgeStyle = (index: number) => {
     if (index === 0) {
@@ -208,8 +271,8 @@ export function Dashboard() {
 
   const seriesCacheKey = useMemo(() => makeSeriesCacheKey(holdings), [holdings]);
   const seriesHoldingsRef = useRef<{ key: string; holdings: typeof holdings }>({ key: "", holdings: [] });
-  // The trend cache key intentionally tracks valuation inputs only. Display-only
-  // changes such as holding names should not trigger a historical series reload.
+  // The trend cache key tracks structural position inputs. Live price ticks should
+  // not invalidate the historical-series cache on every quote refresh.
   if (seriesHoldingsRef.current.key !== seriesCacheKey) {
     seriesHoldingsRef.current = { key: seriesCacheKey, holdings };
   }
@@ -429,23 +492,52 @@ export function Dashboard() {
   const dashboardRefreshing = isRefreshing || manualRefreshing;
   const dismissedNoticeKeySet = useMemo(() => new Set(dismissedNoticeKeys), [dismissedNoticeKeys]);
   const corporateActionNotices = useMemo(
-    () => getRecentCorporateActionNotices(portfolioEvents, new Date(), 30, dismissedNoticeKeySet),
-    [dismissedNoticeKeySet, portfolioEvents],
+    () => getRecentCorporateActionNotices(
+      portfolioEvents,
+      noticeToday,
+      CORPORATE_ACTION_NOTICE_RETENTION_DAYS,
+      dismissedNoticeKeySet,
+    ),
+    [dismissedNoticeKeySet, noticeToday, portfolioEvents],
   );
 
-  const corporateActionLabel = useCallback((type: (typeof corporateActionNotices)[number]["type"]) => {
+  const corporateActionLabel = useCallback((event: (typeof corporateActionNotices)[number]) => {
+    const type = event.type;
     if (type === "cash_dividend") return text.dashboard.actionCashDividend;
     if (type === "dividend_reinvest") return text.dashboard.actionDividendReinvest;
     if (type === "share_dividend") return text.dashboard.actionShareDividend;
-    if (type === "split") return text.dashboard.actionSplit;
+    if (type === "split") return event.corporateActionKind === "share_bonus_transfer"
+      ? text.dashboard.actionShareBonusTransfer
+      : text.dashboard.actionSplit;
     if (type === "interest") return text.dashboard.actionInterest;
     if (type === "bond_coupon") return text.dashboard.actionBondCoupon;
     return type;
   }, [text.dashboard]);
+  const latestCorporateActionNotice = corporateActionNotices[0];
+  const hasActionRequiredNotice = corporateActionNotices.some(
+    (event) => event.type === "split" || event.type === "share_dividend",
+  );
+  const noticeAccent = hasActionRequiredNotice ? "#D97706" : "#4F9CF9";
 
   useEffect(() => {
     if (!isRefreshing) setManualRefreshing(false);
   }, [isRefreshing]);
+
+  useEffect(() => {
+    let midnightTimer: ReturnType<typeof setTimeout> | undefined;
+    const scheduleNextDay = () => {
+      const now = new Date();
+      const nextDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 1);
+      midnightTimer = setTimeout(() => {
+        setNoticeToday(new Date());
+        scheduleNextDay();
+      }, Math.max(1_000, nextDay.getTime() - now.getTime()));
+    };
+    scheduleNextDay();
+    return () => {
+      if (midnightTimer) clearTimeout(midnightTimer);
+    };
+  }, []);
 
   const handleRefresh = useCallback(() => {
     if (dashboardRefreshing) return;
@@ -460,6 +552,12 @@ export function Dashboard() {
     setNoticesExpanded(false);
   }, [corporateActionNotices, dismissedNoticeKeys]);
 
+  const dismissCorporateActionNotice = useCallback((event: PortfolioEvent) => {
+    const nextKeys = mergeDismissedCorporateActionNoticeKeys(dismissedNoticeKeys, [event]);
+    writeDismissedCorporateActionNoticeKeys(nextKeys);
+    setDismissedNoticeKeys(nextKeys);
+  }, [dismissedNoticeKeys]);
+
   const { isSidePanel, switchTitle, toggleView: handleSwitchView } = useViewSwitcher();
 
   return (
@@ -469,13 +567,24 @@ export function Dashboard() {
         className="shrink-0 flex items-center justify-between px-4 h-[50px] border-b border-app-border backdrop-blur-sm"
         style={{ background: "color-mix(in srgb, var(--bg) 92%, transparent)" }}
       >
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           <BrandMark size={28} />
           <span className="text-tp text-sm font-semibold tracking-tight">{text.appName}</span>
         </div>
-        <div className="flex items-center gap-2">
-          <span className="text-tm text-[11px]">{lastRefreshError || lastRefreshed}</span>
-          <button onClick={togglePrivacy} className="flex items-center justify-center rounded-lg size-[30px] bg-app-card">
+        <div className="ml-2 flex min-w-0 items-center gap-2">
+          <span
+            className={`max-w-[82px] truncate text-[11px] ${lastRefreshError ? "font-semibold text-[#D97706]" : "text-tm"}`}
+            title={lastRefreshError || lastRefreshed}
+            aria-label={lastRefreshError || lastRefreshed}
+          >
+            {lastRefreshError ? (language === "en" ? "Sync issue" : "同步异常") : lastRefreshed}
+          </span>
+          <button
+            onClick={togglePrivacy}
+            className="flex items-center justify-center rounded-lg size-[30px] bg-app-card"
+            aria-label={privacyMode ? (language === "en" ? "Show asset amounts" : "显示资产金额") : (language === "en" ? "Hide asset amounts" : "隐藏资产金额")}
+            title={privacyMode ? (language === "en" ? "Show asset amounts" : "显示资产金额") : (language === "en" ? "Hide asset amounts" : "隐藏资产金额")}
+          >
             {privacyMode ? <EyeOff size={14} color="var(--text-secondary)" /> : <Eye size={14} color="var(--text-secondary)" />}
           </button>
           <button onClick={handleSwitchView}
@@ -505,54 +614,100 @@ export function Dashboard() {
         style={{ scrollbarWidth: "none", overscrollBehaviorY: "contain", WebkitOverflowScrolling: "touch", paddingBottom: 16 }}
       >
       {corporateActionNotices.length > 0 && (
-        <div className="mx-3 mt-3 rounded-xl border border-app-accent/20 bg-app-card overflow-hidden">
+        <motion.div
+          initial={{ opacity: 0, y: -5 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.22 }}
+          className="relative mx-3 mt-3 overflow-hidden rounded-xl border"
+          style={{
+            borderColor: `${noticeAccent}40`,
+            borderLeftWidth: 3,
+            background: `${noticeAccent}10`,
+          }}
+        >
           <div className="flex items-center">
             <button
               type="button"
-              className="min-w-0 flex-1 flex items-center gap-2.5 pl-3 pr-2 py-2.5 text-left"
+              className="min-w-0 flex-1 flex items-center gap-2.5 pl-2.5 pr-2 py-3 text-left"
               onClick={() => setNoticesExpanded((current) => !current)}
               aria-expanded={noticesExpanded}
             >
-              <span className="size-8 shrink-0 rounded-lg bg-app-accent/10 flex items-center justify-center">
-                <Bell size={15} color="#4F9CF9" />
+              <span
+                className="relative flex size-9 shrink-0 items-center justify-center rounded-[10px]"
+                style={{ background: `${noticeAccent}1F`, color: noticeAccent }}
+              >
+                {hasActionRequiredNotice ? <AlertTriangle size={17} /> : <Bell size={17} />}
+                <span className="absolute -right-0.5 -top-0.5 size-2.5 rounded-full border-2 border-app-card bg-[#F24E4E]" />
               </span>
               <span className="min-w-0 flex-1">
                 <span className="flex items-center gap-1.5">
-                  <span className="text-tp text-xs font-semibold">{text.dashboard.actionNoticeTitle}</span>
-                  <span className="rounded-full bg-app-accent/10 text-app-accent text-[9px] font-semibold px-1.5 py-0.5">
+                  <span className="text-tp text-[13px] font-bold">{text.dashboard.actionNoticeTitle}</span>
+                  <span
+                    className="rounded-full px-1.5 py-0.5 text-[9px] font-bold"
+                    style={{ background: `${noticeAccent}1F`, color: noticeAccent }}
+                  >
                     {text.dashboard.actionNoticeCount(corporateActionNotices.length)}
                   </span>
                 </span>
-                <span className="block truncate text-tm text-[10px] mt-0.5">
-                  {text.dashboard.actionNoticeSummary(
-                    corporateActionNotices[0]?.name || corporateActionNotices[0]?.symbol || text.dashboard.unknownHolding,
-                    corporateActionLabel(corporateActionNotices[0]!.type),
-                  )}
+                <span className="mt-0.5 block truncate text-[11px] font-medium text-ts">
+                  {latestCorporateActionNotice && [
+                    text.dashboard.actionNoticeSummary(
+                      latestCorporateActionNotice.name || latestCorporateActionNotice.symbol || text.dashboard.unknownHolding,
+                      corporateActionLabel(latestCorporateActionNotice),
+                    ),
+                    corporateActionNoticeMeta(latestCorporateActionNotice, privacyMode, language),
+                    latestCorporateActionNotice.date.slice(5),
+                  ].filter(Boolean).join(" · ")}
                 </span>
               </span>
               {noticesExpanded
-                ? <ChevronUp size={15} color="var(--text-muted)" />
-                : <ChevronDown size={15} color="var(--text-muted)" />}
+                ? <ChevronUp size={16} color={noticeAccent} />
+                : <ChevronDown size={16} color={noticeAccent} />}
             </button>
             <button
               type="button"
-              className="size-8 mr-1 shrink-0 rounded-lg flex items-center justify-center hover:bg-app-control"
+              className="mr-1.5 flex size-8 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-app-control"
               onClick={dismissCorporateActionNotices}
               title={text.dashboard.actionNoticeDismiss}
               aria-label={text.dashboard.actionNoticeDismiss}
             >
-              <X size={14} color="var(--text-muted)" />
+              <X size={14} color={noticeAccent} />
             </button>
           </div>
           {noticesExpanded && (
-            <div className="border-t border-app-border px-3">
+            <div
+              className="border-t px-3"
+              style={{ borderColor: `${noticeAccent}24` }}
+            >
               {corporateActionNotices.slice(0, 5).map((event) => (
-                <div key={event.id} className="flex items-center justify-between gap-3 py-2 border-b border-app-border last:border-b-0">
+                <div key={event.id} className="flex items-center gap-2 border-b border-app-border py-2.5 last:border-b-0">
+                  <span
+                    className="size-2 shrink-0 rounded-full"
+                    style={{ background: (event.type === "split" || event.type === "share_dividend") ? "#D97706" : "#4F9CF9" }}
+                  />
                   <div className="min-w-0">
-                    <p className="text-ts text-[11px] font-medium truncate">{event.name || event.symbol || text.dashboard.unknownHolding}</p>
-                    <p className="text-tm text-[10px] mt-0.5">{corporateActionLabel(event.type)}</p>
+                    <p className="flex items-center gap-1.5 truncate text-[11px] font-semibold text-tp">
+                      <span className="truncate">{event.name || event.symbol || text.dashboard.unknownHolding}</span>
+                      {(event.type === "split" || event.type === "share_dividend") && (
+                        <span className="shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-semibold" style={{ background: "rgba(217,119,6,0.14)", color: "#D97706" }}>
+                          {language === "en" ? "Check shares" : "需核对份额"}
+                        </span>
+                      )}
+                    </p>
+                    <p className="text-tm text-[10px] mt-0.5 truncate">
+                      {[corporateActionLabel(event), corporateActionNoticeMeta(event, privacyMode, language)].filter(Boolean).join(" · ")}
+                    </p>
                   </div>
-                  <span className="text-tmi text-[10px] shrink-0">{event.date}</span>
+                  <span className="ml-auto text-tmi text-[10px] shrink-0">{event.date}</span>
+                  <button
+                    type="button"
+                    className="flex size-7 shrink-0 items-center justify-center rounded-lg hover:bg-app-control"
+                    onClick={() => dismissCorporateActionNotice(event)}
+                    title={text.dashboard.actionNoticeDismissOne}
+                    aria-label={text.dashboard.actionNoticeDismissOne}
+                  >
+                    <X size={12} color="var(--text-muted)" />
+                  </button>
                 </div>
               ))}
               {corporateActionNotices.length > 5 && (
@@ -562,7 +717,7 @@ export function Dashboard() {
               )}
             </div>
           )}
-        </div>
+        </motion.div>
       )}
       {/* Hero Card */}
       <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}
@@ -572,7 +727,7 @@ export function Dashboard() {
           <div className="min-w-0">
             <p className="text-tm text-[11px] mb-0.5">{text.dashboard.totalAsset}</p>
             <p className="text-tp text-[26px] font-bold tracking-tighter leading-tight">
-              {privacyMode ? "¥ ******" : formatExactMoney(stats.totalAsset, "CNY", 2)}
+              {privacyMode ? `${currency} ******` : formatExactMoney(convertCurrency(stats.totalAsset, "CNY", currency), currency, 2)}
             </p>
             <p className="text-tm text-[10px] mt-0.5">
               ≈ {privacyMode ? "***" : formatExactMoney(stats.usdEquiv, "USD", 2)} USD
@@ -581,7 +736,7 @@ export function Dashboard() {
           <div className="shrink-0 text-right">
             <p className="text-tm text-[10px]">{text.dashboard.todayPnl}</p>
             <p className="truncate text-base font-bold tracking-tight" style={{ color: todayColor }}>
-              {fmtPnl(stats.todayPnl, privacyMode, todayColor)}
+              {fmtPnl(stats.todayPnl, privacyMode, todayColor, currency)}
             </p>
             <div className="mt-0.5">{fmtRate(stats.todayPnlRate, todayColor)}</div>
           </div>
@@ -590,7 +745,7 @@ export function Dashboard() {
         {/* ── Row 2: cost basis + position count (auxiliary, small) ── */}
         <div className="flex items-center justify-between gap-3 mt-2">
           <p className="text-tm text-[10px]">
-            {text.dashboard.costBasis} {privacyMode ? "¥***" : formatExactMoney(costBasis, "CNY", 2)}
+            {text.dashboard.costBasis} {privacyMode ? `${currency} ***` : formatExactMoney(convertCurrency(costBasis, "CNY", currency), currency, 2)}
           </p>
           <p className="text-tmi text-[10px]">{text.dashboard.positionsGroups(holdings.length, groups.length)}</p>
         </div>
@@ -599,17 +754,17 @@ export function Dashboard() {
         <div className="grid grid-cols-3 gap-x-3 gap-y-2 mt-3 pt-3 border-t border-app-border">
           <div className="min-w-0">
             <p className="text-tm text-[10px]">{text.dashboard.totalInvestmentPnl}</p>
-            <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.totalInvestmentPnl, privacyMode, totalColor)}</p>
+            <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.totalInvestmentPnl, privacyMode, totalColor, currency)}</p>
             <div>{fmtRate(stats.totalInvestmentRate, totalColor)}</div>
           </div>
           <div className="min-w-0">
             <p className="text-tm text-[10px]">{text.dashboard.totalPnl}</p>
-            <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.unrealizedPnl, privacyMode, cumulColor)}</p>
+            <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.unrealizedPnl, privacyMode, cumulColor, currency)}</p>
             <div>{fmtRate(stats.unrealizedRate, cumulColor)}</div>
           </div>
           <div className="min-w-0">
             <p className="text-tm text-[10px]">{text.dashboard.realizedPnl}</p>
-            <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.realizedPnl, privacyMode, realizedColor)}</p>
+            <p className="truncate text-sm font-semibold tracking-tight">{fmtPnl(stats.realizedPnl, privacyMode, realizedColor, currency)}</p>
             <div>{fmtRate(stats.realizedRate, realizedColor)}</div>
           </div>
         </div>
@@ -644,7 +799,7 @@ export function Dashboard() {
 	                        borderRadius: 6, padding: "4px 8px", fontSize: 11, color: "var(--text-primary)" }}>
 	                        <div>{payload[0]?.payload?.date}</div>
 	                        <div style={{ color: "#4F9CF9" }}>
-		                          {privacyMode ? "¥***" : formatExactMoney(Number(payload[0]?.value), "CNY", 2)}
+		                          {privacyMode ? `${currency} ***` : formatExactMoney(convertCurrency(Number(payload[0]?.value), "CNY", currency), currency, 2)}
 	                        </div>
 	                      </div>
                     ) : null}
@@ -684,7 +839,7 @@ export function Dashboard() {
                   <div className="rounded-full size-1.5" style={{ background: color }} />
                   <span className="text-tm text-[10px]">{name}</span>
                   <span className="text-ts text-[10px] font-medium">
-                    {privacyMode ? "**" : formatExactMoney(value, "CNY", 2)}
+                    {privacyMode ? "**" : formatExactMoney(convertCurrency(value, "CNY", currency), currency, 2)}
                   </span>
                   <span className="text-tmi text-[10px]">{formatPercent(pct / 100)}</span>
                 </div>
@@ -794,7 +949,7 @@ export function Dashboard() {
                       <div className="text-right">
                         <span style={{ color: c, fontSize: 12, fontWeight: 600, whiteSpace: "nowrap" }}>
                           {item.todayPnl > 0 ? "+" : item.todayPnl < 0 ? "-" : ""}
-                          {privacyMode ? "--" : formatExactMoney(Math.abs(todayPnlCny), "CNY", 2)}
+                          {privacyMode ? "--" : formatExactMoney(convertCurrency(Math.abs(todayPnlCny), "CNY", currency), currency, 2)}
                         </span>
                         <span style={{ color: c, fontSize: 10, marginLeft: 4, whiteSpace: "nowrap" }}>
                           ({formatPercent(item.todayPnlRate, 2)})

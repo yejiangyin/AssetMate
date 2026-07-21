@@ -272,6 +272,11 @@ export function hydratePlans(plans: DCAPlan[], executions: DCAExecution[] = []):
   const today = todayYMD();
   const executedPlanIds = new Set(executions.filter((item) => item.status === "executed").map((item) => item.planId));
   return plans.map((p) => {
+    // Disabled plans keep their existing nextExecDate so enabling later doesn't
+    // trigger a backfill of all missed executions since the original startDate.
+    if (!p.enabled) {
+      return { ...p, totalInvested: p.totalInvested ?? 0, execCount: p.execCount ?? 0 };
+    }
     const hasSettled = executedPlanIds.has(p.id) || (p.execCount ?? 0) > 0 || (p.totalInvested ?? 0) > 0;
     const shouldRecoverFirstDueDate = !hasSettled && Boolean(p.startDate) && p.startDate <= today;
     return {
@@ -832,7 +837,8 @@ export function settleDueDCAPlans(
 
     const executionPrice = holding.currentPrice;
     const confirmedDate = undefined;
-    const quantity = plan.amount / executionPrice;
+    const purchaseAmount = affordableBuyAmount(holding.transactionCostProfile, plan.amount);
+    const quantity = purchaseAmount / executionPrice;
     if (!(quantity > 0)) {
       nextExecutions.unshift({
         id: `dca_exec_${safeUUID()}`,

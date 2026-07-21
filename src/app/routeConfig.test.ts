@@ -16,8 +16,11 @@ describe("appRoutes", () => {
 
     const children = root?.children ?? [];
     assert.ok(children.some((route) => route.index === true));
-    for (const path of ["holdings", "returns", "market", "backtest", "settings"]) {
+    for (const path of ["holdings", "returns", "market", "research", "backtest", "settings"]) {
       assert.ok(children.some((route) => route.path === path), `missing ${path} route`);
     }
+    assert.ok(children.some((route) => route.path === "settings/ai"), "missing AI settings route");
+    const legacyBacktest = children.find((route) => route.path === "backtest");
+    assert.ok(legacyBacktest && "element" in legacyBacktest, "legacy backtest URL must redirect into Research Center");
   });
 });

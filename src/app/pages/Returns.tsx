@@ -28,9 +28,9 @@ import {
   type PortfolioSnapshotInput,
   type YearlyReturn,
 } from "../services/portfolioEvents";
-import { toCNY } from "../services/priceRefresher";
+import { convertCurrency, toCNY } from "../services/priceRefresher";
 import { formatPercent } from "../utils/numberFormat";
-import { breakdownBarWidth, formatCalendarCny, formatCompactCny, hasMeaningfulReturnData, returnEventValue } from "../utils/returnsPresentation";
+import { breakdownBarWidth, formatCalendarMoney, formatCompactMoney, hasMeaningfulReturnData, returnEventValue } from "../utils/returnsPresentation";
 
 type ScopeMode = "week" | "month" | "year" | "all";
 type ViewLevel = "day" | "week" | "days" | "months" | "years";
@@ -184,6 +184,7 @@ export function Returns() {
     lastRefreshError,
     profitColor,
     language,
+    currency,
   } = useApp();
   const text = t(language);
   const copy = text.returns;
@@ -436,7 +437,8 @@ export function Returns() {
     return [];
   }, [dailyRows, displayRows, locale, selectedDailyRows, today, view.key, view.level]);
 
-  const signedMoney = (value: number) => formatCompactCny(value, privacyMode, locale);
+  const displayValue = useCallback((value: number) => convertCurrency(value, "CNY", currency), [currency]);
+  const signedMoney = (value: number) => formatCompactMoney(displayValue(value), privacyMode, locale, currency);
   const handleDrill = (row: ReturnRow) => {
     if (view.level === "day") return;
     setPath((current) => [...current, rowKey(row)]);
@@ -483,7 +485,12 @@ export function Returns() {
       : scope === "month"
       ? selectedMonth >= currentMonth
       : selectedYear >= currentYear;
-  const dayEvents = periodEvents.filter((event) => returnEventValue(event) !== 0);
+  const visibleEvents = useMemo(
+    () => periodEvents
+      .filter((event) => returnEventValue(event) !== 0)
+      .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
+    [periodEvents],
+  );
   const dailyRowByDate = useMemo(() => new Map(dailyRows.map((row) => [row.date, row])), [dailyRows]);
   const dayContextCells = view.level === "day"
     ? [-1, 0, 1].map((offset) => {
@@ -503,8 +510,13 @@ export function Returns() {
         <div className="flex h-[50px] items-center justify-between border-b border-app-border px-4">
           <span className="text-sm font-semibold text-tp">{copy.title}</span>
           <div className="flex items-center gap-2">
-            <span className="max-w-[94px] truncate text-[11px]" style={{ color: lastRefreshError ? "#F24E4E" : "var(--text-muted)" }}>
-              {lastRefreshError || lastRefreshed}
+            <span
+              className="max-w-[82px] truncate text-[11px]"
+              title={lastRefreshError || lastRefreshed}
+              aria-label={lastRefreshError || lastRefreshed}
+              style={{ color: lastRefreshError ? "#D97706" : "var(--text-muted)", fontWeight: lastRefreshError ? 600 : 400 }}
+            >
+              {lastRefreshError ? (language === "en" ? "Sync issue" : "同步异常") : lastRefreshed}
             </span>
             <HeaderIconButton
               label={privacyMode ? (language === "en" ? "Show sensitive data" : "显示敏感数据") : (language === "en" ? "Hide sensitive data" : "隐藏敏感数据")}
@@ -592,7 +604,7 @@ export function Returns() {
             <Link
               to="/holdings"
               className="mt-5 rounded-xl px-5 py-2.5 text-xs font-semibold text-white"
-              style={{ background: "linear-gradient(135deg, #2563EB, #7C3AED)" }}
+              style={{ background: "linear-gradient(135deg, #4F9CF9, #7C3AED)" }}
             >
               {copy.addHolding}
             </Link>
@@ -674,7 +686,7 @@ export function Returns() {
                           className={`mt-1 block font-bold leading-tight break-words ${isDays ? "text-[9px]" : "text-[12px]"}`}
                           style={{ color: rawColor || "var(--text-micro)" }}
                         >
-                          {cell.row && cell.totalPnl !== 0 ? formatCalendarCny(cell.totalPnl, privacyMode, locale) : "-"}
+                          {cell.row && cell.totalPnl !== 0 ? formatCalendarMoney(displayValue(cell.totalPnl), privacyMode, locale, currency) : "-"}
                         </span>
                         {cell.row && cell.totalPnl !== 0 && (
                           <span
@@ -756,7 +768,7 @@ export function Returns() {
                     currency: "CNY",
                   }, locale)}</span>
                   <span className="mt-1 block truncate text-[10px] font-bold" style={{ color: cell.row ? profitColor(cell.row.totalPnl) : "var(--text-micro)" }}>
-                    {cell.row && cell.row.totalPnl !== 0 ? formatCalendarCny(cell.row.totalPnl, privacyMode, locale) : "-"}
+                    {cell.row && cell.row.totalPnl !== 0 ? formatCalendarMoney(displayValue(cell.row.totalPnl), privacyMode, locale, currency) : "-"}
                   </span>
                 </button>
               ))}
@@ -764,26 +776,28 @@ export function Returns() {
           </section>
         )}
 
-        {view.level === "day" && (
-          <section className="mt-4">
-            <SectionHeader icon={<ReceiptText size={14} color="#4F9CF9" />} title={copy.eventDetail} />
-            <div className="overflow-hidden rounded-xl border border-app-border bg-app-card">
-              {dayEvents.map((event, index) => {
-                const value = returnEventValue(event);
-                return (
-                  <div key={event.id} className="flex items-center justify-between gap-3 px-3 py-2.5" style={{ borderBottom: index < dayEvents.length - 1 ? "1px solid var(--border)" : "none" }}>
-                    <div className="min-w-0">
-                      <p className="truncate text-xs font-semibold text-tp">{event.name || event.symbol || copy.eventType(event.type)}</p>
-                      <p className="mt-0.5 text-[9px] text-tmi">{copy.eventType(event.type)}{event.symbol ? ` · ${event.symbol}` : ""}</p>
-                    </div>
-                    <span className="shrink-0 text-xs font-bold" style={{ color: profitColor(value) }}>{signedMoney(value)}</span>
+        <section className="mt-4">
+          <SectionHeader
+            icon={<ReceiptText size={14} color="#4F9CF9" />}
+            title={copy.eventDetail}
+            meta={visibleEvents.length > 0 ? String(visibleEvents.length) : undefined}
+          />
+          <div className="overflow-hidden rounded-xl border border-app-border bg-app-card">
+            {visibleEvents.map((event, index) => {
+              const value = returnEventValue(event);
+              return (
+                <div key={event.id} className="flex items-center justify-between gap-3 px-3 py-2.5" style={{ borderBottom: index < visibleEvents.length - 1 ? "1px solid var(--border)" : "none" }}>
+                  <div className="min-w-0">
+                    <p className="truncate text-xs font-semibold text-tp">{event.name || event.symbol || copy.eventType(event.type)}</p>
+                    <p className="mt-0.5 text-[9px] text-tmi">{copy.eventType(event.type)}{event.symbol ? ` · ${event.symbol}` : ""}{view.level === "day" ? "" : ` · ${event.date}`}</p>
                   </div>
-                );
-              })}
-              {dayEvents.length === 0 && <EmptyState text={copy.noEvents} />}
-            </div>
-          </section>
-        )}
+                  <span className="shrink-0 text-xs font-bold" style={{ color: profitColor(value) }}>{signedMoney(value)}</span>
+                </div>
+              );
+            })}
+            {visibleEvents.length === 0 && <EmptyState text={copy.noEvents} />}
+          </div>
+        </section>
 
         <section className="mt-4">
           <SectionHeader
@@ -821,7 +835,7 @@ export function Returns() {
 
         <section className="mt-4">
           <SectionHeader icon={<Layers3 size={14} color="#4F9CF9" />} title={copy.sourceBreakdown} />
-          <BreakdownPanel rows={sourceRows} privacyMode={privacyMode} profitColor={profitColor} locale={locale} />
+          <BreakdownPanel rows={sourceRows} privacyMode={privacyMode} profitColor={profitColor} locale={locale} currency={currency} />
         </section>
           </>
         )}
@@ -880,11 +894,13 @@ function BreakdownPanel({
   privacyMode,
   profitColor,
   locale,
+  currency,
 }: {
   rows: Array<{ key: string; label: string; value: number; color: string }>;
   privacyMode: boolean;
   profitColor: (value: number) => string;
   locale: string;
+  currency: string;
 }) {
   return (
     <div className="space-y-2 rounded-xl border border-app-border bg-app-card p-3">
@@ -895,7 +911,7 @@ function BreakdownPanel({
           <div key={row.key}>
             <div className="mb-1 flex items-center justify-between gap-2 text-[10px]">
               <span className="text-tm">{row.label}</span>
-              <span className="font-bold" style={{ color: profitColor(row.value) }}>{formatCompactCny(row.value, privacyMode, locale)}</span>
+              <span className="font-bold" style={{ color: profitColor(row.value) }}>{formatCompactMoney(convertCurrency(row.value, "CNY", currency), privacyMode, locale, currency)}</span>
             </div>
             <div className="h-1.5 rounded-full bg-app-surface2">
               <div className="h-1.5 rounded-full" style={{ width: `${width}%`, background: barColor }} />

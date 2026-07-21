@@ -219,4 +219,6 @@
   bottom: auto !important;
 }
 
-::-webkit-scrollbar { display: none; }
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+::-webkit-scrollbar-track { background: transparent; }

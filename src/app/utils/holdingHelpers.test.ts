@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { Holding } from "../data/mockData";
 import type { HoldingInput } from "../context/AppContext";
-import { applyCorporateAction, applyHoldingAdjustment, buildHolding, normalizeHolding } from "./holdingHelpers";
+import { applyCorporateAction, applyHoldingAdjustment, buildHolding, normalizeHolding, reverseCorporateAction } from "./holdingHelpers";
 
 function holding(patch: Partial<Holding> = {}): Holding {
   return {
@@ -254,6 +254,33 @@ describe("applyCorporateAction", () => {
     assert.equal(adjusted.costPrice, 0.5);
     assert.equal(adjusted.quantity * adjusted.costPrice, 10);
     assert.equal(adjusted.corporateActions?.[0]?.ratio, 2);
+  });
+
+  test("reverses a posted reinvestment and its holding-level return effects", () => {
+    const original = holding({ quantity: 10, costPrice: 2, currentPrice: 3 });
+    const adjusted = applyCorporateAction(original, {
+      id: "reinvest-1",
+      type: "dividend_reinvest",
+      date: "2026-06-04",
+      amount: 6,
+      shares: 2,
+      price: 3,
+    });
+    const reversed = reverseCorporateAction(adjusted, "reinvest-1");
+
+    assert.equal(reversed.quantity, original.quantity);
+    assert.equal(reversed.costPrice, original.costPrice);
+    assert.equal(reversed.cashDividendTotal, 0);
+    assert.deepEqual(reversed.corporateActions, []);
+  });
+
+  test("reverses fees without changing the cost basis", () => {
+    const adjusted = applyCorporateAction(holding(), { id: "fee-1", type: "fee", date: "2026-06-04", amount: 2 });
+    const reversed = reverseCorporateAction(adjusted, "fee-1");
+
+    assert.equal(reversed.quantity, 10);
+    assert.equal(reversed.costPrice, 1);
+    assert.equal(reversed.totalPnl, 10);
   });
 });
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { autoBenchmark, buildBenchmarkInput } from "./Backtest";
+import { autoBenchmark, buildBenchmarkInput, normalizeBacktestSeedSymbol } from "./Backtest";
 
 describe("backtest benchmark selection", () => {
   test("maps supported markets to a representative benchmark", () => {
@@ -29,5 +29,16 @@ describe("backtest benchmark cash-flow parity", () => {
     assert.equal(input.monthlyAmount, 300);
     assert.equal(input.feeRate, 0);
     assert.equal(input.sellTaxRate, 0);
+  });
+});
+
+describe("backtest seed normalization", () => {
+  test("normalizes seeded Hong Kong symbols before matching holdings", () => {
+    assert.equal(normalizeBacktestSeedSymbol({
+      symbol: "700.HK",
+      name: "Tencent",
+      market: "HK",
+      assetType: "stock",
+    }), "00700");
   });
 });

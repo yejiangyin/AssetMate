@@ -93,6 +93,13 @@ FX.USDT = FX.USD;
 FX.USDC = FX.USD;
 FX.CNY = 1;
 
+/** Convert between supported quote/display currencies through the CNY base. */
+export function convertCurrency(value: number, fromCurrency: string, toCurrency: string) {
+  const fromRate = FX[fromCurrency.toUpperCase() as FxCode] ?? 1;
+  const toRate = FX[toCurrency.toUpperCase() as FxCode] ?? 1;
+  return value * fromRate / toRate;
+}
+
 function syncFxRatesFromStorage() {
   applyFxRates(readStoredFxRates());
 }
@@ -533,13 +540,27 @@ export async function mapWithConcurrency<T, R>(
 
 async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSignal): Promise<PriceMap> {
   if (signal.aborted) return {};
-  await refreshFxRates();
+  // Race helper: resolves/rejects with the promise, but also rejects when the
+  // abort signal fires. This lets in-flight fetches be "aborted" at the code
+  // level without modifying every underlying fetch function.
+  const raceWithSignal = <T>(promise: Promise<T>): Promise<T> => {
+    if (signal.aborted) return Promise.reject(new Error("refresh aborted"));
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => { reject(new Error("refresh aborted")); };
+      signal.addEventListener("abort", onAbort, { once: true });
+      promise.then(
+        (val) => { signal.removeEventListener("abort", onAbort); resolve(val); },
+        (err) => { signal.removeEventListener("abort", onAbort); reject(err); },
+      );
+    });
+  };
+  await raceWithSignal(refreshFxRates());
   if (signal.aborted) return {};
   const eastMoneyTargets = targets.filter((h) => h.market === "A" || h.market === "HK");
   const [eastMoneyQuotes, eastMoneyStatuses] = eastMoneyTargets.length
     ? await Promise.all([
-      fetchEastMoneyQuotesBySymbols(eastMoneyTargets.map((h) => ({ symbol: h.symbol, market: h.market }))).catch(() => []),
-      fetchEastMoneyTradeStatusesBySymbols(eastMoneyTargets.map((h) => ({ symbol: h.symbol, market: h.market }))).catch(() => []),
+      raceWithSignal(fetchEastMoneyQuotesBySymbols(eastMoneyTargets.map((h) => ({ symbol: h.symbol, market: h.market })))).catch(() => []),
+      raceWithSignal(fetchEastMoneyTradeStatusesBySymbols(eastMoneyTargets.map((h) => ({ symbol: h.symbol, market: h.market })))).catch(() => []),
     ])
     : [[], []];
   const eastMoneyMap = new Map(
@@ -558,8 +579,8 @@ async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSi
       let update: HoldingLiveUpdate = {};
       if (h.market === "A" || h.market === "HK") {
         price = eastMoneyMap.get(`${h.market}:${h.symbol}`) ?? null;
-        if (!price) price = await fetchStockLike(h.symbol, h.market);
-        const status = eastMoneyStatusMap.get(`${h.market}:${h.symbol}`) ?? await fetchTencentTradeStatus(h.symbol, h.market);
+        if (!price) price = await raceWithSignal(fetchStockLike(h.symbol, h.market));
+        const status = eastMoneyStatusMap.get(`${h.market}:${h.symbol}`) ?? await raceWithSignal(fetchTencentTradeStatus(h.symbol, h.market));
         if (status) {
           update = {
             autoTradeStatus: status.status,
@@ -570,15 +591,15 @@ async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSi
           update = normalTradeStatusFromSource(price.source);
         }
       } else if (h.market === "CRYPTO") {
-        price = await fetchCrypto(h.symbol);
+        price = await raceWithSignal(fetchCrypto(h.symbol));
         if (price) update = normalTradeStatusFromSource(price.source);
       } else if (h.market === "FUND") {
         const [fundPrice, fundStatus] = await Promise.all([
-          eastMoneyFundLive(h.symbol),
-          fetchCnFundTradeStatus(h.symbol).catch(() => null),
+          raceWithSignal(eastMoneyFundLive(h.symbol)),
+          raceWithSignal(fetchCnFundTradeStatus(h.symbol)).catch(() => null),
         ]);
         price = fundPrice;
-        if (!price) price = await fetchStockLike(h.symbol, h.market);
+        if (!price) price = await raceWithSignal(fetchStockLike(h.symbol, h.market));
         if (fundStatus) {
           update = {
             autoTradeStatus: fundStatus.status,
@@ -590,7 +611,7 @@ async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSi
           update = normalTradeStatusFromSource(price.source);
         }
       } else {
-        price = await fetchStockLike(h.symbol, h.market);
+        price = await raceWithSignal(fetchStockLike(h.symbol, h.market));
         if (price) update = normalTradeStatusFromSource(price.source);
       }
       if (signal.aborted) throw new Error("refresh aborted");
@@ -616,7 +637,12 @@ export function refreshPrices(holdings: HoldingRef[]): Promise<PriceMap> {
   refreshPricesInFlight?.controller.abort();
 
   const controller = new AbortController();
+  // Global deadline: guarantees the in-flight promise settles even if a provider
+  // hangs. Without this, isRefreshing stays true forever and the setInterval-driven
+  // auto-refresh (AppContext) silently skips every subsequent tick.
+  const timeoutId = setTimeout(() => controller.abort(), 30_000);
   const promise = refreshPricesForTargets(targets, controller.signal).finally(() => {
+    clearTimeout(timeoutId);
     if (refreshPricesInFlight?.promise === promise) refreshPricesInFlight = null;
   });
   refreshPricesInFlight = { key, promise, controller };

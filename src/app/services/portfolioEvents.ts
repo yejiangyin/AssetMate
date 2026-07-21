@@ -19,6 +19,8 @@ export interface PortfolioEvent {
   id: string;
   date: string;
   holdingId?: string;
+  /** Snapshot of the group at event time so history remains filterable after close/delete. */
+  groupId?: string;
   symbol?: string;
   name?: string;
   market?: string;
@@ -31,6 +33,7 @@ export interface PortfolioEvent {
   currency: string;
   source: PortfolioEventSource;
   corporateActionId?: string;
+  corporateActionKind?: "share_bonus_transfer";
   relatedEventId?: string;
   costBasisAtEvent?: number;
   proceeds?: number;
@@ -249,6 +252,7 @@ export function normalizePortfolioEvent(raw: Partial<PortfolioEvent> & Record<st
     id: raw.id,
     date,
     holdingId: typeof raw.holdingId === "string" ? raw.holdingId : undefined,
+    groupId: typeof raw.groupId === "string" ? raw.groupId : undefined,
     symbol: typeof raw.symbol === "string" ? raw.symbol : undefined,
     name: typeof raw.name === "string" ? raw.name : undefined,
     market: typeof raw.market === "string" ? raw.market : undefined,
@@ -263,6 +267,7 @@ export function normalizePortfolioEvent(raw: Partial<PortfolioEvent> & Record<st
       ? raw.source as PortfolioEventSource
       : "manual",
     corporateActionId: typeof raw.corporateActionId === "string" ? raw.corporateActionId : undefined,
+    corporateActionKind: raw.corporateActionKind === "share_bonus_transfer" ? "share_bonus_transfer" : undefined,
     relatedEventId: typeof raw.relatedEventId === "string" ? raw.relatedEventId : undefined,
     costBasisAtEvent: Number.isFinite(raw.costBasisAtEvent) ? Number(raw.costBasisAtEvent) : undefined,
     proceeds: Number.isFinite(raw.proceeds) ? Number(raw.proceeds) : undefined,
@@ -286,6 +291,7 @@ export function normalizePortfolioEvents(raw: unknown): PortfolioEvent[] {
 function eventIdentityForHolding(holding: Holding) {
   return {
     holdingId: holding.id,
+    groupId: holding.groupId,
     symbol: holding.symbol,
     name: holding.name,
     market: holding.market,
@@ -296,11 +302,15 @@ function eventIdentityForHolding(holding: Holding) {
 
 function eventFromCorporateAction(holding: Holding, action: CorporateActionLike, source: PortfolioEventSource): PortfolioEvent | null {
   const date = ymdFromEventValue(action.payDate || action.exDate || action.date);
+  const corporateActionKind: PortfolioEvent["corporateActionKind"] = action.type === "split" && action.source === "eastmoney-stock"
+    ? "share_bonus_transfer"
+    : undefined;
   const base = {
     ...eventIdentityForHolding(holding),
     date,
     source,
     corporateActionId: action.id,
+    corporateActionKind,
     note: action.note,
     rateUsed: action.rateUsed,
     minimumFeeUsed: action.minimumFeeUsed,
@@ -541,6 +551,7 @@ export function migratePortfolioEvents(
         id: `migration:closed:${closed.id}`,
         date,
         holdingId: closed.sourceHoldingId,
+        groupId: closed.groupId,
         symbol: closed.symbol,
         name: closed.name,
         market: closed.market,
@@ -567,6 +578,7 @@ export function migratePortfolioEvents(
         id: `migration:closed-dividend-summary:${closed.id}:${date}:${closed.cashDividendTotal ?? 0}:${missingDividend}`,
         date,
         holdingId: closed.sourceHoldingId,
+        groupId: closed.groupId,
         symbol: closed.symbol,
         name: closed.name,
         market: closed.market,
@@ -598,6 +610,7 @@ export function migratePortfolioEvents(
           id: `migration:closed-${cost.type}:${closed.id}:${date}`,
           date,
           holdingId: closed.sourceHoldingId,
+          groupId: closed.groupId,
           symbol: closed.symbol,
           name: closed.name,
           market: closed.market,
@@ -621,6 +634,7 @@ export function migratePortfolioEvents(
             id: `migration:closed-fee:${closed.id}:${date}`,
             date,
             holdingId: closed.sourceHoldingId,
+            groupId: closed.groupId,
             symbol: closed.symbol,
             name: closed.name,
             market: closed.market,
@@ -652,6 +666,7 @@ export function migratePortfolioEvents(
       id: `migration:dca:${execution.id ?? `${execution.holdingId}:${date}`}`,
       date,
       holdingId: execution.holdingId,
+      groupId: holding?.groupId,
       symbol: holding?.symbol,
       name: holding?.name,
       market: holding?.market,
@@ -831,12 +846,15 @@ export function getHoldingReturnContributions(
   const endSnapshot = endCandidate && endCandidate.date >= startDate ? endCandidate : undefined;
   const baselineSnapshot = mappedSnapshots.filter((snapshot) => snapshot.date < startDate).at(-1);
   const firstInRange = mappedSnapshots.find((snapshot) => snapshot.date >= startDate);
-  const canUseZeroBaseline = !baselineSnapshot && firstInRange?.migratedBaseline === true;
-  const fallbackBaseline = !baselineSnapshot && firstInRange && !canUseZeroBaseline ? firstInRange : undefined;
+  // A migrated snapshot is a measurement taken at migration time, not a
+  // zero-cost baseline. Treating it as zero turns lifetime unrealized P/L into
+  // a weekly/monthly contribution. Use the first measured map as an estimated
+  // baseline until a real pre-period snapshot exists.
+  const fallbackBaseline = !baselineSnapshot ? firstInRange : undefined;
   const baselineMap = baselineSnapshot?.holdingUnrealizedPnl
-    ?? (canUseZeroBaseline ? {} : fallbackBaseline?.holdingUnrealizedPnl);
+    ?? fallbackBaseline?.holdingUnrealizedPnl;
   const endMap = endSnapshot?.holdingUnrealizedPnl;
-  const incompleteBreakdown = !endMap || !baselineMap || Boolean(fallbackBaseline) || canUseZeroBaseline;
+  const incompleteBreakdown = !endMap || !baselineMap || Boolean(fallbackBaseline);
 
   const result = new Map<string, HoldingReturnContribution>();
   const ensure = (id: string) => {

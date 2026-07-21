@@ -835,7 +835,9 @@ async function fetchFundLatestQuote(
       volume: 0,
       currency: "CNY",
       exchange: "EastMoney Fund",
-      isLive: true,
+      // This is the latest confirmed official NAV, which can lag the current
+      // trading day and therefore must not be labelled as a live quote.
+      isLive: false,
     };
   } catch {
     clearTimeout(tid);
@@ -1378,7 +1380,7 @@ export async function fetchRecentDailyChart(symbol: string, market: string, days
     throw new Error(`recent daily unavailable for ${market}:${symbol}`);
   }
 }
-export async function fetchDetailChart(symbol: string, market: string, range: TimeRange, force = false): Promise<ChartData> {
+export async function fetchDetailChart(symbol: string, market: string, range: TimeRange, force = false, skipMemoryCache = false): Promise<ChartData> {
   const detailKey = `detail::${market}::${symbol}::${range}`;
   const detailChartKey = detailCacheKey(symbol, market, range);
   const persistedDetail = readPersistentEntry<ChartData>(PERSISTENT_CHART_STORAGE_KEY, detailChartKey);
@@ -1389,13 +1391,17 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     return data;
   };
   if (!force) {
-    const hit = getCached(detailChartKey);
-    // Detail charts should not be blocked by a stale quote-only cache entry.
-    if (hit && hasRealChartPoints(hit.points)) return hit;
-    const persisted = getPersistentChart(detailChartKey);
-    if (persisted) {
-      setCached(detailChartKey, persisted);
-      return persisted;
+    // Manual refresh (skipMemoryCache=true) bypasses both in-memory and persistent caches
+    // to fetch fresh data, but still honors in-flight dedup so rapid double-clicks don't spam.
+    if (!skipMemoryCache) {
+      const hit = getCached(detailChartKey);
+      // Detail charts should not be blocked by a stale quote-only cache entry.
+      if (hit && hasRealChartPoints(hit.points)) return hit;
+      const persisted = getPersistentChart(detailChartKey);
+      if (persisted) {
+        setCached(detailChartKey, persisted);
+        return persisted;
+      }
     }
     return reuseInflight(inflightDetailRequests, detailKey, async () => fetchDetailChart(symbol, market, range, true));
   }
@@ -1847,4 +1853,331 @@ export function fmtLarge(n: number | undefined, language: "zh" | "en" = "zh"): s
 export function fmtPrice(n: number | undefined | null, currency = "USD"): string {
   if (n == null || n === 0) return "—";
   return formatExactMoney(n, currency);
+}
+
+// ─── Yahoo quoteSummary for AI research ───────────────────────────────────────
+
+export interface YahooQuoteSummary {
+  companyProfile?: {
+    sector?: string;
+    industry?: string;
+    description?: string;
+    website?: string;
+    employees?: number;
+    country?: string;
+  };
+  keyStats?: {
+    enterpriseValue?: number;
+    evToRevenue?: number;
+    evToEbitda?: number;
+    pegRatio?: number;
+    beta?: number;
+    priceToBook?: number;
+    bookValue?: number;
+    profitMargins?: number;
+    grossMargins?: number;
+    operatingMargins?: number;
+    ebitdaMargins?: number;
+    returnOnEquity?: number;
+    returnOnAssets?: number;
+    debtToEquity?: number;
+    currentRatio?: number;
+    quickRatio?: number;
+    totalCash?: number;
+    totalDebt?: number;
+    revenuePerShare?: number;
+    revenueGrowth?: number;
+    earningsGrowth?: number;
+  };
+  analystData?: {
+    targetHigh?: number;
+    targetLow?: number;
+    targetMean?: number;
+    strongBuy?: number;
+    buy?: number;
+    hold?: number;
+    sell?: number;
+    strongSell?: number;
+  };
+  financialStatements?: {
+    income?: Array<{
+      year?: string;
+      totalRevenue?: number;
+      grossProfit?: number;
+      operatingIncome?: number;
+      netIncome?: number;
+      ebitda?: number;
+      researchAndDevelopment?: number;
+    }>;
+    balanceSheet?: Array<{
+      year?: string;
+      totalAssets?: number;
+      totalLiabilities?: number;
+      stockholdersEquity?: number;
+      totalCash?: number;
+      totalDebt?: number;
+    }>;
+    cashFlow?: Array<{
+      year?: string;
+      operatingCashFlow?: number;
+      capitalExpenditures?: number;
+      freeCashFlow?: number;
+    }>;
+  };
+  calendarEvents?: {
+    nextEarningsDate?: string;
+    exDividendDate?: string;
+    dividendDate?: string;
+  };
+}
+
+function rawVal(v: unknown): number | undefined {
+  if (v == null) return undefined;
+  if (typeof v === "number") return Number.isFinite(v) ? v : undefined;
+  if (typeof v === "object" && v !== null) {
+    const raw = (v as { raw?: unknown }).raw;
+    if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  }
+  return undefined;
+}
+
+function rawDate(v: unknown): string | undefined {
+  const raw = rawVal(v);
+  if (raw == null) return undefined;
+  const d = new Date(raw * 1000);
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString().slice(0, 10);
+}
+
+// ─── Yahoo crumb authentication for quoteSummary ──────────────────────────────
+
+let cachedCrumb: { crumb: string; fetchedAt: number } | null = null;
+let inflightCrumb: Promise<string | null> | null = null;
+const CRUMB_TTL_MS = 50 * 60 * 1000; // 50 minutes
+
+async function loadYahooCrumb(): Promise<string | null> {
+  // Step 1: prime cookies by visiting fc.yahoo.com (returns 404 but sets A3 cookie on .yahoo.com)
+  try {
+    const cookieCtrl = new AbortController();
+    const cookieTid = setTimeout(() => cookieCtrl.abort(), 5000);
+    await fetch("https://fc.yahoo.com/", {
+      signal: cookieCtrl.signal,
+      cache: "no-store",
+      credentials: "include",
+    }).catch(() => {});
+    clearTimeout(cookieTid);
+  } catch {
+    // ignore - cookies may still have been set
+  }
+
+  // Step 2: fetch crumb (browser auto-sends .yahoo.com cookies)
+  for (const host of ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]) {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 5000);
+    try {
+      const res = await fetch(`https://${host}/v1/test/getcrumb`, {
+        signal: ctrl.signal,
+        cache: "no-store",
+        credentials: "include",
+      });
+      clearTimeout(tid);
+      if (!res.ok) continue;
+      const crumb = (await res.text()).trim();
+      if (crumb && crumb.length > 0 && crumb.length < 100) {
+        cachedCrumb = { crumb, fetchedAt: Date.now() };
+        return crumb;
+      }
+    } catch {
+      clearTimeout(tid);
+    }
+  }
+  return null;
+}
+
+async function fetchYahooCrumb(): Promise<string | null> {
+  if (cachedCrumb && Date.now() - cachedCrumb.fetchedAt < CRUMB_TTL_MS) {
+    return cachedCrumb.crumb;
+  }
+  if (!inflightCrumb) {
+    const task = loadYahooCrumb().finally(() => {
+      if (inflightCrumb === task) inflightCrumb = null;
+    });
+    inflightCrumb = task;
+  }
+  return inflightCrumb;
+}
+
+function invalidateYahooCrumb(usedCrumb?: string) {
+  // A delayed 401 from a request using an older crumb must not erase a newer
+  // crumb that another concurrent request has already stored.
+  if (!usedCrumb || cachedCrumb?.crumb === usedCrumb) cachedCrumb = null;
+}
+
+export function resetYahooCrumbStateForTests() {
+  cachedCrumb = null;
+  inflightCrumb = null;
+}
+
+export async function fetchYahooQuoteSummary(yahooSymbol: string): Promise<YahooQuoteSummary | null> {
+  const modules = [
+    "assetProfile",
+    "defaultKeyStatistics",
+    "financialData",
+    "calendarEvents",
+    "recommendationTrend",
+    "incomeStatementHistory",
+    "balanceSheetHistory",
+    "cashflowStatementHistory",
+  ].join(",");
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const crumb = await fetchYahooCrumb();
+    if (!crumb) return null;
+    const crumbParam = encodeURIComponent(crumb);
+
+    for (const host of ["query2.finance.yahoo.com", "query1.finance.yahoo.com"]) {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const url = `https://${host}/v10/finance/quoteSummary/${encodeURIComponent(yahooSymbol)}?modules=${modules}&crumb=${crumbParam}`;
+      const res = await fetch(url, { signal: ctrl.signal, cache: "no-store", credentials: "include" });
+      clearTimeout(tid);
+      if (res.status === 401 && attempt === 0) {
+        invalidateYahooCrumb(crumb);
+        break;
+      }
+      if (!res.ok) continue;
+      const json = await res.json();
+      const result = json?.quoteSummary?.result?.[0];
+      if (!result) continue;
+
+      const summary: YahooQuoteSummary = {};
+
+      const ap = result.assetProfile;
+      if (ap) {
+        const desc = typeof ap.longBusinessSummary === "string" ? ap.longBusinessSummary : undefined;
+        summary.companyProfile = {
+          sector: typeof ap.sector === "string" ? ap.sector : undefined,
+          industry: typeof ap.industry === "string" ? ap.industry : undefined,
+          description: desc || undefined,
+          website: typeof ap.website === "string" ? ap.website : undefined,
+          employees: rawVal(ap.fullTimeEmployees),
+          country: typeof ap.country === "string" ? ap.country : undefined,
+        };
+        if (!Object.values(summary.companyProfile).some((v) => v != null)) delete summary.companyProfile;
+      }
+
+      const dks = result.defaultKeyStatistics;
+      const fd = result.financialData;
+      if (dks || fd) {
+        const ks: NonNullable<YahooQuoteSummary["keyStats"]> = {};
+        for (const s of [dks, fd]) {
+          if (!s) continue;
+          ks.enterpriseValue ??= rawVal(s.enterpriseValue);
+          ks.evToRevenue ??= rawVal(s.enterpriseToRevenue);
+          ks.evToEbitda ??= rawVal(s.enterpriseToEbitda);
+          ks.pegRatio ??= rawVal(s.pegRatio);
+          ks.beta ??= rawVal(s.beta);
+          ks.priceToBook ??= rawVal(s.priceToBook);
+          ks.bookValue ??= rawVal(s.bookValue);
+          ks.profitMargins ??= rawVal(s.profitMargins);
+          ks.grossMargins ??= rawVal(s.grossMargins);
+          ks.operatingMargins ??= rawVal(s.operatingMargins);
+          ks.ebitdaMargins ??= rawVal(s.ebitdaMargins);
+          ks.returnOnEquity ??= rawVal(s.returnOnEquity);
+          ks.returnOnAssets ??= rawVal(s.returnOnAssets);
+          ks.debtToEquity ??= rawVal(s.debtToEquity);
+          ks.currentRatio ??= rawVal(s.currentRatio);
+          ks.quickRatio ??= rawVal(s.quickRatio);
+          ks.totalCash ??= rawVal(s.totalCash);
+          ks.totalDebt ??= rawVal(s.totalDebt);
+          ks.revenuePerShare ??= rawVal(s.revenuePerShare);
+          ks.revenueGrowth ??= rawVal(s.revenueGrowth);
+          ks.earningsGrowth ??= rawVal(s.earningsGrowth);
+        }
+        if (Object.values(ks).some((v) => v != null)) summary.keyStats = ks;
+      }
+
+      const rt = result.recommendationTrend?.trend?.[0];
+      if (rt || fd) {
+        const ad: NonNullable<YahooQuoteSummary["analystData"]> = {};
+        if (fd) {
+          ad.targetHigh = rawVal(fd.targetHighPrice);
+          ad.targetLow = rawVal(fd.targetLowPrice);
+          ad.targetMean = rawVal(fd.targetMeanPrice);
+        }
+        if (rt) {
+          ad.strongBuy = rawVal(rt.strongBuy);
+          ad.buy = rawVal(rt.buy);
+          ad.hold = rawVal(rt.hold);
+          ad.sell = rawVal(rt.sell);
+          ad.strongSell = rawVal(rt.strongSell);
+        }
+        if (Object.values(ad).some((v) => v != null)) summary.analystData = ad;
+      }
+
+      const incArr: any[] = result.incomeStatementHistory?.incomeStatementHistory ?? [];
+      const bsArr: any[] = result.balanceSheetHistory?.balanceSheetStatements ?? [];
+      const cfArr: any[] = result.cashflowStatementHistory?.cashflowStatements ?? [];
+      if (incArr.length || bsArr.length || cfArr.length) {
+        const fs: NonNullable<YahooQuoteSummary["financialStatements"]> = {};
+
+        // Extract year label from endDate (e.g. {raw: 1696118400, fmt: "2023-10-01"})
+        const yearFromEnd = (v: unknown): string | undefined => {
+          const raw = rawVal(v);
+          if (raw == null) return undefined;
+          const d = new Date(raw * 1000);
+          return Number.isNaN(d.getTime()) ? undefined : d.toISOString().slice(0, 10);
+        };
+
+        if (incArr.length) {
+          fs.income = incArr.slice(0, 5).map((inc) => ({
+            year: yearFromEnd(inc.endDate),
+            totalRevenue: rawVal(inc.totalRevenue),
+            grossProfit: rawVal(inc.grossProfit),
+            operatingIncome: rawVal(inc.operatingIncome),
+            netIncome: rawVal(inc.netIncome),
+            ebitda: rawVal(inc.ebitda),
+            researchAndDevelopment: rawVal(inc.researchAndDevelopment),
+          })).filter((s) => Object.entries(s).some(([k, v]) => k !== "year" && v != null));
+        }
+        if (bsArr.length) {
+          fs.balanceSheet = bsArr.slice(0, 5).map((bs) => ({
+            year: yearFromEnd(bs.endDate),
+            totalAssets: rawVal(bs.totalAssets),
+            totalLiabilities: rawVal(bs.totalLiab),
+            stockholdersEquity: rawVal(bs.totalStockholderEquity),
+            totalCash: rawVal(bs.totalCash),
+            totalDebt: rawVal(bs.totalDebt),
+          })).filter((s) => Object.entries(s).some(([k, v]) => k !== "year" && v != null));
+        }
+        if (cfArr.length) {
+          fs.cashFlow = cfArr.slice(0, 5).map((cf) => ({
+            year: yearFromEnd(cf.endDate),
+            operatingCashFlow: rawVal(cf.totalCashFromOperatingActivities),
+            capitalExpenditures: rawVal(cf.capitalExpenditures),
+            freeCashFlow: rawVal(cf.freeCashFlow),
+          })).filter((s) => Object.entries(s).some(([k, v]) => k !== "year" && v != null));
+        }
+        if (fs.income?.length || fs.balanceSheet?.length || fs.cashFlow?.length) summary.financialStatements = fs;
+      }
+
+      const ce = result.calendarEvents;
+      if (ce) {
+        const ev: NonNullable<YahooQuoteSummary["calendarEvents"]> = {};
+        const earningsDates = Array.isArray(ce.earnings?.earningsDate) ? ce.earnings.earningsDate : [];
+        ev.nextEarningsDate = rawDate(earningsDates[0])
+          ?? rawDate(ce.earnings?.startDate)
+          ?? (typeof ce.earnings?.startDate === "string" ? ce.earnings.startDate.slice(0, 10) : undefined);
+        ev.exDividendDate = rawDate(ce.exDividendDate);
+        ev.dividendDate = rawDate(ce.dividendDate);
+        if (Object.values(ev).some((v) => v != null)) summary.calendarEvents = ev;
+      }
+
+      return summary;
+    } catch {
+      clearTimeout(tid);
+    }
+    }
+  }
+  return null;
 }

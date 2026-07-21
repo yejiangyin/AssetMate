@@ -14,6 +14,7 @@ import { getMarketBadgeWithBg } from "../utils/marketBadge";
 import { normalizeHoldingSymbol, normalizeHoldingType } from "../utils/holdingHelpers";
 import { useSecuritySearch } from "../utils/useSecuritySearch";
 import { assetTypeLabel, marketLabel, t } from "../i18n";
+import type { BacktestResearchContext, BacktestSeed } from "../research/types";
 
 const marketOptions = [
   { value: "US", label: "美股" },
@@ -155,8 +156,12 @@ function currencyForMarket(market: string) {
   if (market === "US") return "USD";
   if (market === "HK") return "HKD";
   if (market === "JP") return "JPY";
-  if (market === "CRYPTO") return "USD";
+  if (market === "CRYPTO") return "USDT";
   return "CNY";
+}
+
+export function normalizeBacktestSeedSymbol(seed: BacktestSeed | null | undefined) {
+  return seed ? normalizeHoldingSymbol(seed.symbol, seed.market) : "";
 }
 
 function numberInput(value: number, onChange: (value: number) => void, placeholder?: string, step = 1) {
@@ -710,7 +715,21 @@ function strategyBuyLabelWithPeriod(strategy: BacktestStrategy, period: number, 
   return isEn ? `${label} #${period}` : `${label} 第${period}期`;
 }
 
-export function Backtest() {
+export type BacktestView = "backtest" | "compare";
+
+export function Backtest({
+  embedded = false,
+  view: controlledView,
+  onViewChange,
+  initialSeed,
+  onInterpret,
+}: {
+  embedded?: boolean;
+  view?: BacktestView;
+  onViewChange?: (view: BacktestView) => void;
+  initialSeed?: BacktestSeed | null;
+  onInterpret?: (context: BacktestResearchContext) => void;
+} = {}) {
   const { language, profitColor, holdings } = useApp();
   const isEn = language === "en";
   const text = t(language);
@@ -720,13 +739,13 @@ export function Backtest() {
     ...marketOptions.map((option) => ({ value: option.value as Market | "", label: marketLabel(option.value, language) })),
   ], [language, text.holdings.allMarkets]);
   const [form, setForm] = useState<BacktestInput>({
-    symbol: "",
-    market: "US",
-    assetType: "stock",
+    symbol: normalizeBacktestSeedSymbol(initialSeed),
+    market: initialSeed?.market ?? "US",
+    assetType: initialSeed?.assetType ?? "stock",
     startDate: yearsAgoYMD(3),
     endDate: todayYMD(),
     initialAmount: 10000,
-    strategy: "lump_sum",
+    strategy: initialSeed?.strategy ?? "lump_sum",
     monthlyAmount: 1000,
     feeRate: 0,
     sellFeeRate: 0,
@@ -737,8 +756,10 @@ export function Backtest() {
     liquidateAtEnd: false,
     dividendMode: "cash",
   });
-  const [securityQuery, setSecurityQuery] = useState("");
-  const [marketScope, setMarketScope] = useState<Market | "">("");
+  const [securityQuery, setSecurityQuery] = useState(initialSeed ? `${initialSeed.name} (${initialSeed.symbol})` : "");
+  const [marketScope, setMarketScope] = useState<Market | "">(
+    initialSeed && marketOptions.some((option) => option.value === initialSeed.market) ? initialSeed.market as Market : "",
+  );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<BacktestResult | null>(null);
@@ -747,8 +768,32 @@ export function Backtest() {
   const [benchmarkError, setBenchmarkError] = useState("");
   const [savedBacktests, setSavedBacktests] = useState<SavedBacktest[]>(loadSavedBacktests);
   const [periodView, setPeriodView] = useState<"month" | "year">("month");
-  const [pageTab, setPageTab] = useState<"backtest" | "compare">("backtest");
+  const [internalPageTab, setInternalPageTab] = useState<BacktestView>("backtest");
+  const pageTab = controlledView ?? internalPageTab;
+  const setPageTab = (tab: BacktestView) => {
+    setInternalPageTab(tab);
+    onViewChange?.(tab);
+  };
   const runSeqRef = useRef(0);
+
+  useEffect(() => {
+    if (!initialSeed) return;
+    runSeqRef.current += 1;
+    setForm((current) => ({
+      ...current,
+      symbol: normalizeBacktestSeedSymbol(initialSeed),
+      market: initialSeed.market,
+      assetType: initialSeed.assetType,
+      strategy: initialSeed.strategy ?? current.strategy,
+    }));
+    setSecurityQuery(`${initialSeed.name} (${initialSeed.symbol})`);
+    setMarketScope(marketOptions.some((option) => option.value === initialSeed.market) ? initialSeed.market as Market : "");
+    setResult(null);
+    setBenchmarkResult(null);
+    setBenchmarkError("");
+    setError("");
+    setInternalPageTab("backtest");
+  }, [initialSeed]);
 
   const chartColor = profitColor(result?.totalPnl ?? 0);
   const chartData = useMemo(() => {
@@ -871,6 +916,34 @@ export function Backtest() {
     persistSavedBacktests([item, ...savedBacktests]);
   };
 
+  const interpretCurrentResult = () => {
+    if (!result || !onInterpret) return;
+    onInterpret({
+      symbol: form.symbol,
+      name: securityQuery.replace(/\s*\([^)]*\)\s*$/, "") || form.symbol,
+      market: form.market,
+      currency: quoteCurrency,
+      strategy: form.strategy,
+      startDate: result.actualStartDate,
+      endDate: result.actualEndDate,
+      totalPnl: result.totalPnl,
+      totalInvested: result.totalInvested,
+      finalValue: result.finalValue,
+      totalReturn: result.totalReturn,
+      annualizedReturn: result.annualizedReturn,
+      maxDrawdown: result.maxDrawdown,
+      totalFees: result.totalFees,
+      totalTaxes: result.totalTaxes,
+      totalDividends: result.totalDividends,
+      tradeCount: result.tradeCount,
+      benchmarkLabel: benchmarkResult?.label,
+      benchmarkReturn: benchmarkResult?.totalReturn,
+      benchmarkAnnualizedReturn: benchmarkResult?.annualizedReturn,
+      benchmarkMaxDrawdown: benchmarkResult?.maxDrawdown,
+      monthlyReturns: result.monthlyReturns.slice(-24).map((item) => ({ month: item.key, returnRate: item.returnRate })),
+    });
+  };
+
   const loadSavedBacktest = (item: SavedBacktest) => {
     if (!item.form) return;
     runSeqRef.current += 1;
@@ -981,7 +1054,7 @@ export function Backtest() {
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
-      <div
+      {!embedded && <div
         className="shrink-0 flex items-center justify-between px-4"
         style={{
           height: 50,
@@ -1009,9 +1082,9 @@ export function Backtest() {
             </button>
           )}
         </div>
-      </div>
+      </div>}
 
-      <div className="shrink-0 border-b border-app-border px-3 py-2">
+      {!embedded && <div className="shrink-0 border-b border-app-border px-3 py-2">
         <div className="grid grid-cols-2 rounded-xl bg-app-card p-1">
           {(["backtest", "compare"] as const).map((tab) => (
             <button
@@ -1026,7 +1099,7 @@ export function Backtest() {
             </button>
           ))}
         </div>
-      </div>
+      </div>}
 
       <div className="flex-1 overflow-y-auto px-3 py-3" style={{ scrollbarWidth: "none", paddingBottom: 16 }}>
         <div style={{ display: pageTab === "backtest" ? "block" : "none" }}>
@@ -1210,6 +1283,7 @@ export function Backtest() {
                   type="button"
                   role="switch"
                   aria-checked={form.liquidateAtEnd === true}
+                  aria-label={isEn ? "Liquidate at end" : "期末模拟清仓"}
                   onClick={() => updateForm("liquidateAtEnd", !form.liquidateAtEnd)}
                   className="flex h-[38px] w-full items-center justify-between rounded-xl border border-app-border bg-app-card px-3 text-[10px] font-semibold text-ts"
                 >
@@ -1257,6 +1331,11 @@ export function Backtest() {
               <button type="button" onClick={saveCurrentResult} className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg border border-app-border bg-app-card py-2 text-[10px] font-semibold text-app-accent">
                 <Save size={12} />{isEn ? "Save for comparison" : "保存当前方案用于对比"}
               </button>
+              {onInterpret && (
+                <button type="button" onClick={interpretCurrentResult} className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-lg bg-app-accent py-2 text-[10px] font-semibold text-white">
+                  <TrendingUp size={12} />{isEn ? "AI review this backtest" : "AI 解读本次回测"}
+                </button>
+              )}
             </section>
 
             {(benchmarkResult || benchmarkError) && (
@@ -1491,6 +1570,28 @@ export function Backtest() {
           </section>
         )}
       </div>
+
+      {embedded && pageTab === "backtest" && (
+        <div
+          className="shrink-0 border-t border-app-border px-3 py-2.5"
+          style={{
+            background: "color-mix(in srgb, var(--bg) 94%, transparent)",
+            backdropFilter: "blur(16px)",
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => void run()}
+            disabled={loading}
+            className="flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-app-accent text-[13px] font-bold text-white shadow-sm transition-[transform,opacity] active:scale-[0.99] disabled:cursor-wait disabled:opacity-60"
+          >
+            <RefreshCw size={15} className={loading ? "animate-spin-smooth" : undefined} />
+            {loading
+              ? (isEn ? "Running backtest…" : "回测计算中…")
+              : (isEn ? "Run backtest" : "开始回测")}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

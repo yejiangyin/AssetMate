@@ -1,4 +1,3 @@
-import type { Holding } from "../data/mockData";
 import { toYahooSymbol } from "./quoteApi";
 import { fetchCnFundOfficialHistory } from "./securitiesApi";
 import {
@@ -89,10 +88,16 @@ function parseSplitRatio(raw: unknown, numerator?: unknown, denominator?: unknow
   return left > 0 && right > 0 ? left / right : 0;
 }
 
-function canUseYahooActions(holding: Holding) {
+type CorporateActionSubject = {
+  symbol: string;
+  market: string;
+  assetType: string;
+};
+
+function canUseYahooActions(holding: CorporateActionSubject) {
   if (holding.market === "CRYPTO" || holding.market === "GOLD" || holding.assetType === "crypto") return false;
   if (holding.market === "FUND" && holding.assetType === "fund") return false;
-  return ["US", "HK", "JP", "A"].includes(holding.market);
+  return ["US", "HK", "JP", "A", "UK", "DE", "IN", "VN"].includes(holding.market);
 }
 
 function normalizeFundCode(symbol: string) {
@@ -227,9 +232,10 @@ async function fetchEastMoneyFundCorporateActions(symbol: string): Promise<Corpo
       cache.set(key, { ts: Date.now(), data: enriched });
       writePersistentActions(key, enriched, { fullRefresh, previousFullRefreshAt: persistent?.lastFullRefreshAt });
       return enriched;
-    } catch {
+    } catch (error) {
       clearTimeout(tid);
-      return persistent?.data ?? [];
+      if (persistent?.data?.length) return persistent.data;
+      throw error;
     } finally {
       inflight.delete(key);
     }
@@ -376,9 +382,10 @@ async function fetchEastMoneyStockCorporateActions(symbol: string): Promise<Corp
       cache.set(key, { ts: Date.now(), data: merged });
       writePersistentActions(key, merged, { fullRefresh, previousFullRefreshAt: persistent?.lastFullRefreshAt });
       return merged;
-    } catch {
+    } catch (error) {
       clearTimeout(tid);
-      return validPersistentActions;
+      if (validPersistentActions.length) return validPersistentActions;
+      throw error;
     } finally {
       inflight.delete(key);
     }
@@ -469,8 +476,9 @@ async function fetchYahooCorporateActions(yahooSymbol: string, days = 45): Promi
       cache.set(key, { ts: Date.now(), data: merged });
       writePersistentActions(key, merged, { fullRefresh, previousFullRefreshAt: persistent?.lastFullRefreshAt });
       return merged;
-    } catch {
-      return persistent?.data ?? [];
+    } catch (error) {
+      if (persistent?.data?.length) return persistent.data;
+      throw error;
     } finally {
       inflight.delete(key);
     }
@@ -480,7 +488,7 @@ async function fetchYahooCorporateActions(yahooSymbol: string, days = 45): Promi
   return task;
 }
 
-export async function fetchCorporateActions(holding: Holding, days = 45): Promise<CorporateActionEvent[]> {
+export async function fetchCorporateActions(holding: CorporateActionSubject, days = 45): Promise<CorporateActionEvent[]> {
   if (holding.market === "FUND" && holding.assetType === "fund") {
     return fetchEastMoneyFundCorporateActions(holding.symbol);
   }

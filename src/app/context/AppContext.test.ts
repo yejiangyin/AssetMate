@@ -130,6 +130,36 @@ describe("automatic corporate actions", () => {
     assert.equal(tax?.rateUsed, 0.1);
   });
 
+  test("records open-end fund reinvestment with the net dividend amount", () => {
+    const taxed = fundHolding({
+      dividendReinvest: true,
+      transactionCostProfile: { dividendTaxRate: 0.1 },
+    });
+    const result = applyAutomaticCorporateActions(
+      [taxed],
+      new Map([["h1", [dividend]]]),
+      false,
+      "2026-06-08",
+    );
+
+    const holding = result.holdings[0]!;
+    const action = holding.corporateActions?.[0];
+    const event = result.portfolioEvents.find((item) => item.type === "dividend_reinvest");
+
+    assert.equal(holding.quantity, 11.8);
+    assert.equal(holding.cashDividendTotal, 3.6);
+    assert.equal(action?.type, "dividend_reinvest");
+    assert.equal(action?.amount, 3.6);
+    assert.equal(action?.estimatedAmount, 4);
+    assert.equal(action?.rateUsed, 0.1);
+    assert.match(action?.note ?? "", /net of dividend withholding tax/);
+    assert.equal(event?.amount, 3.6);
+    assert.equal(event?.estimatedAmount, 4);
+    const taxEvent = result.portfolioEvents.find((item) => item.type === "tax");
+    assert.equal(taxEvent?.amount, -0.4);
+    assert.equal(taxEvent?.rateUsed, 0.1);
+  });
+
   test("prefers the source reinvestment price over local short history", () => {
     assert.equal(resolveFundDividendReinvestPrice(fundHolding(), { ...dividend, reinvestPrice: 1.8 }), 1.8);
   });

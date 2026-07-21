@@ -15,6 +15,7 @@ export interface PublicQuote {
 
 export interface PublicChartPoint {
   time: string;
+  timestamp?: number;
   price: number;
   volume?: number;
   open?: number;
@@ -145,6 +146,7 @@ function aggregateCalendarPoints(points: PublicChartPoint[], mode: "quarter" | "
     const lows = bucket.map((item) => item.low ?? item.price).filter((value) => value != null && value > 0) as number[];
     return {
       time: mode === "quarter" ? `${String(key.slice(2, 4))}/${key.slice(-2)}` : key,
+      timestamp: last.timestamp,
       price: last.close ?? last.price,
       volume: bucket.reduce((sum, item) => sum + (item.volume ?? 0), 0) || undefined,
       open: first.open ?? first.price,
@@ -212,6 +214,7 @@ export async function fetchBinanceCryptoKline(symbol: string, range: PublicMarke
       const volume = num(row?.[5]);
       return {
         time: formatDateLabel(time, range),
+        timestamp: time.getTime(),
         price: close,
         volume,
         open,
@@ -287,6 +290,7 @@ export async function fetchOkxCryptoKline(symbol: string, range: PublicMarketTim
       const volume = num(row?.[5]);
       return {
         time: formatDateLabel(time, range),
+        timestamp: time.getTime(),
         price: close,
         volume,
         open,
