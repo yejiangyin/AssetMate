@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "资产助手",
-  "version": "2.0.1",
-  "version_name": "2.0.1",
+  "version": "2.0.2",
+  "version_name": "2.0.2",
   "description": "个人资产、多市场行情、AI 投研与策略回测插件。",
   "permissions": [
     "sidePanel",

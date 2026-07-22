@@ -69,6 +69,9 @@ export interface PortfolioSnapshotInput {
   feePnl?: number;
   totalPnl?: number;
   migratedBaseline?: boolean;
+  estimated?: boolean;
+  estimateReason?: "historical_backfill";
+  fxFallback?: boolean;
   holdingUnrealizedPnl?: Record<string, number>;
 }
 
@@ -82,6 +85,8 @@ export interface DailyReturn {
   totalAsset: number;
   currency: "CNY";
   incompleteBreakdown?: boolean;
+  estimatedSnapshot?: boolean;
+  fxFallback?: boolean;
 }
 
 export interface MonthlyReturn {
@@ -774,6 +779,8 @@ export function getDailyReturns(events: PortfolioEvent[], snapshots: PortfolioSn
       totalAsset: snapshot?.totalAsset ?? lastTotalAsset,
       currency: "CNY",
       incompleteBreakdown: !snapshot || !hasBreakdown || isInitialBaseline || snapshot.migratedBaseline || undefined,
+      estimatedSnapshot: snapshot?.estimated || undefined,
+      fxFallback: snapshot?.fxFallback || undefined,
     });
   }
   return rows;

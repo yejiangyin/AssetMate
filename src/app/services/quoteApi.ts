@@ -479,7 +479,7 @@ export async function fetchBacktestDailyPrices(
 ): Promise<DailyPricePoint[]> {
   if (market === "FUND") {
     const history = await fetchCnFundOfficialHistory(symbol, 4000);
-    const useAdjustedNav = history.length > 0 && history.every((point) => {
+    const useAdjustedNav = options.preferAdjusted !== false && history.length > 0 && history.every((point) => {
       const totalNav = Number(point.totalNav);
       return Number.isFinite(totalNav) && totalNav > 0;
     });

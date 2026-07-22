@@ -386,6 +386,21 @@ describe("return aggregations", () => {
     assert.equal(daily[0]?.incompleteBreakdown, true);
   });
 
+  test("exposes historical backfill and FX fallback provenance to the returns UI", () => {
+    const daily = getDailyReturns([], [{
+      date: "2026-07-01",
+      totalAsset: 1200,
+      todayPnl: 0,
+      cumulativePnl: 200,
+      unrealizedPnl: 200,
+      estimated: true,
+      estimateReason: "historical_backfill",
+      fxFallback: true,
+    }]);
+    assert.equal(daily[0]?.estimatedSnapshot, true);
+    assert.equal(daily[0]?.fxFallback, true);
+  });
+
   test("preserves pruned returns in a dated baseline", () => {
     const events: PortfolioEvent[] = [
       { id: "old-sell", date: "2026-01-01", type: "sell", amount: 20, amountInBase: 20, currency: "CNY", source: "manual", costBasisAtEvent: 100, createdAt: "2026-01-01T00:00:00.000Z" },

@@ -320,6 +320,8 @@ export function Returns() {
     [archivedBreakdown, eventBreakdown],
   );
   const incompleteCount = selectedDailyRows.filter((row) => row.incompleteBreakdown).length;
+  const backfilledCount = selectedDailyRows.filter((row) => row.estimatedSnapshot).length;
+  const hasFxFallback = selectedDailyRows.some((row) => row.fxFallback);
   const trackingStart = dailyRows[0]?.date;
   const containsBaseline = selectedDailyRows.some((row) => row.incompleteBreakdown)
     && analysisSnapshots.some((snapshot) => snapshot.migratedBaseline && snapshot.date >= view.start && snapshot.date <= view.end);
@@ -630,6 +632,13 @@ export function Returns() {
               <p>{copy.incomplete(incompleteCount)}</p>
               {containsBaseline && <p className="mt-0.5 text-tmi">{copy.baselineIncluded}</p>}
             </div>
+          </div>
+        )}
+
+        {backfilledCount > 0 && (
+          <div className="mb-3 flex gap-2 rounded-xl border px-3 py-2" style={{ borderColor: "rgba(79,156,249,0.24)", background: "rgba(79,156,249,0.07)" }}>
+            <Layers3 size={14} color="#4F9CF9" className="mt-0.5 shrink-0" />
+            <p className="text-[10px] leading-4 text-tm">{copy.backfilled(backfilledCount, hasFxFallback)}</p>
           </div>
         )}
 

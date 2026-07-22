@@ -183,6 +183,23 @@ describe("Yahoo chart fetchers", () => {
     });
   });
 
+  test("historical portfolio valuation can request raw fund NAV", async () => {
+    await withMockFetch((async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/f10/lsjz")) return okJson({ Data: null });
+      return {
+        ok: true,
+        text: async () => [
+          "var Data_netWorthTrend = [{\"x\":1767312000000,\"y\":1.04,\"equityReturn\":0.1}];",
+          "var Data_ACWorthTrend = [[1767312000000,1.43]];",
+        ].join(""),
+      } as Response;
+    }) as typeof fetch, async () => {
+      const prices = await fetchBacktestDailyPrices("003547", "FUND", "2026-01-02", "2026-01-02", { preferAdjusted: false });
+      assert.deepEqual(prices, [{ date: "2026-01-02", price: 1.04, adjusted: false }]);
+    });
+  });
+
   test("fetchBacktestDailyPrices falls back to fund unit NAV when cumulative NAV is absent", async () => {
     await withMockFetch((async (input: string | URL | Request) => {
       const url = String(input);

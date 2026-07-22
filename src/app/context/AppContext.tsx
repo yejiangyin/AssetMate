@@ -23,8 +23,9 @@ import {
 import { normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction, reverseCorporateAction } from "../utils/holdingHelpers";
 import { dedupeDCAExecutions, hydratePlans, repairDCAData, settleDueDCAPlans, syncPlanWithHolding, computeNextExec } from "../utils/dcaEngine";
 import { safeUUID } from "../utils/safeId";
-import { consumeSnapshotDueDates, DEFAULT_OPEN_MODE, getConfiguredExtensionOpenMode, normalizeOpenMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
+import { acknowledgeSnapshotDueDates, DEFAULT_OPEN_MODE, getConfiguredExtensionOpenMode, getSnapshotDueDates, normalizeOpenMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
 import { estimateTransactionCosts, mergeTransactionCostProfile } from "../utils/transactionCosts";
+import { backfillPortfolioSnapshots, collectMissingSnapshotDates } from "../services/portfolioSnapshotBackfill";
 
 /* ─── types ──────────────────────────────────────────── */
 type ColorScheme    = "red-up" | "green-up";
@@ -168,6 +169,9 @@ export interface PortfolioSnapshot {
   feePnl?: number;
   totalPnl?: number;
   migratedBaseline?: boolean;
+  estimated?: boolean;
+  estimateReason?: "historical_backfill";
+  fxFallback?: boolean;
   holdingUnrealizedPnl?: Record<string, number>;
 }
 
@@ -1095,6 +1099,16 @@ function savePersistedState(snapshot: PersistedState, options: { clearCachesOnFa
   };
 }
 
+function readPersistedSnapshotDates() {
+  if (typeof window === "undefined") return new Set<string>();
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? "{}") as PersistedState;
+    return new Set((saved.assetSnapshots ?? []).map((snapshot) => snapshot.date).filter(Boolean));
+  } catch {
+    return new Set<string>();
+  }
+}
+
 function readRefreshMeta(): RefreshMeta {
   if (typeof window === "undefined") return {};
   try {
@@ -1175,6 +1189,9 @@ export function loadInitialState(): AppState {
             feePnl: Number.isFinite(snapshot.feePnl) ? snapshot.feePnl : undefined,
             totalPnl: Number.isFinite(snapshot.totalPnl) ? snapshot.totalPnl : undefined,
             migratedBaseline: snapshot.migratedBaseline === true ? true : undefined,
+            estimated: snapshot.estimated === true ? true : undefined,
+            estimateReason: snapshot.estimateReason === "historical_backfill" ? "historical_backfill" as const : undefined,
+            fxFallback: snapshot.fxFallback === true ? true : undefined,
             holdingUnrealizedPnl: snapshot.holdingUnrealizedPnl && typeof snapshot.holdingUnrealizedPnl === "object"
               ? Object.fromEntries(Object.entries(snapshot.holdingUnrealizedPnl)
                   .filter(([id, value]) => id && Number.isFinite(value))
@@ -1451,6 +1468,48 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return task;
   }, [doRefresh]);
 
+  const runSnapshotBackfill = useCallback(async (queuedDates: string[]) => {
+    const current = stateRef.current;
+    const today = todayLocalYMD();
+    const existingDates = current.assetSnapshots.map((snapshot) => snapshot.date);
+    const dates = collectMissingSnapshotDates(existingDates, queuedDates, today, MAX_PORTFOLIO_SNAPSHOTS);
+    const alreadySatisfied = queuedDates.filter((date) => existingDates.includes(date));
+    if (!dates.length) {
+      if (alreadySatisfied.length) await acknowledgeSnapshotDueDates(alreadySatisfied);
+      return { completedDates: [] as string[], failedDates: [] as string[] };
+    }
+
+    const result = await backfillPortfolioSnapshots({
+      dates,
+      holdings: current.holdings,
+      events: current.portfolioEvents,
+      baseline: current.portfolioEventBaseline,
+    });
+    if (result.snapshots.length) {
+      setState((latest) => {
+        const replacements = new Map(result.snapshots.map((snapshot) => [snapshot.date, snapshot]));
+        return {
+          ...latest,
+          assetSnapshots: prunePortfolioSnapshots([
+            ...latest.assetSnapshots.filter((snapshot) => !replacements.has(snapshot.date)),
+            ...result.snapshots,
+          ]),
+        };
+      });
+      // The background queue is acknowledged only after the normal persisted
+      // state effect has durably written the generated snapshots. If the popup
+      // closes before this completes, the dates remain queued for the next run.
+      await new Promise((resolve) => window.setTimeout(resolve, 350));
+    }
+    const persistedDates = readPersistedSnapshotDates();
+    const acknowledged = [...new Set([
+      ...alreadySatisfied,
+      ...result.completedDates.filter((date) => queuedDates.includes(date) && persistedDates.has(date)),
+    ])];
+    if (acknowledged.length) await acknowledgeSnapshotDueDates(acknowledged);
+    return result;
+  }, []);
+
   useEffect(() => {
     // Bypass the cross-view refresh coordination on initial mount: when the
     // user switches from popup to side panel (or vice versa) within the
@@ -1458,13 +1517,37 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     // from fetching data at all, leaving it showing stale values with no
     // "refreshing" indication. Each view should always refresh at least once
     // on open.
-    void consumeSnapshotDueDates().then((response) => {
-      void runRefresh(stateRef.current.holdings, {
-        forceCorporateActions: Boolean(response.dates?.length),
-        bypassCoordination: true,
-      });
+    void getSnapshotDueDates().then(async (response) => {
+      const queuedDates = response.dates ?? [];
+      let failedBackfillCount = 0;
+      try {
+        const result = await runSnapshotBackfill(queuedDates);
+        failedBackfillCount = result.failedDates.length;
+      } catch {
+        // Missing dates stay unacknowledged and will be retried next time.
+        failedBackfillCount = 1;
+      } finally {
+        await runRefresh(stateRef.current.holdings, {
+          forceCorporateActions: Boolean(queuedDates.length),
+          bypassCoordination: true,
+        });
+        if (queuedDates.length) {
+          await new Promise((resolve) => window.setTimeout(resolve, 350));
+          const persistedDates = readPersistedSnapshotDates();
+          const satisfied = queuedDates.filter((date) => persistedDates.has(date));
+          if (satisfied.length) await acknowledgeSnapshotDueDates(satisfied);
+        }
+        if (failedBackfillCount > 0) {
+          setState((latest) => ({
+            ...latest,
+            lastRefreshError: latest.language === "en"
+              ? `${failedBackfillCount} historical snapshot${failedBackfillCount === 1 ? "" : "s"} could not be backfilled and will retry next time.`
+              : `${failedBackfillCount} 天历史收益快照暂未补算成功，下次打开将自动重试。`,
+          }));
+        }
+      }
     });
-  }, [runRefresh]);
+  }, [runRefresh, runSnapshotBackfill]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
