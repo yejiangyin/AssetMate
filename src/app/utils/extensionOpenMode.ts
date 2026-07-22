@@ -76,8 +76,12 @@ export function getConfiguredExtensionOpenMode() {
   return sendExtensionOpenModeMessage("asset-helper:get-open-mode");
 }
 
-export function consumeSnapshotDueDates() {
-  return sendExtensionOpenModeMessage("asset-helper:consume-snapshot-due");
+export function getSnapshotDueDates() {
+  return sendExtensionOpenModeMessage("asset-helper:get-snapshot-due");
+}
+
+export function acknowledgeSnapshotDueDates(dates: string[]) {
+  return sendExtensionOpenModeMessage("asset-helper:ack-snapshot-due", { dates });
 }
 
 async function getCurrentWindowId() {

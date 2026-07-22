@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  acknowledgeSnapshotDueDates,
   getExtensionViewMode,
   getConfiguredExtensionOpenMode,
+  getSnapshotDueDates,
   normalizeOpenMode,
   openExtensionMode,
   sendExtensionOpenModeMessage,
@@ -55,6 +57,30 @@ describe("extensionOpenMode", () => {
 
     try {
       assert.deepEqual(await getConfiguredExtensionOpenMode(), { ok: true, mode: "sidepanel" });
+    } finally {
+      (globalThis as { chrome?: unknown }).chrome = previousChrome;
+    }
+  });
+
+  test("peeks and acknowledges snapshot dates with separate messages", async () => {
+    const previousChrome = (globalThis as { chrome?: unknown }).chrome;
+    const calls: unknown[] = [];
+    (globalThis as { chrome?: unknown }).chrome = {
+      runtime: {
+        id: "ext",
+        sendMessage: (message: unknown, callback: (response: { ok?: boolean; dates?: string[] } | undefined) => void) => {
+          calls.push(message);
+          callback({ ok: true, dates: ["2026-07-20"] });
+        },
+      },
+    };
+    try {
+      assert.deepEqual(await getSnapshotDueDates(), { ok: true, dates: ["2026-07-20"] });
+      await acknowledgeSnapshotDueDates(["2026-07-20"]);
+      assert.deepEqual(calls, [
+        { type: "asset-helper:get-snapshot-due" },
+        { type: "asset-helper:ack-snapshot-due", dates: ["2026-07-20"] },
+      ]);
     } finally {
       (globalThis as { chrome?: unknown }).chrome = previousChrome;
     }

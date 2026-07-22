@@ -129,13 +129,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message.type === "asset-helper:consume-snapshot-due") {
+  if (message.type === "asset-helper:get-snapshot-due" || message.type === "asset-helper:consume-snapshot-due") {
     void chrome.storage.local.get(SNAPSHOT_DUE_KEY)
       .then((data) => {
         const dates = Array.isArray(data[SNAPSHOT_DUE_KEY]) ? data[SNAPSHOT_DUE_KEY] : [];
-        return chrome.storage.local.remove(SNAPSHOT_DUE_KEY).then(() => sendResponse({ ok: true, dates }));
+        sendResponse({ ok: true, dates });
       })
-      .catch((error) => sendResponse({ ok: false, reason: error?.message ?? "consume_failed" }));
+      .catch((error) => sendResponse({ ok: false, reason: error?.message ?? "get_due_failed" }));
+    return true;
+  }
+
+  if (message.type === "asset-helper:ack-snapshot-due") {
+    void chrome.storage.local.get(SNAPSHOT_DUE_KEY)
+      .then((data) => {
+        const current = Array.isArray(data[SNAPSHOT_DUE_KEY]) ? data[SNAPSHOT_DUE_KEY] : [];
+        const acknowledged = new Set(Array.isArray(message.dates) ? message.dates : []);
+        const remaining = current.filter((date) => !acknowledged.has(date));
+        const operation = remaining.length
+          ? chrome.storage.local.set({ [SNAPSHOT_DUE_KEY]: remaining })
+          : chrome.storage.local.remove(SNAPSHOT_DUE_KEY);
+        return operation.then(() => sendResponse({ ok: true, dates: remaining }));
+      })
+      .catch((error) => sendResponse({ ok: false, reason: error?.message ?? "ack_due_failed" }));
     return true;
   }
 

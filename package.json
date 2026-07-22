@@ -2,7 +2,7 @@
   "name": "asset-helper",
   "description": "个人资产与多市场行情查看 Chrome 扩展",
   "private": true,
-  "version": "2.0.1",
+  "version": "2.0.2",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
