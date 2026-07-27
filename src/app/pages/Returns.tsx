@@ -249,8 +249,16 @@ export function Returns() {
   }, [assetSnapshots, holdings, stats, today]);
 
   const dailyRows = useMemo(
-    () => getDailyReturns(portfolioEvents, analysisSnapshots, portfolioEventBaseline),
-    [analysisSnapshots, portfolioEventBaseline, portfolioEvents],
+    () => getDailyReturns(portfolioEvents, analysisSnapshots, portfolioEventBaseline, {
+      attributeWeekendUnrealized: true,
+      holdingMarkets: Object.fromEntries([
+        ...portfolioEvents
+          .filter((event) => event.holdingId && event.market)
+          .map((event) => [event.holdingId!, event.market!] as const),
+        ...holdings.map((holding) => [holding.id, holding.market] as const),
+      ]),
+    }),
+    [analysisSnapshots, holdings, portfolioEventBaseline, portfolioEvents],
   );
 
   const view = useMemo(() => {
