@@ -89,6 +89,16 @@ export interface DailyReturn {
   fxFallback?: boolean;
 }
 
+export interface DailyReturnAttributionOptions {
+  /**
+   * Market captured for each holding id. When supplied, non-crypto valuation
+   * changes first observed on a weekend are attributed to the preceding
+   * weekday, while continuously traded crypto keeps its calendar-day return.
+   */
+  holdingMarkets?: Record<string, string>;
+  attributeWeekendUnrealized?: boolean;
+}
+
 export interface MonthlyReturn {
   month: string;
   unrealizedPnlChange: number;
@@ -728,7 +738,34 @@ function aggregateEventsByDate(events: PortfolioEvent[], baseline?: PortfolioEve
   return map;
 }
 
-export function getDailyReturns(events: PortfolioEvent[], snapshots: PortfolioSnapshotInput[], baseline?: PortfolioEventBaseline): DailyReturn[] {
+function precedingWeekday(date: string) {
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  const weekday = parsed.getUTCDay();
+  if (weekday === 6) parsed.setUTCDate(parsed.getUTCDate() - 1);
+  if (weekday === 0) parsed.setUTCDate(parsed.getUTCDate() - 2);
+  return parsed.toISOString().slice(0, 10);
+}
+
+function weekendCryptoUnrealizedChange(
+  previous: Record<string, number>,
+  current: Record<string, number>,
+  holdingMarkets: Record<string, string>,
+) {
+  const holdingIds = new Set([...Object.keys(previous), ...Object.keys(current)]);
+  let change = 0;
+  for (const holdingId of holdingIds) {
+    if (holdingMarkets[holdingId]?.toUpperCase() !== "CRYPTO") continue;
+    change += (Number(current[holdingId]) || 0) - (Number(previous[holdingId]) || 0);
+  }
+  return change;
+}
+
+export function getDailyReturns(
+  events: PortfolioEvent[],
+  snapshots: PortfolioSnapshotInput[],
+  baseline?: PortfolioEventBaseline,
+  options: DailyReturnAttributionOptions = {},
+): DailyReturn[] {
   const eventByDate = aggregateEventsByDate(events, baseline);
   const snapshotByDate = new Map<string, PortfolioSnapshotInput>();
   for (const snapshot of snapshots) {
@@ -748,9 +785,13 @@ export function getDailyReturns(events: PortfolioEvent[], snapshots: PortfolioSn
     .sort((a, b) => a.date.localeCompare(b.date));
 
   const rows: DailyReturn[] = [];
+  const rowsByDate = new Map<string, DailyReturn>();
   let lastSnapshotIndex = 0;
   let lastTotalAsset = sortedSnapshots[0]?.totalAsset ?? 0;
   let lastUnrealizedPnl: number | undefined;
+  let lastHoldingUnrealizedPnl: Record<string, number> | undefined;
+  const holdingMarkets = options.holdingMarkets ?? {};
+  const hasCryptoHolding = Object.values(holdingMarkets).some((market) => market.toUpperCase() === "CRYPTO");
 
   for (const date of sortedDates) {
     const snapshot = snapshotByDate.get(date);
@@ -767,21 +808,50 @@ export function getDailyReturns(events: PortfolioEvent[], snapshots: PortfolioSn
     if (hasBreakdown) {
       lastUnrealizedPnl = currentUnrealized;
     }
+    const currentHoldingUnrealizedPnl = snapshot?.holdingUnrealizedPnl;
     const eventBreakdown = eventByDate.get(date) ?? { realizedTradingPnl: 0, dividendPnl: 0, transactionFeePnl: 0, taxPnl: 0, feePnl: 0 };
-    const totalPnl = unrealizedPnlChange + eventBreakdown.realizedTradingPnl + eventBreakdown.dividendPnl + eventBreakdown.feePnl;
-    rows.push({
+    const row: DailyReturn = {
       date,
       unrealizedPnlChange,
       realizedTradingPnl: eventBreakdown.realizedTradingPnl,
       dividendPnl: eventBreakdown.dividendPnl,
       feePnl: eventBreakdown.feePnl,
-      totalPnl,
+      totalPnl: unrealizedPnlChange + eventBreakdown.realizedTradingPnl + eventBreakdown.dividendPnl + eventBreakdown.feePnl,
       totalAsset: snapshot?.totalAsset ?? lastTotalAsset,
       currency: "CNY",
       incompleteBreakdown: !snapshot || !hasBreakdown || isInitialBaseline || snapshot.migratedBaseline || undefined,
       estimatedSnapshot: snapshot?.estimated || undefined,
       fxFallback: snapshot?.fxFallback || undefined,
-    });
+    };
+
+    if (options.attributeWeekendUnrealized && hasBreakdown && precedingWeekday(date) !== date) {
+      const target = rowsByDate.get(precedingWeekday(date));
+      let weekendCryptoChange: number | undefined;
+      if (!hasCryptoHolding) {
+        weekendCryptoChange = 0;
+      } else if (lastHoldingUnrealizedPnl && currentHoldingUnrealizedPnl) {
+        weekendCryptoChange = weekendCryptoUnrealizedChange(
+          lastHoldingUnrealizedPnl,
+          currentHoldingUnrealizedPnl,
+          holdingMarkets,
+        );
+      }
+      if (target && weekendCryptoChange !== undefined) {
+        const weekdayChange = unrealizedPnlChange - weekendCryptoChange;
+        target.unrealizedPnlChange += weekdayChange;
+        target.totalPnl += weekdayChange;
+        target.estimatedSnapshot = target.estimatedSnapshot || row.estimatedSnapshot || undefined;
+        target.fxFallback = target.fxFallback || row.fxFallback || undefined;
+        row.unrealizedPnlChange = weekendCryptoChange;
+        row.totalPnl = weekendCryptoChange + row.realizedTradingPnl + row.dividendPnl + row.feePnl;
+      }
+    }
+
+    rows.push(row);
+    rowsByDate.set(date, row);
+    if (currentHoldingUnrealizedPnl) {
+      lastHoldingUnrealizedPnl = currentHoldingUnrealizedPnl;
+    }
   }
   return rows;
 }

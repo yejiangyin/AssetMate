@@ -275,7 +275,10 @@ export function extractResearchSources(markdown: string, accessedAt = new Date()
 
 function extractNumericDataPoints(markdown: string): string[] {
   const points: string[] = [];
-  const tableRowPattern = /\|\s*([^|]+?)\s*\|\s*([0-9][0-9,]*\.?[0-9]*\s*[%亿万元$]?)\s*\|/g;
+  // Keep the sign in the sampled value. Reports commonly mix ASCII signs,
+  // Unicode minus/en-dash, and full-width signs; dropping the sign can turn a
+  // loss into a gain during manual audit.
+  const tableRowPattern = /\|\s*([^|]+?)\s*\|\s*([$￥]?[+\-−–－＋]?[0-9][0-9,，]*\.?[0-9]*\s*(?:万亿|亿|万|[BMKT]|[%xX倍]|元|美元|港元)?)\s*\|/gi;
   let match: RegExpExecArray | null;
   while ((match = tableRowPattern.exec(markdown))) {
     const label = match[1]!.trim();
@@ -288,8 +291,11 @@ function extractNumericDataPoints(markdown: string): string[] {
 }
 
 function parseChineseNumber(text: string): number | null {
-  const cleaned = text.replace(/[,，\s]/g, "");
-  const match = cleaned.match(/^([\d.]+)(万亿|亿|万|B|M|K|T|%)?$/i);
+  const cleaned = text
+    .replace(/[,，\s]/g, "")
+    .replace(/[−–－]/g, "-")
+    .replace(/＋/g, "+");
+  const match = cleaned.match(/^([+-]?[\d.]+)(万亿|亿|万|B|M|K|T|%)?$/i);
   if (!match) return null;
   const base = parseFloat(match[1]!);
   if (!Number.isFinite(base)) return null;

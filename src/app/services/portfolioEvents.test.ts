@@ -267,6 +267,81 @@ describe("migratePortfolioEvents", () => {
 });
 
 describe("return aggregations", () => {
+  test("attributes weekend security valuation changes to Friday", () => {
+    const daily = getDailyReturns([], [{
+      date: "2026-07-09",
+      totalAsset: 100,
+      todayPnl: 0,
+      cumulativePnl: 0,
+      unrealizedPnl: 0,
+      holdingUnrealizedPnl: { stock: 0 },
+    }, {
+      date: "2026-07-10",
+      totalAsset: 110,
+      todayPnl: 0,
+      cumulativePnl: 10,
+      unrealizedPnl: 10,
+      holdingUnrealizedPnl: { stock: 10 },
+    }, {
+      date: "2026-07-11",
+      totalAsset: 125,
+      todayPnl: 0,
+      cumulativePnl: 25,
+      unrealizedPnl: 25,
+      holdingUnrealizedPnl: { stock: 25 },
+    }], undefined, {
+      attributeWeekendUnrealized: true,
+      holdingMarkets: { stock: "US" },
+    });
+
+    assert.equal(daily.find((row) => row.date === "2026-07-10")?.totalPnl, 25);
+    assert.equal(daily.find((row) => row.date === "2026-07-11")?.totalPnl, 0);
+    assert.equal(daily.reduce((sum, row) => sum + row.totalPnl, 0), 25);
+  });
+
+  test("keeps crypto and realized events on weekends while moving security changes", () => {
+    const daily = getDailyReturns([{
+      id: "weekend-dividend",
+      date: "2026-07-11",
+      type: "cash_dividend",
+      amount: 3,
+      amountInBase: 3,
+      currency: "CNY",
+      source: "manual",
+      createdAt: "2026-07-11T00:00:00.000Z",
+    }], [{
+      date: "2026-07-09",
+      totalAsset: 200,
+      todayPnl: 0,
+      cumulativePnl: 0,
+      unrealizedPnl: 0,
+      holdingUnrealizedPnl: { stock: 0, crypto: 0 },
+    }, {
+      date: "2026-07-10",
+      totalAsset: 212,
+      todayPnl: 0,
+      cumulativePnl: 12,
+      unrealizedPnl: 12,
+      holdingUnrealizedPnl: { stock: 10, crypto: 2 },
+    }, {
+      date: "2026-07-11",
+      totalAsset: 235,
+      todayPnl: 0,
+      cumulativePnl: 35,
+      unrealizedPnl: 32,
+      holdingUnrealizedPnl: { stock: 25, crypto: 7 },
+    }], undefined, {
+      attributeWeekendUnrealized: true,
+      holdingMarkets: { stock: "US", crypto: "CRYPTO" },
+    });
+
+    assert.equal(daily.find((row) => row.date === "2026-07-10")?.totalPnl, 27);
+    assert.equal(daily.find((row) => row.date === "2026-07-11")?.unrealizedPnlChange, 5);
+    assert.equal(daily.find((row) => row.date === "2026-07-11")?.dividendPnl, 3);
+    assert.equal(daily.find((row) => row.date === "2026-07-11")?.totalPnl, 8);
+    assert.equal(daily.reduce((sum, row) => sum + row.totalPnl, 0), 35);
+  });
+
   test("aggregates daily, monthly, and yearly returns from snapshots and events", () => {
     const daily = getDailyReturns([{
       id: "sell1",

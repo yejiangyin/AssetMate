@@ -121,6 +121,23 @@ describe("financial rigor", () => {
     assert.equal(first.checks.find((check) => check.id === "sampled-data")?.detail, second.checks.find((check) => check.id === "sampled-data")?.detail);
   });
 
+  test("preserves ASCII, Unicode, and full-width signs in sampled financial data", () => {
+    const signedValues: Array<[string, string]> = [
+      ["-1.72%", "-1.72%"],
+      ["−2.5%", "−2.5%"],
+      ["–3.25亿", "–3.25亿"],
+      ["－4.5M", "－4.5M"],
+      ["＋5.75%", "＋5.75%"],
+    ];
+    for (const [reported, expected] of signedValues) {
+      const markdown = `数据截止日期：2026-07-27\n| 指标 | 数值 |\n| 净利润增长 | ${reported} |`;
+      const result = auditResearchReport({ markdown, dataCutoff: "2026-07-27" });
+      const sampled = result.checks.find((check) => check.id === "sampled-data");
+      assert.equal(sampled?.status, "pass");
+      assert.match(sampled?.detail ?? "", new RegExp(expected.replace(/[+]/g, "\\+")));
+    }
+  });
+
   test("rejects professional-data references that are outside the MCP trace", () => {
     const result = auditResearchReport({
       markdown: "数据截止日期：2026-07-20\n## 看多优势\n专业数据集 [D2]\n## 看空风险\n风险存在。",
