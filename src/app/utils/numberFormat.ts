@@ -32,8 +32,11 @@ export function formatSignedExactMoney(value: number, currency = "CNY", decimals
 
 export function formatPercent(value: number, decimals = 4, locale?: string) {
   if (!Number.isFinite(value)) return "—";
-  const sign = value < 0 || Object.is(value, -0) ? "-" : "+";
-  return `${sign}${(Math.abs(value) * 100).toLocaleString(locale, {
+  const precision = Math.max(0, decimals);
+  const zeroThreshold = 0.5 * 10 ** (-precision) / 100;
+  const normalized = Math.abs(value) < zeroThreshold ? 0 : value;
+  const sign = normalized > 0 ? "+" : normalized < 0 ? "-" : "";
+  return `${sign}${(Math.abs(normalized) * 100).toLocaleString(locale, {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   })}%`;

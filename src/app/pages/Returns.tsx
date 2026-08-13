@@ -22,6 +22,7 @@ import {
   emptyReturnBreakdown,
   getDailyReturns,
   getHoldingReturnContributions,
+  getModifiedDietzReturn,
   getMonthlyReturns,
   getYearlyReturns,
   mergeReturnBreakdowns,
@@ -32,7 +33,7 @@ import {
 } from "../services/portfolioEvents";
 import { convertCurrency, toCNY } from "../services/priceRefresher";
 import { formatPercent } from "../utils/numberFormat";
-import { breakdownBarWidth, formatCalendarMoney, formatCompactMoney, hasMeaningfulReturnData, returnEventValue } from "../utils/returnsPresentation";
+import { breakdownBarWidth, formatCalendarMoney, formatCompactMoney, hasMeaningfulReturnData, normalizeMoneyForDisplay, returnEventValue } from "../utils/returnsPresentation";
 import { RETURNS_RANKING_PREVIEW_LIMIT, getVisibleRanking } from "../utils/rankingVisibility";
 
 type ScopeMode = "week" | "month" | "year" | "all";
@@ -95,12 +96,14 @@ function sumRows(rows: ReturnRow[]) {
     dividendPnl: total.dividendPnl + row.dividendPnl,
     feePnl: total.feePnl + row.feePnl,
     totalPnl: total.totalPnl + row.totalPnl,
+    capitalFlow: total.capitalFlow + row.capitalFlow,
   }), {
     unrealizedPnlChange: 0,
     realizedTradingPnl: 0,
     dividendPnl: 0,
     feePnl: 0,
     totalPnl: 0,
+    capitalFlow: 0,
   });
 }
 
@@ -145,10 +148,6 @@ function priorTotalAsset(dailyRows: DailyReturn[], beforeDate: string): number {
   return asset;
 }
 
-function cellRate(totalPnl: number, startingAsset: number): number {
-  return startingAsset > 0 ? totalPnl / startingAsset : 0;
-}
-
 function hexToRgba(hex: string, alpha: number): string {
   const r = parseInt(hex.slice(1, 3), 16);
   const g = parseInt(hex.slice(3, 5), 16);
@@ -165,7 +164,7 @@ type GridCell = {
   key?: string;
   label: string;
   totalPnl: number;
-  rate: number;
+  rate: number | null;
   row?: ReturnRow;
   disabled?: boolean;
   isToday?: boolean;
@@ -243,6 +242,9 @@ export function Returns() {
       migratedBaseline: existingToday?.migratedBaseline
         || (!assetSnapshots.some((snapshot) => Number.isFinite(snapshot.unrealizedPnl)) ? true : undefined),
       holdingUnrealizedPnl,
+      holdingValuationDates: Object.fromEntries(holdings
+        .filter((holding) => /^\d{4}-\d{2}-\d{2}$/.test(holding.priceDate ?? ""))
+        .map((holding) => [holding.id, holding.priceDate!])),
     };
     return [...assetSnapshots.filter((snapshot) => snapshot.date !== today), currentSnapshot]
       .sort((a, b) => a.date.localeCompare(b.date));
@@ -333,14 +335,13 @@ export function Returns() {
   const trackingStart = dailyRows[0]?.date;
   const containsBaseline = selectedDailyRows.some((row) => row.incompleteBreakdown)
     && analysisSnapshots.some((snapshot) => snapshot.migratedBaseline && snapshot.date >= view.start && snapshot.date <= view.end);
-  const positiveDays = selectedDailyRows.filter((row) => row.totalPnl > 0).length;
-  const activeDays = selectedDailyRows.filter((row) =>
+  const qualityDailyRows = selectedDailyRows.filter((row) => !row.incompleteBreakdown);
+  const positiveDays = qualityDailyRows.filter((row) => row.totalPnl > 0).length;
+  const activeDays = qualityDailyRows.filter((row) =>
     row.unrealizedPnlChange || row.realizedTradingPnl || row.dividendPnl || row.feePnl
   ).length;
-  const startingAsset = selectedDailyRows[0]
-    ? Math.max(0, selectedDailyRows[0].totalAsset - selectedDailyRows[0].totalPnl)
-    : stats.costBasis;
-  const periodRate = startingAsset > 0 ? totals.totalPnl / startingAsset : 0;
+  const openingAsset = priorTotalAsset(dailyRows, view.start);
+  const periodRate = getModifiedDietzReturn(dailyRows, view.start, view.end);
   const realizedIncome = periodBreakdown.realizedTradingPnl + periodBreakdown.dividendPnl + periodBreakdown.feePnl;
 
   const sourceRows = [
@@ -367,10 +368,13 @@ export function Returns() {
     analysisSnapshots,
     view.start,
     view.end,
+    totals.totalPnl,
   ).map((row) => ({
     ...row,
-    ...(identityById.get(row.id) ?? { name: row.id, symbol: "-" }),
-  })), [analysisSnapshots, identityById, portfolioEvents, view.end, view.start]);
+    ...(row.id === "__unallocated__"
+      ? { name: language === "en" ? "Unallocated historical return" : "未归属历史收益", symbol: "—" }
+      : (identityById.get(row.id) ?? { name: row.id, symbol: "-" })),
+  })), [analysisSnapshots, identityById, language, portfolioEvents, totals.totalPnl, view.end, view.start]);
   const rankRows = useMemo(
     () => getVisibleRanking(allRankRows, rankingExpanded, RETURNS_RANKING_PREVIEW_LIMIT),
     [allRankRows, rankingExpanded],
@@ -393,7 +397,7 @@ export function Returns() {
           key: date,
           label: String(Number(date.slice(-2))),
           totalPnl: row?.totalPnl ?? 0,
-          rate: cellRate(row?.totalPnl ?? 0, startingAsset),
+          rate: row && !row.incompleteBreakdown && startingAsset > 0 ? row.totalPnl / startingAsset : null,
           row,
           disabled: date > today,
           isToday: date === today,
@@ -405,7 +409,7 @@ export function Returns() {
       const firstWeekday = (new Date(year, month - 1, 1).getDay() + 6) % 7;
       const days = new Date(year, month, 0).getDate();
       const rowByDate = new Map(selectedDailyRows.map((row) => [row.date, row]));
-      const blanks: GridCell[] = Array.from({ length: firstWeekday }, () => ({ blank: true, label: "", totalPnl: 0, rate: 0 }));
+      const blanks: GridCell[] = Array.from({ length: firstWeekday }, () => ({ blank: true, label: "", totalPnl: 0, rate: null }));
       const cells: GridCell[] = Array.from({ length: days }, (_, index) => {
         const day = index + 1;
         const date = `${view.key}-${String(day).padStart(2, "0")}`;
@@ -415,7 +419,7 @@ export function Returns() {
           key: date,
           label: String(day),
           totalPnl: row?.totalPnl ?? 0,
-          rate: cellRate(row?.totalPnl ?? 0, startingAsset),
+          rate: row && !row.incompleteBreakdown && startingAsset > 0 ? row.totalPnl / startingAsset : null,
           row,
           disabled: date > today,
           isToday: date === today,
@@ -428,12 +432,13 @@ export function Returns() {
       return Array.from({ length: 12 }, (_, index) => {
         const monthKey = `${view.key}-${String(index + 1).padStart(2, "0")}`;
         const row = rowByKey.get(monthKey);
-        const startingAsset = priorTotalAsset(dailyRows, `${monthKey}-01`);
         return {
           key: monthKey,
           label: formatMonthShort(monthKey, locale),
           totalPnl: row?.totalPnl ?? 0,
-          rate: cellRate(row?.totalPnl ?? 0, startingAsset),
+          rate: row && !row.incompleteBreakdown
+            ? getModifiedDietzReturn(dailyRows, `${monthKey}-01`, lastDayOfMonth(monthKey))
+            : null,
           row,
           disabled: `${monthKey}-01` > today,
         };
@@ -445,12 +450,13 @@ export function Returns() {
       return Array.from({ length: 10 }, (_, index) => {
         const yearKey = String(currentYearNum - 9 + index);
         const row = rowByKey.get(yearKey);
-        const startingAsset = priorTotalAsset(dailyRows, `${yearKey}-01-01`);
         return {
           key: yearKey,
           label: yearKey,
           totalPnl: row?.totalPnl ?? 0,
-          rate: cellRate(row?.totalPnl ?? 0, startingAsset),
+          rate: row && !row.incompleteBreakdown
+            ? getModifiedDietzReturn(dailyRows, `${yearKey}-01-01`, `${yearKey}-12-31`)
+            : null,
           row,
           disabled: `${yearKey}-01-01` > today,
         };
@@ -460,7 +466,9 @@ export function Returns() {
   }, [dailyRows, displayRows, locale, selectedDailyRows, today, view.key, view.level]);
 
   const displayValue = useCallback((value: number) => convertCurrency(value, "CNY", currency), [currency]);
-  const signedMoney = (value: number) => formatCompactMoney(displayValue(value), privacyMode, locale, currency);
+  const displayMoneyValue = (value: number) => normalizeMoneyForDisplay(displayValue(value));
+  const signedMoney = (value: number) => formatCompactMoney(displayMoneyValue(value), privacyMode, locale, currency);
+  const moneyColor = (value: number) => profitColor(displayMoneyValue(value));
   const handleDrill = (row: ReturnRow) => {
     if (view.level === "day") return;
     setPath((current) => [...current, rowKey(row)]);
@@ -652,17 +660,21 @@ export function Returns() {
 
         <section className="rounded-xl border border-app-accent/15 bg-app-surface p-3">
           <p className="text-[10px] text-tm">{scope === "all" && path.length === 0 ? copy.cumulativeReturn : copy.totalReturn}</p>
-          <p className="mt-0.5 break-words text-[25px] font-bold leading-tight" style={{ color: profitColor(totals.totalPnl) }}>
+          <p className="mt-0.5 break-words text-[25px] font-bold leading-tight" style={{ color: moneyColor(totals.totalPnl) }}>
             {signedMoney(totals.totalPnl)}
           </p>
           <div className="mt-3 grid grid-cols-3 gap-2 border-t border-app-border pt-2.5">
-            <Metric label={copy.periodRate} value={formatPercent(periodRate, 2, locale)} color={profitColor(periodRate)} />
-            <Metric label={copy.realizedIncome} value={signedMoney(realizedIncome)} color={profitColor(realizedIncome)} />
+            <Metric
+              label={copy.periodRate}
+              value={periodRate == null ? "—" : formatPercent(periodRate, 2, locale)}
+              color={periodRate == null ? "var(--text-muted)" : profitColor(periodRate)}
+            />
+            <Metric label={copy.realizedIncome} value={signedMoney(realizedIncome)} color={moneyColor(realizedIncome)} />
             <Metric label={copy.positiveDays} value={copy.dayCount(positiveDays, activeDays)} color="var(--text-secondary)" />
           </div>
           <div className="mt-2.5 grid grid-cols-2 gap-x-4 gap-y-1.5 border-t border-app-border pt-2.5">
             {sourceRows.map((row) => (
-              <DetailMetric key={row.key} label={row.label} value={signedMoney(row.value)} color={profitColor(row.value)} />
+              <DetailMetric key={row.key} label={row.label} value={signedMoney(row.value)} color={moneyColor(row.value)} />
             ))}
           </div>
         </section>
@@ -679,8 +691,9 @@ export function Returns() {
                   {gridCells.map((cell, index) => {
                     if (cell.blank) return <span key={`blank-${index}`} />;
                     const isDays = view.level === "days" || view.level === "week";
-                    const rawColor = cell.totalPnl !== 0 ? profitColor(cell.totalPnl) : "";
-                    const absRate = Math.min(Math.abs(cell.rate), 1);
+                    const displayedTotal = displayMoneyValue(cell.totalPnl);
+                    const rawColor = displayedTotal !== 0 ? profitColor(displayedTotal) : "";
+                    const absRate = Math.min(Math.abs(cell.rate ?? 0), 1);
                     const bgIntensity = 0.035 + absRate * 0.07;
                     return (
                       <button
@@ -694,7 +707,7 @@ export function Returns() {
                           minHeight: isDays ? 56 : 58,
                           background: cell.disabled
                             ? "transparent"
-                            : cell.totalPnl !== 0
+                            : displayedTotal !== 0
                               ? hexToRgba(rawColor, bgIntensity)
                               : "transparent",
                           opacity: cell.disabled ? 0.28 : 1,
@@ -715,9 +728,9 @@ export function Returns() {
                           className={`mt-1 block font-bold leading-tight break-words ${isDays ? "text-[9px]" : "text-[12px]"}`}
                           style={{ color: rawColor || "var(--text-micro)" }}
                         >
-                          {cell.row && cell.totalPnl !== 0 ? formatCalendarMoney(displayValue(cell.totalPnl), privacyMode, locale, currency) : "-"}
+                          {cell.row && displayedTotal !== 0 ? formatCalendarMoney(displayedTotal, privacyMode, locale, currency) : "-"}
                         </span>
-                        {cell.row && cell.totalPnl !== 0 && (
+                        {cell.row && displayedTotal !== 0 && cell.rate != null && (
                           <span
                             className={`mt-0.5 block leading-tight ${isDays ? "text-[8px]" : "text-[9px]"}`}
                             style={{ color: rawColor }}
@@ -749,7 +762,7 @@ export function Returns() {
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center justify-between gap-2">
                       <span className="truncate text-xs font-semibold text-tp">{formatRowTitle(row, locale)}</span>
-                      <span className="shrink-0 text-xs font-bold" style={{ color: profitColor(row.totalPnl) }}>{signedMoney(row.totalPnl)}</span>
+                      <span className="shrink-0 text-xs font-bold" style={{ color: moneyColor(row.totalPnl) }}>{signedMoney(row.totalPnl)}</span>
                     </div>
                     <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 text-[9px] text-tmi">
                       <DetailMetric label={copy.shortUnrealized} value={signedMoney(row.unrealizedPnlChange)} />
@@ -794,10 +807,11 @@ export function Returns() {
                     feePnl: 0,
                     totalPnl: 0,
                     totalAsset: 0,
+                    capitalFlow: 0,
                     currency: "CNY",
                   }, locale)}</span>
                   <span className="mt-1 block truncate text-[10px] font-bold" style={{ color: cell.row ? profitColor(cell.row.totalPnl) : "var(--text-micro)" }}>
-                    {cell.row && cell.row.totalPnl !== 0 ? formatCalendarMoney(displayValue(cell.row.totalPnl), privacyMode, locale, currency) : "-"}
+                    {cell.row && displayMoneyValue(cell.row.totalPnl) !== 0 ? formatCalendarMoney(displayMoneyValue(cell.row.totalPnl), privacyMode, locale, currency) : "-"}
                   </span>
                 </button>
               ))}
@@ -820,7 +834,7 @@ export function Returns() {
                     <p className="truncate text-xs font-semibold text-tp">{event.name || event.symbol || copy.eventType(event.type)}</p>
                     <p className="mt-0.5 text-[9px] text-tmi">{copy.eventType(event.type)}{event.symbol ? ` · ${event.symbol}` : ""}{view.level === "day" ? "" : ` · ${event.date}`}</p>
                   </div>
-                  <span className="shrink-0 text-xs font-bold" style={{ color: profitColor(value) }}>{signedMoney(value)}</span>
+                  <span className="shrink-0 text-xs font-bold" style={{ color: moneyColor(value) }}>{signedMoney(value)}</span>
                 </div>
               );
             })}
@@ -837,7 +851,7 @@ export function Returns() {
           <div className="overflow-hidden rounded-xl border border-app-border bg-app-card">
             {rankRows.map((row, index) => {
               const realized = row.realizedTradingPnl + row.dividendPnl + row.feePnl;
-              const contributionRate = startingAsset > 0 ? row.totalPnl / startingAsset : 0;
+              const contributionRate = openingAsset > 0 && periodRate != null ? row.totalPnl / openingAsset : null;
               return (
                 <div key={row.id} className="flex items-center gap-2 px-3 py-2.5" style={{ borderBottom: index < rankRows.length - 1 ? "1px solid var(--border)" : "none" }}>
                   <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-[9px] font-bold" style={{ color: index < 3 ? "#F59E0B" : "var(--text-micro)", background: index < 3 ? "rgba(245,158,11,0.10)" : "var(--bg-surface2)" }}>
@@ -850,9 +864,9 @@ export function Returns() {
                     </p>
                   </div>
                   <div className="shrink-0 text-right">
-                    <span className="block text-xs font-bold" style={{ color: profitColor(row.totalPnl) }}>{signedMoney(row.totalPnl)}</span>
-                    <span className="mt-0.5 block text-[9px] font-semibold" style={{ color: profitColor(contributionRate) }}>
-                      {copy.rankContribution} {formatPercent(contributionRate, 2, locale)}
+                    <span className="block text-xs font-bold" style={{ color: moneyColor(row.totalPnl) }}>{signedMoney(row.totalPnl)}</span>
+                    <span className="mt-0.5 block text-[9px] font-semibold" style={{ color: contributionRate == null ? "var(--text-muted)" : profitColor(contributionRate) }}>
+                      {copy.rankContribution} {contributionRate == null ? "—" : formatPercent(contributionRate, 2, locale)}
                     </span>
                   </div>
                 </div>

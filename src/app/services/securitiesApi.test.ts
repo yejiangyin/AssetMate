@@ -357,7 +357,10 @@ describe("fund quote history", () => {
   test("parses realtime fund estimates", async () => {
     await withMockFetch((async () => ({
       ok: true,
-      text: async () => 'jsonpgz({"name":"测试基金","jzrq":"2026-01-02","dwjz":"1.2345","gsz":"1.2500","gszzl":"1.25"})',
+      json: async () => ({ data: [{
+        FCODE: "006479", SHORTNAME: "测试基金", PDATE: "2026-01-02", NAV: 1.2345,
+        GSZ: 1.25, GSZZL: 1.25, GZTIME: "2026-01-05 14:30",
+      }] }),
     }) as Response) as typeof fetch, async () => {
       const estimate = await fetchCnFundEstimate("006479");
 
@@ -366,6 +369,34 @@ describe("fund quote history", () => {
       assert.equal(estimate?.officialNav, 1.2345);
       assert.equal(estimate?.estimatedNav, 1.25);
       assert.equal(estimate?.estimatedChangePercent, 1.25);
+      assert.equal(estimate?.estimateTime, "2026-01-05 14:30");
+    });
+  });
+
+  test("falls back to the secondary valuation host", async () => {
+    const requested: string[] = [];
+    await withMockFetch((async (input: string | URL | Request) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.includes("fundcomapi.tiantianfunds.com")) return { ok: false, status: 503 } as Response;
+      return {
+        ok: true,
+        json: async () => ({ data: [{ FCODE: "006479", PDATE: "2026-01-02", NAV: 1.2, GSZ: 1.21, GSZZL: 0.83 }] }),
+      } as Response;
+    }) as typeof fetch, async () => {
+      assert.equal((await fetchCnFundEstimate("006479"))?.estimatedNav, 1.21);
+      assert.ok(requested.some((url) => url.includes("fundcomapi.eastmoney.com")));
+    });
+  });
+
+  test("keeps official NAV when the replacement endpoint publishes no estimate", async () => {
+    await withMockFetch((async () => ({
+      ok: true,
+      json: async () => ({ data: [{ FCODE: "006479", PDATE: "2026-01-02", NAV: 1.2, GSZ: null, GSZZL: null }] }),
+    }) as Response) as typeof fetch, async () => {
+      const estimate = await fetchCnFundEstimate("006479");
+      assert.equal(estimate?.officialNav, 1.2);
+      assert.equal(Number.isNaN(estimate?.estimatedNav), true);
     });
   });
 

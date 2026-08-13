@@ -25,6 +25,9 @@ describe("numberFormat", () => {
     assert.equal(formatExactNumber(1234.5678, 2, 1, "en-US"), "1,234.57");
     assert.equal(formatSignedExactMoney(12.3, "USD", 2), "+$12.30");
     assert.equal(formatSignedExactMoney(-12.3, "CNY", 1), "-¥12.3");
+    assert.equal(formatPercent(0, 2, "zh-CN"), "0.00%");
+    assert.equal(formatPercent(0.0000001, 2, "zh-CN"), "0.00%");
+    assert.equal(formatPercent(-0, 2, "zh-CN"), "0.00%");
   });
 });
 

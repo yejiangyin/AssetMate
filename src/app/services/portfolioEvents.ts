@@ -18,6 +18,8 @@ export type PortfolioEventSource = "manual" | "auto" | "import" | "system" | "mi
 export interface PortfolioEvent {
   id: string;
   date: string;
+  /** Cash settlement date when it differs from the return recognition date. */
+  settlementDate?: string;
   holdingId?: string;
   /** Snapshot of the group at event time so history remains filterable after close/delete. */
   groupId?: string;
@@ -30,6 +32,16 @@ export interface PortfolioEvent {
   price?: number;
   amount: number;
   amountInBase: number;
+  fxRateToBase?: number;
+  fxRateEstimated?: boolean;
+  /**
+   * Change in capital represented by this event in the portfolio base
+   * currency. Buys are positive contributions and sales are negative
+   * withdrawals because the app currently tracks invested positions rather
+   * than a brokerage cash balance.
+   */
+  capitalFlowInBase?: number;
+  capitalFlowIncomplete?: boolean;
   currency: string;
   source: PortfolioEventSource;
   corporateActionId?: string;
@@ -51,11 +63,15 @@ export interface ReturnBreakdown {
   taxPnl: number;
   /** Aggregate of transactionFeePnl and taxPnl for snapshot compatibility. */
   feePnl: number;
+  /** Position-account contribution (+) or withdrawal (-), not investment P/L. */
+  capitalFlow?: number;
 }
 
 export interface PortfolioEventBaseline {
   daily: Record<string, ReturnBreakdown>;
   realizedCostBasis: number;
+  /** Dates before this boundary cannot be position-reconstructed after compaction. */
+  positionHistoryStart?: string;
 }
 
 export interface PortfolioSnapshotInput {
@@ -73,6 +89,8 @@ export interface PortfolioSnapshotInput {
   estimateReason?: "historical_backfill";
   fxFallback?: boolean;
   holdingUnrealizedPnl?: Record<string, number>;
+  /** Actual source valuation date for each holding, used for market-day attribution. */
+  holdingValuationDates?: Record<string, string>;
 }
 
 export interface DailyReturn {
@@ -83,10 +101,12 @@ export interface DailyReturn {
   feePnl: number;
   totalPnl: number;
   totalAsset: number;
+  capitalFlow: number;
   currency: "CNY";
   incompleteBreakdown?: boolean;
   estimatedSnapshot?: boolean;
   fxFallback?: boolean;
+  valuationSpanDays?: number;
 }
 
 export interface DailyReturnAttributionOptions {
@@ -106,6 +126,7 @@ export interface MonthlyReturn {
   dividendPnl: number;
   feePnl: number;
   totalPnl: number;
+  capitalFlow: number;
   currency: "CNY";
   incompleteBreakdown?: boolean;
 }
@@ -117,6 +138,7 @@ export interface YearlyReturn {
   dividendPnl: number;
   feePnl: number;
   totalPnl: number;
+  capitalFlow: number;
   currency: "CNY";
   incompleteBreakdown?: boolean;
 }
@@ -163,7 +185,7 @@ const DIVIDEND_EVENT_TYPES = new Set<PortfolioEventType>([
 export const MAX_PORTFOLIO_EVENTS = 5000;
 
 export function emptyReturnBreakdown(): ReturnBreakdown {
-  return { realizedTradingPnl: 0, dividendPnl: 0, transactionFeePnl: 0, taxPnl: 0, feePnl: 0 };
+  return { realizedTradingPnl: 0, dividendPnl: 0, transactionFeePnl: 0, taxPnl: 0, feePnl: 0, capitalFlow: 0 };
 }
 
 export function normalizePortfolioEventBaseline(raw: unknown): PortfolioEventBaseline {
@@ -178,11 +200,17 @@ export function normalizePortfolioEventBaseline(raw: unknown): PortfolioEventBas
         dividendPnl: finiteNumber(row.dividendPnl),
         transactionFeePnl: finiteNumber(row.transactionFeePnl),
         taxPnl: finiteNumber(row.taxPnl),
-        feePnl: finiteNumber(row.feePnl),
+        feePnl: Number.isFinite(row.feePnl)
+          ? finiteNumber(row.feePnl)
+          : finiteNumber(row.transactionFeePnl) + finiteNumber(row.taxPnl),
+        capitalFlow: finiteNumber(row.capitalFlow),
       };
     }
   }
-  return { daily, realizedCostBasis: Math.max(0, finiteNumber(candidate.realizedCostBasis)) };
+  const positionHistoryStart = typeof candidate.positionHistoryStart === "string" && isValidYmd(candidate.positionHistoryStart)
+    ? candidate.positionHistoryStart
+    : undefined;
+  return { daily, realizedCostBasis: Math.max(0, finiteNumber(candidate.realizedCostBasis)), positionHistoryStart };
 }
 
 export function mergeReturnBreakdowns(a: ReturnBreakdown, b: ReturnBreakdown): ReturnBreakdown {
@@ -192,6 +220,7 @@ export function mergeReturnBreakdowns(a: ReturnBreakdown, b: ReturnBreakdown): R
     transactionFeePnl: a.transactionFeePnl + b.transactionFeePnl,
     taxPnl: a.taxPnl + b.taxPnl,
     feePnl: a.feePnl + b.feePnl,
+    capitalFlow: finiteNumber(a.capitalFlow) + finiteNumber(b.capitalFlow),
   };
 }
 
@@ -202,11 +231,20 @@ function finiteNumber(value: unknown, fallback = 0) {
 
 export function ymdFromEventValue(value: unknown, fallback = new Date()) {
   const match = String(value ?? "").match(/^\d{4}-\d{2}-\d{2}/);
-  if (match) return match[0]!;
+  if (match) {
+    const parsed = new Date(`${match[0]}T00:00:00.000Z`);
+    if (Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === match[0]) return match[0]!;
+  }
   const year = fallback.getFullYear();
   const month = String(fallback.getMonth() + 1).padStart(2, "0");
   const day = String(fallback.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function isValidYmd(value: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
 export function amountInBase(amount: number, currency: string) {
@@ -245,6 +283,11 @@ export function compactPortfolioEventHistory(
     if (event.type === "sell") {
       baseline.realizedCostBasis += amountInBase(event.costBasisAtEvent ?? 0, event.currency);
     }
+    if (["buy", "sell", "dividend_reinvest", "share_dividend", "split"].includes(event.type)) {
+      baseline.positionHistoryStart = !baseline.positionHistoryStart || event.date > baseline.positionHistoryStart
+        ? event.date
+        : baseline.positionHistoryStart;
+    }
   }
   return { events: sorted.slice(-maxEvents), baseline };
 }
@@ -260,12 +303,35 @@ export function normalizePortfolioEvent(raw: Partial<PortfolioEvent> & Record<st
   if (!raw || typeof raw.id !== "string" || !raw.id) return null;
   const type = raw.type as PortfolioEventType;
   if (!EVENT_TYPES.has(type)) return null;
-  const amount = finiteNumber(raw.amount);
+  if (typeof raw.date !== "string" || !isValidYmd(raw.date.slice(0, 10))) return null;
+  const rawAmount = finiteNumber(raw.amount);
+  const amount = type === "fee" || type === "tax"
+    ? -Math.abs(rawAmount)
+    : ["cash_dividend", "dividend_reinvest", "interest", "bond_coupon", "buy"].includes(type)
+      ? Math.abs(rawAmount)
+      : rawAmount;
   const currency = typeof raw.currency === "string" && raw.currency ? raw.currency : "CNY";
   const date = ymdFromEventValue(raw.date);
+  const rawAmountInBase = Number.isFinite(raw.amountInBase) ? Number(raw.amountInBase) : amountInBase(amount, currency);
+  const normalizedAmountInBase = type === "fee" || type === "tax"
+    ? -Math.abs(rawAmountInBase)
+    : ["cash_dividend", "dividend_reinvest", "interest", "bond_coupon", "buy"].includes(type)
+      ? Math.abs(rawAmountInBase)
+      : rawAmountInBase;
+  const fxRateToBase = Number.isFinite(raw.fxRateToBase) && Number(raw.fxRateToBase) > 0
+    ? Number(raw.fxRateToBase)
+    : amount !== 0 && currency.toUpperCase() !== "CNY"
+      ? Math.abs(normalizedAmountInBase / amount)
+      : undefined;
+  const normalizedProceeds = Number.isFinite(raw.proceeds)
+    ? Number(raw.proceeds)
+    : Math.max(0, finiteNumber(raw.quantity) * finiteNumber(raw.price));
   return {
     id: raw.id,
     date,
+    settlementDate: typeof raw.settlementDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(raw.settlementDate)
+      ? raw.settlementDate
+      : undefined,
     holdingId: typeof raw.holdingId === "string" ? raw.holdingId : undefined,
     groupId: typeof raw.groupId === "string" ? raw.groupId : undefined,
     symbol: typeof raw.symbol === "string" ? raw.symbol : undefined,
@@ -276,7 +342,18 @@ export function normalizePortfolioEvent(raw: Partial<PortfolioEvent> & Record<st
     quantity: Number.isFinite(raw.quantity) ? Number(raw.quantity) : undefined,
     price: Number.isFinite(raw.price) ? Number(raw.price) : undefined,
     amount,
-    amountInBase: Number.isFinite(raw.amountInBase) ? Number(raw.amountInBase) : amountInBase(amount, currency),
+    amountInBase: normalizedAmountInBase,
+    fxRateToBase,
+    fxRateEstimated: raw.fxRateEstimated === true
+      || (currency.toUpperCase() !== "CNY" && date !== ymdFromEventValue(undefined)),
+    capitalFlowInBase: Number.isFinite(raw.capitalFlowInBase)
+      ? Number(raw.capitalFlowInBase)
+      : type === "buy"
+        ? (Number.isFinite(raw.amountInBase) ? Number(raw.amountInBase) : amountInBase(amount, currency))
+        : type === "sell"
+          ? -amountInBase(normalizedProceeds, currency)
+          : undefined,
+    capitalFlowIncomplete: type === "sell" && !(normalizedProceeds > 0) ? true : undefined,
     currency,
     source: ["manual", "auto", "import", "system", "migration"].includes(String(raw.source))
       ? raw.source as PortfolioEventSource
@@ -285,7 +362,7 @@ export function normalizePortfolioEvent(raw: Partial<PortfolioEvent> & Record<st
     corporateActionKind: raw.corporateActionKind === "share_bonus_transfer" ? "share_bonus_transfer" : undefined,
     relatedEventId: typeof raw.relatedEventId === "string" ? raw.relatedEventId : undefined,
     costBasisAtEvent: Number.isFinite(raw.costBasisAtEvent) ? Number(raw.costBasisAtEvent) : undefined,
-    proceeds: Number.isFinite(raw.proceeds) ? Number(raw.proceeds) : undefined,
+    proceeds: type === "sell" && normalizedProceeds > 0 ? normalizedProceeds : undefined,
     note: typeof raw.note === "string" ? raw.note : undefined,
     rateUsed: Number.isFinite(raw.rateUsed) ? Number(raw.rateUsed) : undefined,
     minimumFeeUsed: Number.isFinite(raw.minimumFeeUsed) ? Number(raw.minimumFeeUsed) : undefined,
@@ -316,13 +393,23 @@ function eventIdentityForHolding(holding: Holding) {
 }
 
 function eventFromCorporateAction(holding: Holding, action: CorporateActionLike, source: PortfolioEventSource): PortfolioEvent | null {
-  const date = ymdFromEventValue(action.payDate || action.exDate || action.date);
+  const recognizesOnExDate = action.type === "cash_dividend"
+    || action.type === "dividend_reinvest"
+    || action.type === "share_dividend"
+    || action.type === "split";
+  const date = ymdFromEventValue(recognizesOnExDate
+    ? (action.exDate || action.date || action.payDate)
+    : (action.payDate || action.date || action.exDate));
+  const settlementDate = action.payDate && action.payDate !== date
+    ? ymdFromEventValue(action.payDate)
+    : undefined;
   const corporateActionKind: PortfolioEvent["corporateActionKind"] = action.type === "split" && action.source === "eastmoney-stock"
     ? "share_bonus_transfer"
     : undefined;
   const base = {
     ...eventIdentityForHolding(holding),
     date,
+    settlementDate,
     source,
     corporateActionId: action.id,
     corporateActionKind,
@@ -331,6 +418,8 @@ function eventFromCorporateAction(holding: Holding, action: CorporateActionLike,
     minimumFeeUsed: action.minimumFeeUsed,
     estimatedAmount: action.estimatedAmount,
     createdAt: `${date}T00:00:00.000Z`,
+    fxRateToBase: holding.currency.toUpperCase() === "CNY" ? 1 : amountInBase(1, holding.currency),
+    fxRateEstimated: holding.currency.toUpperCase() !== "CNY" && date !== ymdFromEventValue(undefined),
   };
   const reinvest = action.type === "share_dividend" &&
     /dividend\s*reinvest|红利再投/i.test(action.note ?? "") &&
@@ -454,6 +543,7 @@ export function buildBuyEvent(
 ): PortfolioEvent {
   const date = ymdFromEventValue(input.date);
   const amount = input.quantity * input.price;
+  const amountBase = amountInBase(amount, holding.currency);
   return {
     id: `${input.source ?? "manual"}:buy:${holding.id}:${date}:${input.quantity}:${input.price}:${input.relatedEventId ?? Date.now()}`,
     date,
@@ -462,7 +552,10 @@ export function buildBuyEvent(
     quantity: input.quantity,
     price: input.price,
     amount,
-    amountInBase: amountInBase(amount, holding.currency),
+    amountInBase: amountBase,
+    capitalFlowInBase: amountBase,
+    fxRateToBase: amount > 0 ? amountBase / amount : undefined,
+    fxRateEstimated: holding.currency.toUpperCase() !== "CNY" && date !== ymdFromEventValue(undefined),
     currency: holding.currency,
     source: input.source ?? "manual",
     relatedEventId: input.relatedEventId,
@@ -479,6 +572,7 @@ export function buildSellEvent(
   const costBasisAtEvent = sellQuantity * holding.costPrice;
   const proceeds = sellQuantity * input.price;
   const amount = proceeds - costBasisAtEvent;
+  const amountBase = amountInBase(amount, holding.currency);
   return {
     id: `${input.source ?? "manual"}:sell:${holding.id}:${date}:${sellQuantity}:${input.price}:${input.relatedEventId ?? Date.now()}`,
     date,
@@ -487,7 +581,10 @@ export function buildSellEvent(
     quantity: sellQuantity,
     price: input.price,
     amount,
-    amountInBase: amountInBase(amount, holding.currency),
+    amountInBase: amountBase,
+    capitalFlowInBase: -amountInBase(proceeds, holding.currency),
+    fxRateToBase: amount !== 0 ? amountBase / amount : undefined,
+    fxRateEstimated: holding.currency.toUpperCase() !== "CNY" && date !== ymdFromEventValue(undefined),
     currency: holding.currency,
     source: input.source ?? "manual",
     relatedEventId: input.relatedEventId,
@@ -576,6 +673,7 @@ export function migratePortfolioEvents(
         price: closed.closePrice,
         amount: sellAmount,
         amountInBase: amountInBase(sellAmount, closed.currency),
+        capitalFlowInBase: -amountInBase(closed.proceeds, closed.currency),
         currency: closed.currency,
         source: "migration",
         relatedEventId: closed.id,
@@ -691,6 +789,7 @@ export function migratePortfolioEvents(
       price: price || undefined,
       amount: amount > 0 ? amount : quantity * price,
       amountInBase: amountInBase(amount > 0 ? amount : quantity * price, holding?.currency ?? "CNY"),
+      capitalFlowInBase: amountInBase(amount > 0 ? amount : quantity * price, holding?.currency ?? "CNY"),
       currency: holding?.currency ?? "CNY",
       source: "migration",
       relatedEventId: execution.id,
@@ -704,6 +803,11 @@ export function migratePortfolioEvents(
 
 export function computeReturnBreakdown(events: PortfolioEvent[]): ReturnBreakdown {
   return events.reduce<ReturnBreakdown>((acc, event) => {
+    if (event.type === "buy") acc.capitalFlow = finiteNumber(acc.capitalFlow) + finiteNumber(event.capitalFlowInBase, event.amountInBase);
+    if (event.type === "sell") acc.capitalFlow = finiteNumber(acc.capitalFlow) + finiteNumber(
+      event.capitalFlowInBase,
+      -amountInBase(finiteNumber(event.proceeds), event.currency),
+    );
     if (event.type === "sell") acc.realizedTradingPnl += event.amountInBase;
     if (event.type === "cash_dividend" || event.type === "dividend_reinvest" || event.type === "interest" || event.type === "bond_coupon") {
       acc.dividendPnl += event.amountInBase;
@@ -717,7 +821,7 @@ export function computeReturnBreakdown(events: PortfolioEvent[]): ReturnBreakdow
       acc.feePnl += event.amountInBase;
     }
     return acc;
-  }, { realizedTradingPnl: 0, dividendPnl: 0, transactionFeePnl: 0, taxPnl: 0, feePnl: 0 });
+  }, { realizedTradingPnl: 0, dividendPnl: 0, transactionFeePnl: 0, taxPnl: 0, feePnl: 0, capitalFlow: 0 });
 }
 
 function aggregateEventsByDate(events: PortfolioEvent[], baseline?: PortfolioEventBaseline) {
@@ -726,13 +830,14 @@ function aggregateEventsByDate(events: PortfolioEvent[], baseline?: PortfolioEve
     map.set(date, { ...row });
   }
   for (const event of events) {
-    const bucket = map.get(event.date) ?? { realizedTradingPnl: 0, dividendPnl: 0, transactionFeePnl: 0, taxPnl: 0, feePnl: 0 };
+    const bucket = map.get(event.date) ?? emptyReturnBreakdown();
     const single = computeReturnBreakdown([event]);
     bucket.realizedTradingPnl += single.realizedTradingPnl;
     bucket.dividendPnl += single.dividendPnl;
     bucket.transactionFeePnl += single.transactionFeePnl;
     bucket.taxPnl += single.taxPnl;
     bucket.feePnl += single.feePnl;
+    bucket.capitalFlow = finiteNumber(bucket.capitalFlow) + finiteNumber(single.capitalFlow);
     map.set(event.date, bucket);
   }
   return map;
@@ -767,6 +872,8 @@ export function getDailyReturns(
   options: DailyReturnAttributionOptions = {},
 ): DailyReturn[] {
   const eventByDate = aggregateEventsByDate(events, baseline);
+  const estimatedFxDates = new Set(events.filter((event) => event.fxRateEstimated).map((event) => event.date));
+  const incompleteCapitalFlowDates = new Set(events.filter((event) => event.capitalFlowIncomplete).map((event) => event.date));
   const snapshotByDate = new Map<string, PortfolioSnapshotInput>();
   for (const snapshot of snapshots) {
     if (snapshot.date && Number.isFinite(snapshot.totalAsset)) {
@@ -787,8 +894,9 @@ export function getDailyReturns(
   const rows: DailyReturn[] = [];
   const rowsByDate = new Map<string, DailyReturn>();
   let lastSnapshotIndex = 0;
-  let lastTotalAsset = sortedSnapshots[0]?.totalAsset ?? 0;
+  let lastTotalAsset = 0;
   let lastUnrealizedPnl: number | undefined;
+  let lastValuationDate: string | undefined;
   let lastHoldingUnrealizedPnl: Record<string, number> | undefined;
   const holdingMarkets = options.holdingMarkets ?? {};
   const hasCryptoHolding = Object.values(holdingMarkets).some((market) => market.toUpperCase() === "CRYPTO");
@@ -802,14 +910,18 @@ export function getDailyReturns(
     const hasBreakdown = Number.isFinite(snapshot?.unrealizedPnl);
     const currentUnrealized = hasBreakdown ? snapshot!.unrealizedPnl! : undefined;
     const isInitialBaseline = hasBreakdown && lastUnrealizedPnl === undefined;
+    const valuationSpanDays = hasBreakdown && lastValuationDate
+      ? Math.max(1, Math.round((Date.parse(`${date}T00:00:00.000Z`) - Date.parse(`${lastValuationDate}T00:00:00.000Z`)) / 86_400_000))
+      : undefined;
     const unrealizedPnlChange = hasBreakdown
       ? isInitialBaseline ? 0 : currentUnrealized! - lastUnrealizedPnl!
       : 0;
     if (hasBreakdown) {
       lastUnrealizedPnl = currentUnrealized;
+      lastValuationDate = date;
     }
     const currentHoldingUnrealizedPnl = snapshot?.holdingUnrealizedPnl;
-    const eventBreakdown = eventByDate.get(date) ?? { realizedTradingPnl: 0, dividendPnl: 0, transactionFeePnl: 0, taxPnl: 0, feePnl: 0 };
+    const eventBreakdown = eventByDate.get(date) ?? emptyReturnBreakdown();
     const row: DailyReturn = {
       date,
       unrealizedPnlChange,
@@ -818,13 +930,15 @@ export function getDailyReturns(
       feePnl: eventBreakdown.feePnl,
       totalPnl: unrealizedPnlChange + eventBreakdown.realizedTradingPnl + eventBreakdown.dividendPnl + eventBreakdown.feePnl,
       totalAsset: snapshot?.totalAsset ?? lastTotalAsset,
+      capitalFlow: finiteNumber(eventBreakdown.capitalFlow),
       currency: "CNY",
-      incompleteBreakdown: !snapshot || !hasBreakdown || isInitialBaseline || snapshot.migratedBaseline || undefined,
+      incompleteBreakdown: !snapshot || !hasBreakdown || isInitialBaseline || snapshot.migratedBaseline || estimatedFxDates.has(date) || incompleteCapitalFlowDates.has(date) || (valuationSpanDays ?? 1) > 1 || undefined,
       estimatedSnapshot: snapshot?.estimated || undefined,
-      fxFallback: snapshot?.fxFallback || undefined,
+      fxFallback: snapshot?.fxFallback || estimatedFxDates.has(date) || undefined,
+      valuationSpanDays: (valuationSpanDays ?? 1) > 1 ? valuationSpanDays : undefined,
     };
 
-    if (options.attributeWeekendUnrealized && hasBreakdown && precedingWeekday(date) !== date) {
+    if (options.attributeWeekendUnrealized && hasBreakdown && !snapshot?.holdingValuationDates && precedingWeekday(date) !== date) {
       const target = rowsByDate.get(precedingWeekday(date));
       let weekendCryptoChange: number | undefined;
       if (!hasCryptoHolding) {
@@ -844,6 +958,34 @@ export function getDailyReturns(
         target.fxFallback = target.fxFallback || row.fxFallback || undefined;
         row.unrealizedPnlChange = weekendCryptoChange;
         row.totalPnl = weekendCryptoChange + row.realizedTradingPnl + row.dividendPnl + row.feePnl;
+      }
+    }
+
+    // Prefer the quote/NAV's actual valuation date over the local refresh date.
+    // This correctly maps US Monday close observed in China on Tuesday back to
+    // Monday and also handles non-weekend timezone shifts. Crypto remains on
+    // its continuously traded local observation day.
+    if (lastHoldingUnrealizedPnl && currentHoldingUnrealizedPnl && snapshot?.holdingValuationDates) {
+      for (const [holdingId, currentValue] of Object.entries(currentHoldingUnrealizedPnl)) {
+        if (holdingMarkets[holdingId]?.toUpperCase() === "CRYPTO") continue;
+        const storedValuationDate = snapshot.holdingValuationDates[holdingId];
+        // Older backfills and live fund estimates could stamp a carried quote
+        // with the Saturday/Sunday observation date. Non-crypto securities do
+        // not have a weekend valuation, so normalize legacy data while reading
+        // it; this repairs already-persisted snapshots without rewriting the
+        // user's event ledger.
+        const valuationDate = storedValuationDate && precedingWeekday(storedValuationDate) !== storedValuationDate
+          ? precedingWeekday(storedValuationDate)
+          : storedValuationDate;
+        if (!valuationDate || valuationDate >= date) continue;
+        const target = rowsByDate.get(valuationDate);
+        if (!target) continue;
+        const change = finiteNumber(currentValue) - finiteNumber(lastHoldingUnrealizedPnl[holdingId]);
+        if (!change) continue;
+        target.unrealizedPnlChange += change;
+        target.totalPnl += change;
+        row.unrealizedPnlChange -= change;
+        row.totalPnl -= change;
       }
     }
 
@@ -867,6 +1009,7 @@ export function getMonthlyReturns(daily: DailyReturn[]): MonthlyReturn[] {
       dividendPnl: 0,
       feePnl: 0,
       totalPnl: 0,
+      capitalFlow: 0,
       currency: "CNY",
       incompleteBreakdown: undefined,
     };
@@ -875,6 +1018,7 @@ export function getMonthlyReturns(daily: DailyReturn[]): MonthlyReturn[] {
     current.dividendPnl += row.dividendPnl;
     current.feePnl += row.feePnl;
     current.totalPnl += row.totalPnl;
+    current.capitalFlow += row.capitalFlow;
     current.incompleteBreakdown = current.incompleteBreakdown || row.incompleteBreakdown || undefined;
     map.set(month, current);
   }
@@ -892,6 +1036,7 @@ export function getYearlyReturns(daily: DailyReturn[]): YearlyReturn[] {
       dividendPnl: 0,
       feePnl: 0,
       totalPnl: 0,
+      capitalFlow: 0,
       currency: "CNY",
       incompleteBreakdown: undefined,
     };
@@ -900,10 +1045,45 @@ export function getYearlyReturns(daily: DailyReturn[]): YearlyReturn[] {
     current.dividendPnl += row.dividendPnl;
     current.feePnl += row.feePnl;
     current.totalPnl += row.totalPnl;
+    current.capitalFlow += row.capitalFlow;
     current.incompleteBreakdown = current.incompleteBreakdown || row.incompleteBreakdown || undefined;
     map.set(year, current);
   }
   return [...map.values()].sort((a, b) => a.year.localeCompare(b.year));
+}
+
+/**
+ * Calculates a position-account Modified Dietz return. Until the application
+ * has a brokerage cash ledger, buys are treated as contributions and sales as
+ * withdrawals. A missing result means the stored valuations are not complete
+ * enough to support a defensible percentage.
+ */
+export function getModifiedDietzReturn(
+  daily: DailyReturn[],
+  startDate: string,
+  endDate: string,
+): number | null {
+  const selected = daily.filter((row) => row.date >= startDate && row.date <= endDate);
+  if (!selected.length || selected.some((row) => row.incompleteBreakdown)) return null;
+  const prior = daily.filter((row) => row.date < startDate && row.totalAsset > 0).at(-1);
+  if (!prior) return null;
+  const openingAsset = prior.totalAsset;
+  if (!(openingAsset > 0)) return null;
+
+  const startMs = Date.parse(`${startDate}T00:00:00.000Z`);
+  const endMs = Date.parse(`${endDate}T00:00:00.000Z`);
+  const totalDays = Math.max(1, Math.round((endMs - startMs) / 86_400_000) + 1);
+  let weightedCapital = 0;
+  let totalPnl = 0;
+  for (const row of selected) {
+    totalPnl += row.totalPnl;
+    if (!row.capitalFlow) continue;
+    const elapsedDays = Math.max(0, Math.round((Date.parse(`${row.date}T00:00:00.000Z`) - startMs) / 86_400_000));
+    const weight = Math.max(0, Math.min(1, (totalDays - elapsedDays) / totalDays));
+    weightedCapital += row.capitalFlow * weight;
+  }
+  const denominator = openingAsset + weightedCapital;
+  return denominator > 0 ? totalPnl / denominator : null;
 }
 
 export function getHoldingReturnContributions(
@@ -911,6 +1091,7 @@ export function getHoldingReturnContributions(
   snapshots: PortfolioSnapshotInput[],
   startDate: string,
   endDate: string,
+  expectedTotal?: number,
 ): HoldingReturnContribution[] {
   const mappedSnapshots = snapshots
     .filter((snapshot) => (
@@ -970,11 +1151,28 @@ export function getHoldingReturnContributions(
     current.feePnl += breakdown.feePnl;
   }
 
-  return [...result.values()]
+  const rows = [...result.values()]
     .map((row) => ({
       ...row,
       totalPnl: row.unrealizedPnlChange + row.realizedTradingPnl + row.dividendPnl + row.feePnl,
     }))
-    .filter((row) => Number.isFinite(row.totalPnl) && row.totalPnl !== 0)
-    .sort((a, b) => b.totalPnl - a.totalPnl);
+    .filter((row) => Number.isFinite(row.totalPnl) && row.totalPnl !== 0);
+  if (Number.isFinite(expectedTotal)) {
+    const assigned = rows.reduce((sum, row) => sum + row.totalPnl, 0);
+    const residual = finiteNumber(expectedTotal) - assigned;
+    if (Math.abs(residual) > 0.005) {
+      rows.push({
+        id: "__unallocated__",
+        unrealizedPnlChange: residual,
+        realizedTradingPnl: 0,
+        dividendPnl: 0,
+        transactionFeePnl: 0,
+        taxPnl: 0,
+        feePnl: 0,
+        totalPnl: residual,
+        incompleteBreakdown: true,
+      });
+    }
+  }
+  return rows.sort((a, b) => b.totalPnl - a.totalPnl);
 }

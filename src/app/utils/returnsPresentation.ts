@@ -26,19 +26,27 @@ function currencySymbol(currency: string) {
   return `${currency} `;
 }
 
+/** Values below half a cent render as an exact, unsigned zero. */
+export function normalizeMoneyForDisplay(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.abs(value) < 0.005 ? 0 : value;
+}
+
 export function formatCompactMoney(value: number, privacyMode: boolean, locale: string, currency = "CNY") {
-  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
+  const normalized = normalizeMoneyForDisplay(value);
+  const sign = normalized > 0 ? "+" : normalized < 0 ? "-" : "";
   const symbol = currencySymbol(currency);
   if (privacyMode) return `${sign}${symbol}--`;
-  const absolute = Math.abs(value);
+  const absolute = Math.abs(normalized);
   return `${sign}${symbol}${absolute.toLocaleString(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 export function formatCalendarMoney(value: number, privacyMode: boolean, locale: string, currency = "CNY") {
-  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
+  const normalized = normalizeMoneyForDisplay(value);
+  const sign = normalized > 0 ? "+" : normalized < 0 ? "-" : "";
   const symbol = currencySymbol(currency);
   if (privacyMode) return `${symbol}--`;
-  const absolute = Math.abs(value);
+  const absolute = Math.abs(normalized);
   if (locale.startsWith("zh") && absolute >= 100_000_000) return `${sign}${symbol}${(absolute / 100_000_000).toLocaleString(locale, { maximumFractionDigits: 1 })}亿`;
   if (locale.startsWith("zh") && absolute >= 10_000) return `${sign}${symbol}${(absolute / 10_000).toLocaleString(locale, { maximumFractionDigits: 1 })}万`;
   if (!locale.startsWith("zh") && absolute >= 1_000_000) return `${sign}${symbol}${(absolute / 1_000_000).toLocaleString(locale, { maximumFractionDigits: 1 })}M`;

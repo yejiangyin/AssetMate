@@ -180,6 +180,7 @@ export function buildPrivateHoldingContext(
   const costBasis = holding.quantity * holding.costPrice;
   const marketValueInBase = toCNY(marketValue, holding.currency);
   const costBasisInBase = toCNY(costBasis, holding.currency);
+  const unrealizedPnlRate = costBasis > 0 ? (marketValue - costBasis) / costBasis : 0;
   return {
     quantity: holding.quantity,
     costPrice: holding.costPrice,
@@ -189,7 +190,7 @@ export function buildPrivateHoldingContext(
     fxRateToBase: toCNY(1, holding.currency),
     costBasisInBase,
     marketValueInBase,
-    unrealizedPnlRate: holding.totalPnlRate,
+    unrealizedPnlRate,
     portfolioWeight: stats.totalAsset > 0 ? marketValueInBase / stats.totalAsset : undefined,
     dcaSummary: plans.length
       ? plans.map((plan) => `${plan.frequency}:${plan.amount}${plan.currency}:${plan.enabled ? "enabled" : "paused"}`).join("; ")
@@ -232,7 +233,7 @@ export function buildPortfolioContext(
       marketValue,
       costBasisInBase: toCNY(costBasis, h.currency),
       marketValueInBase,
-      unrealizedPnlRate: h.totalPnlRate,
+      unrealizedPnlRate: costBasis > 0 ? (marketValue - costBasis) / costBasis : 0,
     };
   });
   const totalAsset = rawSummaries.reduce((sum, holding) => sum + holding.marketValueInBase, 0);

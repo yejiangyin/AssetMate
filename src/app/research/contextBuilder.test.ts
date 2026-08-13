@@ -30,13 +30,14 @@ describe("research context privacy", () => {
   });
 
   test("private portfolio fields are only built in the explicit private context", () => {
-    const context = buildPrivateHoldingContext(holding, { totalAsset: toCNY(3000, "USD") } as never, []);
+    const context = buildPrivateHoldingContext({ ...holding, totalPnlRate: 9 }, { totalAsset: toCNY(3000, "USD") } as never, []);
     assert.equal(context.quantity, 10);
     assert.equal(context.costPrice, 100);
     assert.equal(context.portfolioWeight, 0.5);
     assert.equal(context.currency, "USD");
     assert.equal(context.marketValueInBase, toCNY(1500, "USD"));
     assert.equal(context.cashDividendTotal, holding.cashDividendTotal);
+    assert.equal(context.unrealizedPnlRate, 0.5);
   });
 
   test("builds a public multi-target context without leaking holding ids", () => {
@@ -75,6 +76,7 @@ describe("research context privacy", () => {
     assert.equal(context.holdings[0]?.currency, "USD");
     assert.equal(context.holdings[1]?.currency, "HKD");
     assert.equal(context.holdings[0]?.marketValueInBase, toCNY(1500, "USD"));
+    assert.equal(context.holdings[0]?.unrealizedPnlRate, 0.5);
     assert.equal(context.totalAsset, toCNY(1500, "USD") + toCNY(1500, "HKD"));
     assert.equal(context.realizedPnl, 300);
     assert.equal(context.dividendPnl, 120);

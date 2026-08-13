@@ -115,11 +115,11 @@ describe("normalizeHolding", () => {
     assert.equal(normalized.corporateActions?.[0]?.exDate, "2026-06-04");
   });
 
-  test("keeps holding-level total return including cash dividends for compatibility", () => {
-    // 10 shares, cost 1, current 2 → price gain 10; dividends 5 → total 15
+  test("keeps holding-level P/L limited to unrealized price movement", () => {
+    // 10 shares, cost 1, current 2 → unrealized price gain 10; dividends stay separate.
     const normalized = normalizeHolding(holding({ cashDividendTotal: 5 }));
-    assert.equal(normalized.totalPnl, 15);
-    assert.equal(normalized.totalPnlRate, 1.5); // 15 / 10
+    assert.equal(normalized.totalPnl, 10);
+    assert.equal(normalized.totalPnlRate, 1); // 10 / 10
   });
 
   test("normalizes a reusable transaction cost profile", () => {
@@ -152,7 +152,7 @@ describe("normalizeHolding", () => {
 });
 
 describe("applyCorporateAction", () => {
-  test("records cash dividends and includes them in total P/L", () => {
+  test("records cash dividends without mixing them into unrealized P/L", () => {
     const adjusted = applyCorporateAction(holding(), {
       type: "cash_dividend",
       date: "2026-06-04",
@@ -162,8 +162,7 @@ describe("applyCorporateAction", () => {
     assert.equal(adjusted.quantity, 10);
     assert.equal(adjusted.costPrice, 1);
     assert.equal(adjusted.cashDividendTotal, 3);
-    // totalPnl = (marketValue - costBasis) + cashDividendTotal = 10 + 3 = 13
-    assert.equal(adjusted.totalPnl, 13);
+    assert.equal(adjusted.totalPnl, 10);
     assert.equal(adjusted.corporateActions?.length, 1);
   });
 
@@ -191,7 +190,7 @@ describe("applyCorporateAction", () => {
     assert.equal(adjusted.quantity, 12);
     assert.equal(adjusted.cashDividendTotal, 4);
     assert.equal(adjusted.quantity * adjusted.costPrice, 14);
-    assert.equal(adjusted.totalPnl, 14);
+    assert.equal(adjusted.totalPnl, 10);
     assert.equal(adjusted.corporateActions?.[0]?.type, "dividend_reinvest");
   });
 
@@ -210,9 +209,9 @@ describe("applyCorporateAction", () => {
     assert.equal(withTax.cashDividendTotal, 3);
     assert.equal(withTax.corporateActions?.[0]?.amount, -1.2);
     assert.equal(withTax.corporateActions?.[1]?.amount, -0.8);
-    // Price gain 10 + dividends 3 - fee/tax 2 = total return 11.
-    assert.equal(withTax.totalPnl, 11);
-    assert.equal(withTax.totalPnlRate, 1.1);
+    // Dividends and costs stay in the ledger, not the open-position metric.
+    assert.equal(withTax.totalPnl, 10);
+    assert.equal(withTax.totalPnlRate, 1);
   });
 
   test("snapshots the rule used for an actual transaction fee", () => {

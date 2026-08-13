@@ -65,6 +65,7 @@ export type Holding = {
   fundNavHistory?:        Array<{ date: string; nav: number }>;
   estimatedNav?:           number;
   estimatedChangePercent?: number;
+  estimatedNavAt?:         string;
   updatedAt:    string;
 };
 

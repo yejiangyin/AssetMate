@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { groups as initialGroups, holdings as initialHoldings, closedHoldings as initialClosedHoldings, Group, Holding, ClosedHolding, type TransactionCostProfile } from "../data/mockData";
-import { FX, refreshPrices, toCNY } from "../services/priceRefresher";
+import { FX, refreshPrices, resolveFundEstimateUpdate, toCNY } from "../services/priceRefresher";
 import { MarketType, DCAFrequency, isMarketOpenNow, isTradingDay, refreshTradingCalendar } from "../services/tradingCalendar";
 import type { ChartPoint } from "../services/quoteApi";
 import { fetchCorporateActions, type CorporateActionEvent } from "../services/corporateActions";
@@ -26,6 +26,8 @@ import { safeUUID } from "../utils/safeId";
 import { acknowledgeSnapshotDueDates, DEFAULT_OPEN_MODE, getConfiguredExtensionOpenMode, getSnapshotDueDates, normalizeOpenMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
 import { estimateTransactionCosts, mergeTransactionCostProfile } from "../utils/transactionCosts";
 import { backfillPortfolioSnapshots, collectMissingSnapshotDates } from "../services/portfolioSnapshotBackfill";
+import { collectStaleSnapshotDates } from "../services/staleSnapshotDetector";
+import { backfillPortfolioEventFxRates } from "../services/portfolioEventFxBackfill";
 
 /* ─── types ──────────────────────────────────────────── */
 type ColorScheme    = "red-up" | "green-up";
@@ -173,6 +175,7 @@ export interface PortfolioSnapshot {
   estimateReason?: "historical_backfill";
   fxFallback?: boolean;
   holdingUnrealizedPnl?: Record<string, number>;
+  holdingValuationDates?: Record<string, string>;
 }
 
 /* ─── DCA types ──────────────────────────────────────── */
@@ -330,7 +333,7 @@ export function computeStats(
     ? portfolioEventBaseline.realizedCostBasis + eventRealizedCostBasis
     : realizedCostBasis;
   const totalInvestmentPnl = unrealizedPnl + realizedPnl;
-  const totalInvestmentCostBasis = costBasis + realizedCostBasis;
+  const totalInvestmentCostBasis = costBasis + realizedRateCostBasis;
   const prevMV     = totalMV - todayPnl;
   return {
     totalAsset:     totalMV,
@@ -352,6 +355,22 @@ export function computeStats(
     totalInvestmentRate: totalInvestmentCostBasis > 0 ? totalInvestmentPnl / totalInvestmentCostBasis : 0,
     usdEquiv:       totalMV / (FX.USD || 7.25),
     lastUpdated:    new Date().toISOString(),
+  };
+}
+
+export function preserveHoldingLedgerFields(previous: Holding, next: Holding): Holding {
+  return {
+    ...next,
+    symbol: previous.symbol,
+    market: previous.market,
+    assetType: previous.assetType,
+    currency: previous.currency,
+    quantity: previous.quantity,
+    costPrice: previous.costPrice,
+    cashDividendTotal: previous.cashDividendTotal ?? 0,
+    corporateActions: previous.corporateActions ?? [],
+    fundNavHistory: previous.fundNavHistory,
+    priceDate: previous.priceDate,
   };
 }
 
@@ -548,6 +567,31 @@ function todayLocalYMD(date = new Date()) {
   return `${year}-${month}-${day}`;
 }
 
+const STALE_SNAPSHOT_RECOMPUTE_KEY = "asset-helper:stale-snapshot-recompute";
+
+function readStaleSnapshotRecomputeQueue() {
+  if (typeof window === "undefined") return [] as string[];
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(STALE_SNAPSHOT_RECOMPUTE_KEY) ?? "[]");
+    return Array.isArray(parsed)
+      ? [...new Set(parsed.filter((date): date is string => typeof date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(date)))].sort()
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeStaleSnapshotRecomputeQueue(dates: string[]) {
+  if (typeof window === "undefined") return;
+  try {
+    const normalized = [...new Set(dates)].sort();
+    if (normalized.length) window.localStorage.setItem(STALE_SNAPSHOT_RECOMPUTE_KEY, JSON.stringify(normalized));
+    else window.localStorage.removeItem(STALE_SNAPSHOT_RECOMPUTE_KEY);
+  } catch {
+    // Best effort: a future refresh can rediscover newly stale NAV dates.
+  }
+}
+
 function ymdFromIsoLike(value: string | undefined) {
   const match = String(value ?? "").match(/^\d{4}-\d{2}-\d{2}/);
   return match?.[0] ?? "";
@@ -643,6 +687,9 @@ function upsertPortfolioSnapshot(
       holding.id,
       toCNY((holding.currentPrice - holding.costPrice) * holding.quantity, holding.currency),
     ])),
+    holdingValuationDates: Object.fromEntries(holdings
+      .filter((holding) => /^\d{4}-\d{2}-\d{2}$/.test(holding.priceDate ?? ""))
+      .map((holding) => [holding.id, holding.priceDate!])),
   };
   return [
     ...snapshots.filter((snapshot) => snapshot.date !== today),
@@ -1037,7 +1084,7 @@ function compactPersistedStateForStorage(snapshot: PersistedState): PersistedSta
     portfolioEvents: history.events,
     portfolioEventBaseline: history.baseline,
     assetSnapshots: snapshots.map((item, index) => (
-      index >= detailedStart ? item : { ...item, holdingUnrealizedPnl: undefined }
+      index >= detailedStart ? item : { ...item, holdingUnrealizedPnl: undefined, holdingValuationDates: undefined }
     )),
   };
 }
@@ -1197,6 +1244,11 @@ export function loadInitialState(): AppState {
                   .filter(([id, value]) => id && Number.isFinite(value))
                   .map(([id, value]) => [id, Number(value)]))
               : undefined,
+            holdingValuationDates: snapshot.holdingValuationDates && typeof snapshot.holdingValuationDates === "object"
+              ? Object.fromEntries(Object.entries(snapshot.holdingValuationDates)
+                  .filter(([id, value]) => id && typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value))
+                  .map(([id, value]) => [id, String(value)]))
+              : undefined,
           }))
           .slice(-MAX_PORTFOLIO_SNAPSHOTS)
       : base.assetSnapshots;
@@ -1249,12 +1301,40 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const refreshPromiseRef = useRef<Promise<void> | null>(null);
   const pendingRefreshOptionsRef = useRef<{ forceCorporateActions?: boolean; bypassCoordination?: boolean } | null>(null);
   const corporateActionRefreshPromiseRef = useRef<Promise<void> | null>(null);
+  const recomputeInProgressRef = useRef(false);
+  const eventFxBackfillInProgressRef = useRef(false);
   const persistTimerRef = useRef<number | null>(null);
   const persistedSnapshotRef = useRef<PersistedState | null>(null);
 
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+
+  useEffect(() => {
+    if (eventFxBackfillInProgressRef.current || !state.portfolioEvents.some((event) => event.fxRateEstimated)) return;
+    eventFxBackfillInProgressRef.current = true;
+    void backfillPortfolioEventFxRates(state.portfolioEvents)
+      .then((events) => {
+        if (events === state.portfolioEvents) return;
+        const resolvedById = new Map(events.map((event) => [event.id, event]));
+        setState((latest) => ({
+          ...latest,
+          portfolioEvents: latest.portfolioEvents.map((event) => {
+            const resolved = resolvedById.get(event.id);
+            return resolved && !resolved.fxRateEstimated ? {
+              ...event,
+              amountInBase: resolved.amountInBase,
+              capitalFlowInBase: resolved.capitalFlowInBase,
+              fxRateToBase: resolved.fxRateToBase,
+              fxRateEstimated: undefined,
+            } : event;
+          }),
+        }));
+      })
+      .finally(() => {
+        eventFxBackfillInProgressRef.current = false;
+      });
+  }, [state.portfolioEvents]);
 
   useEffect(() => {
     void refreshTradingCalendar();
@@ -1356,6 +1436,43 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return task;
   }, [applyCorporateActionsToLatestState]);
 
+  // Recompute existing historical snapshots whose unrealizedPnl was captured
+  // before a fund's official NAV published. Runs after each refresh when a
+  // fund's latest NAV date advanced, replacing the stale snapshots with values
+  // computed from the now-available official NAV history.
+  const recomputeStaleSnapshots = useCallback(async (dates: string[]) => {
+    const queued = [...new Set([...readStaleSnapshotRecomputeQueue(), ...dates])].sort();
+    writeStaleSnapshotRecomputeQueue(queued);
+    if (recomputeInProgressRef.current) return;
+    if (!queued.length) return;
+    recomputeInProgressRef.current = true;
+    try {
+      const current = stateRef.current;
+      const result = await backfillPortfolioSnapshots({
+        dates: queued,
+        holdings: current.holdings,
+        events: current.portfolioEvents,
+        baseline: current.portfolioEventBaseline,
+      });
+      if (result.snapshots.length) {
+        setState((latest) => {
+          const replacements = new Map(result.snapshots.map((snapshot) => [snapshot.date, snapshot]));
+          return {
+            ...latest,
+            assetSnapshots: prunePortfolioSnapshots([
+              ...latest.assetSnapshots.filter((snapshot) => !replacements.has(snapshot.date)),
+              ...result.snapshots,
+            ]),
+          };
+        });
+      }
+      const completed = new Set(result.completedDates);
+      writeStaleSnapshotRecomputeQueue(queued.filter((date) => !completed.has(date)));
+    } finally {
+      recomputeInProgressRef.current = false;
+    }
+  }, []);
+
   /* live price refresh */
   const doRefresh = useCallback(async (currentHoldings: Holding[], options: { forceCorporateActions?: boolean; bypassCoordination?: boolean } = {}) => {
     const coordinated = !options.forceCorporateActions && !options.bypassCoordination;
@@ -1366,7 +1483,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const priceMap = await refreshPrices(
         currentHoldings.map((h) => ({ id: h.id, symbol: h.symbol, market: h.market }))
       );
+      // Detect fund holdings whose official NAV just advanced; their previous
+      // snapshots may carry a stale unrealizedPnl based on the older NAV and
+      // need to be recomputed with the now-published official value.
+      const existingDates = stateRef.current.assetSnapshots.map((snapshot) => snapshot.date);
+      const afterHoldings = currentHoldings.map((h) => {
+        const lp = priceMap[h.id]?.price;
+        return lp ? { ...h, fundNavHistory: lp.fundNavHistory ?? h.fundNavHistory } : h;
+      });
+      const staleDates = collectStaleSnapshotDates(
+        currentHoldings,
+        afterHoldings,
+        existingDates,
+        todayLocalYMD(),
+      );
       setState((s) => {
+        const now = new Date();
         const updated = s.holdings.map((h) => {
           const liveUpdate = priceMap[h.id];
           if (!liveUpdate) return h;
@@ -1384,15 +1516,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
           const marketValue = h.quantity * lp.price;
           const costBasis   = h.quantity * h.costPrice;
-          const cashDividendTotal = h.cashDividendTotal ?? 0;
-          const feeTaxTotal = (h.corporateActions ?? []).reduce((sum, action) => (
-            action.type === "fee" || action.type === "tax"
-              ? sum - Math.abs(Number.isFinite(action.amount) ? action.amount ?? 0 : 0)
-              : sum
-          ), 0);
-          // totalPnl includes cash dividends and transaction costs already posted to the holding.
-          const totalPnl    = marketValue - costBasis + cashDividendTotal + feeTaxTotal;
+          // Holding-level P/L is unrealized price P/L only. Cash dividends,
+          // realized trades and costs are aggregated by the portfolio ledger.
+          const totalPnl    = marketValue - costBasis;
           const todayPnl    = Number.isFinite(lp.change) ? h.quantity * lp.change : 0;
+          const fundEstimate = h.market === "FUND" || h.assetType === "fund"
+            ? resolveFundEstimateUpdate(h, lp, todayShanghaiYMD(now))
+            : {};
           return {
             ...h,
             currentPrice: lp.price,
@@ -1407,8 +1537,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             fundBuyConfirmDays: liveUpdate.fundBuyConfirmDays ?? h.fundBuyConfirmDays,
             priceDate: lp.priceDate ?? h.priceDate ?? "",
             fundNavHistory: lp.fundNavHistory ?? h.fundNavHistory,
-            estimatedNav: lp.estimatedNav,
-            estimatedChangePercent: lp.estimatedChangePercent,
+            ...fundEstimate,
             cashDividendTotal: h.cashDividendTotal ?? 0,
             dividendReinvest: h.dividendReinvest ?? null,
             autoCorporateActionSince: h.autoCorporateActionSince ?? "",
@@ -1416,7 +1545,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             updatedAt:    new Date().toISOString(),
           };
         });
-        const now = new Date();
         const t   = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}:${String(now.getSeconds()).padStart(2,"0")}`;
         writeRefreshMeta({ startedAt: 0, finishedAt: now.getTime() });
         const dcaState = applyDCAState(updated, s.dcaPlans, s.dcaExecutions, true);
@@ -1435,6 +1563,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           lastRefreshError: "",
         };
       });
+      // Also retries dates persisted after an earlier provider/storage failure.
+      void recomputeStaleSnapshots(staleDates);
       void runCorporateActionRefresh(currentHoldings, options.forceCorporateActions);
     } catch (error) {
       if (coordinated) writeRefreshMeta({ ...readRefreshMeta(), startedAt: 0 });
@@ -1443,7 +1573,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         : "行情刷新失败";
       setState((s) => ({ ...s, isRefreshing: false, lastRefreshError: message }));
     }
-  }, [applyDCAState, runCorporateActionRefresh]);
+  }, [applyDCAState, recomputeStaleSnapshots, runCorporateActionRefresh]);
 
   const runRefresh = useCallback((currentHoldings: Holding[], options: { forceCorporateActions?: boolean; bypassCoordination?: boolean } = {}) => {
     if (refreshPromiseRef.current) {
@@ -1892,8 +2022,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           corporateActions: previous.corporateActions ?? [],
         }
         : rebuilt;
-      const updatedHoldings = s.holdings.map((x) => (x.id === id ? h : x));
-      const updatedPlans = s.dcaPlans.map((plan) => (plan.holdingId === id ? syncPlanWithHolding(plan, h) : plan));
+      // Financial identity and position fields are ledger-owned once a holding
+      // exists. Buy/sell/corporate-action flows are the only supported way to
+      // change them; otherwise the delta would be misclassified as market P/L.
+      const ledgerSafeHolding: Holding = previous ? preserveHoldingLedgerFields(previous, h) : h;
+      const updatedHoldings = s.holdings.map((x) => (x.id === id ? ledgerSafeHolding : x));
+      const updatedPlans = s.dcaPlans.map((plan) => (plan.holdingId === id ? syncPlanWithHolding(plan, ledgerSafeHolding) : plan));
       const dcaState = applyDCAState(updatedHoldings, updatedPlans, s.dcaExecutions);
       const dcaLedger = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
       const portfolioEvents = dcaLedger.portfolioEvents;
@@ -2065,6 +2199,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         date: patch.date,
         amount: signedAmount,
         amountInBase: toCNY(signedAmount, currentEvent.currency),
+        fxRateToBase: currentEvent.currency.toUpperCase() === "CNY" ? 1 : toCNY(1, currentEvent.currency),
+        fxRateEstimated: currentEvent.currency.toUpperCase() !== "CNY" && patch.date !== todayLocalYMD(),
         note: patch.note?.trim() ?? "",
       };
       if (currentEvent.holdingId && currentEvent.corporateActionId) {

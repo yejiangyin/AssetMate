@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { PortfolioEvent } from "../services/portfolioEvents";
-import { breakdownBarWidth, formatCalendarCny, formatCompactCny, hasMeaningfulReturnData, returnEventValue } from "./returnsPresentation";
+import { breakdownBarWidth, formatCalendarCny, formatCompactCny, hasMeaningfulReturnData, normalizeMoneyForDisplay, returnEventValue } from "./returnsPresentation";
 
 function event(type: PortfolioEvent["type"], amountInBase: number): PortfolioEvent {
   return {
@@ -29,6 +29,14 @@ describe("returns presentation", () => {
     assert.equal(formatCalendarCny(5_000, false, "zh-CN"), "+¥5,000");
     assert.equal(formatCalendarCny(-15_500, false, "zh-CN"), "-¥1.6万");
     assert.equal(formatCalendarCny(125_000_000, false, "zh-CN"), "+¥1.3亿");
+  });
+
+  test("renders sub-cent floating point residue as neutral zero", () => {
+    assert.equal(normalizeMoneyForDisplay(0.0000001), 0);
+    assert.equal(normalizeMoneyForDisplay(-0.004), 0);
+    assert.equal(formatCompactCny(0.0000001, false, "zh-CN"), "¥0.00");
+    assert.equal(formatCompactCny(-0.004, false, "zh-CN"), "¥0.00");
+    assert.equal(formatCalendarCny(0.0000001, false, "zh-CN"), "¥0");
   });
 
   test("keeps bars visible when every source is negative", () => {

@@ -28,6 +28,7 @@ import {
 } from "../i18n";
 import type { Language } from "../context/AppContext";
 import type { PortfolioEvent } from "../services/portfolioEvents";
+import { summarizeHoldingDividends, type HoldingDividendSummary } from "../utils/holdingDividendSummary";
 
 /* ─── constants ──────────────────────────────────────── */
 function getSecurityBadge(market: string, assetType?: string, language: Language = "zh") {
@@ -139,16 +140,8 @@ function holdingMarketValue(h: Holding) {
   return h.quantity * h.currentPrice;
 }
 
-function holdingFeeTaxTotal(h: Holding) {
-  return (h.corporateActions ?? []).reduce((sum, action) => (
-    action.type === "fee" || action.type === "tax"
-      ? sum - Math.abs(Number.isFinite(action.amount) ? action.amount ?? 0 : 0)
-      : sum
-  ), 0);
-}
-
 function holdingTotalPnl(h: Holding) {
-  return h.quantity * (h.currentPrice - h.costPrice) + (h.cashDividendTotal ?? 0) + holdingFeeTaxTotal(h);
+  return h.quantity * (h.currentPrice - h.costPrice);
 }
 
 function holdingTotalPnlRate(h: Holding) {
@@ -391,10 +384,22 @@ function ClosedHoldingsView({
                   </p>
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
-                  <button onClick={() => onEditEvent(event)} className="flex size-7 items-center justify-center rounded-lg bg-app-surface2 text-tm hover:text-app-accent" title={language === "en" ? "Correct record" : "纠正记录"}>
+                  <button
+                    onClick={() => onEditEvent(event)}
+                    className="flex size-7 items-center justify-center rounded-lg transition-opacity hover:opacity-80"
+                    style={{ background: "rgba(79,156,249,0.12)", color: "#4F9CF9" }}
+                    title={language === "en" ? "Correct record" : "纠正记录"}
+                    aria-label={language === "en" ? "Correct record" : "纠正记录"}
+                  >
                     <Pencil size={12} />
                   </button>
-                  <button onClick={() => onDeleteEvent(event)} className="flex size-7 items-center justify-center rounded-lg text-app-danger" style={{ background: "rgba(242,78,78,0.1)" }} title={language === "en" ? "Delete record" : "删除记录"}>
+                  <button
+                    onClick={() => onDeleteEvent(event)}
+                    className="flex size-7 items-center justify-center rounded-lg transition-opacity hover:opacity-80"
+                    style={{ background: "rgba(242,78,78,0.12)", color: "#F24E4E" }}
+                    title={language === "en" ? "Delete record" : "删除记录"}
+                    aria-label={language === "en" ? "Delete record" : "删除记录"}
+                  >
                     <Trash2 size={12} />
                   </button>
                 </div>
@@ -493,9 +498,10 @@ function ClosedHoldingsView({
               </div>
               <button
                 onClick={() => onDelete(item.id)}
-                className="flex items-center justify-center rounded-lg shrink-0"
-                style={{ width: 28, height: 28, background: "rgba(242,78,78,0.1)", color: "#F24E4E" }}
+                className="flex items-center justify-center rounded-lg shrink-0 transition-opacity hover:opacity-80"
+                style={{ width: 28, height: 28, background: "rgba(242,78,78,0.12)", color: "#F24E4E" }}
                 title={language === "en" ? "Delete record" : "删除历史记录"}
+                aria-label={language === "en" ? "Delete record" : "删除历史记录"}
               >
                 <Trash2 size={13} />
               </button>
@@ -586,7 +592,7 @@ function Field({ label, children, className }: { label: string; children: React.
   );
 }
 
-function Input({ value, onChange, placeholder, type = "text", step, min, max }: {
+function Input({ value, onChange, placeholder, type = "text", step, min, max, disabled = false }: {
   value: string | number;
   onChange: (v: string) => void;
   placeholder?: string;
@@ -594,14 +600,16 @@ function Input({ value, onChange, placeholder, type = "text", step, min, max }: 
   step?: string | number;
   min?: string | number;
   max?: string | number;
+  disabled?: boolean;
 }) {
   return (
-    <input type={type} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder}
+    <input type={type} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} disabled={disabled}
       step={step} min={min} max={max}
       style={{
         width: "100%", height: 38, background: "var(--bg-card)",
         border: "1px solid var(--border)", borderRadius: 10, padding: "0 12px",
         color: "var(--text-primary)", fontSize: 13, outline: "none", boxSizing: "border-box",
+        opacity: disabled ? 0.58 : 1,
       }} />
   );
 }
@@ -626,12 +634,12 @@ function Sel<T extends string>({ value, onChange, options, style }: {
 }
 
 /* ─── PnL preview strip ──────────────────────────────── */
-function PnLPreview({ form, cashDividendTotal = 0 }: { form: HoldingInput; cashDividendTotal?: number }) {
+function PnLPreview({ form }: { form: HoldingInput }) {
   const { profitColor, language } = useApp();
   const text = t(language).holdings;
   const mv   = form.quantity * form.currentPrice;
   const cost = form.quantity * form.costPrice;
-  const pnl  = mv - cost + Math.max(0, Number.isFinite(cashDividendTotal) ? cashDividendTotal : 0);
+  const pnl  = mv - cost;
   const rate = cost > 0 ? pnl / cost : 0;
   const col  = profitColor(pnl);
   return (
@@ -652,10 +660,9 @@ function PnLPreview({ form, cashDividendTotal = 0 }: { form: HoldingInput; cashD
 }
 
 /* ─── Add / Edit form sheet ──────────────────────────── */
-function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal = 0 }: {
+function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
   initial: HoldingInput; groups: Group[];
   onSave: (h: HoldingInput) => void; onClose: () => void; isEdit: boolean;
-  cashDividendTotal?: number;
 }) {
   const { language } = useApp();
   const text = t(language);
@@ -829,7 +836,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
         <div className="overflow-y-auto px-4 py-3 flex flex-col gap-3" style={{ scrollbarWidth: "none" }}>
           <p style={{ color: "#4F9CF9", fontSize: 11, fontWeight: 600 }}>{text.holdings.basicInfo}</p>
 
-          <div className="flex gap-2 items-end">
+          {!isEdit && <div className="flex gap-2 items-end">
             <Field label={text.holdings.marketScope}>
               <Sel value={marketScope} onChange={(v) => handleMarketScopeChange(v)} options={marketScopeOptions}
                 style={{ width: 96, flexShrink: 0 }} />
@@ -839,7 +846,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
                 onSelect={handleSelect} placeholder={text.holdings.searchSecurityPlaceholder}
                 marketFilter={marketScope || undefined} />
             </Field>
-          </div>
+          </div>}
 
           {form.autoTradeStatus && form.autoTradeStatus !== "normal" && (
             <div className="rounded-lg px-2.5 py-2" style={{
@@ -861,7 +868,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
             </div>
           )}
 
-          <div className="grid grid-cols-2 gap-2">
+          {!isEdit && <div className="grid grid-cols-2 gap-2">
             <Field label={text.holdings.assetType}>
               <Sel value={form.assetType as AssetType} onChange={(v) => setForm((f) => ({
                 ...f,
@@ -877,7 +884,7 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
                   ...currencyOptions.map((c) => ({ value: c, label: c })),
                 ]} />
             </Field>
-          </div>
+          </div>}
 
           <Field label={text.holdings.group}>
             <Sel value={form.groupId} onChange={(v) => set("groupId", v)} options={groupOpts} />
@@ -896,19 +903,19 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit, cashDividendTotal
           <p style={{ color: "#4F9CF9", fontSize: 11, fontWeight: 600, marginTop: 2 }}>{text.holdings.holdingInfo}</p>
 
           <Field label={text.holdings.quantity}>
-            <Input type="number" value={numberDraft.quantity} onChange={(v) => setNumberField("quantity", v)} placeholder={language === "en" ? "e.g. 100" : "例：100"} />
+            <Input type="number" value={numberDraft.quantity} onChange={(v) => setNumberField("quantity", v)} disabled={isEdit} placeholder={language === "en" ? "Use Buy/Sell to change" : "请通过买入/卖出修改"} />
           </Field>
 
           <div className="grid grid-cols-2 gap-2">
             <Field label={text.holdings.costPrice}>
-              <Input type="number" value={numberDraft.costPrice} onChange={(v) => setNumberField("costPrice", v)} placeholder={language === "en" ? "Avg cost" : "买入均价"} />
+              <Input type="number" value={numberDraft.costPrice} onChange={(v) => setNumberField("costPrice", v)} disabled={isEdit} placeholder={language === "en" ? "Use transactions to change" : "请通过交易修改"} />
             </Field>
             <Field label={text.holdings.currentPrice}>
               <Input type="number" value={numberDraft.currentPrice} onChange={(v) => setNumberField("currentPrice", v)} placeholder={language === "en" ? "Latest quote" : "最新报价"} />
             </Field>
           </div>
 
-          <PnLPreview form={form} cashDividendTotal={isEdit ? cashDividendTotal : 0} />
+          <PnLPreview form={form} />
 
           <div className="rounded-xl p-3" style={{ background: "var(--bg-card)", border: "1px solid var(--border)" }}>
             <p style={{ color: "var(--text-primary)", fontSize: 12, fontWeight: 700 }}>{text.holdings.costProfile}</p>
@@ -1299,10 +1306,11 @@ function AdjustSheet({
 
 /* ─── Holding card ───────────────────────────────────── */
 const HoldingCard = memo(function HoldingCard({
-  h, groups, dcaPlans, onEdit, onDelete, onQuote, onDCA, onBuy, onSell, isSelected, onSelect,
+  h, groups, dcaPlans, dividendSummary, onEdit, onDelete, onQuote, onDCA, onBuy, onSell, isSelected, onSelect,
 }: {
   h: Holding; groups: Group[]; isSelected: boolean;
   dcaPlans: DCAPlan[];
+  dividendSummary?: HoldingDividendSummary | null;
   onEdit: (h: Holding) => void; onDelete: (id: string) => void; onQuote: (h: Holding) => void; onDCA: (h: Holding) => void; onBuy: (h: Holding) => void; onSell: (h: Holding) => void; onSelect: (id: string) => void;
 }) {
   const { profitColor, privacyMode, language } = useApp();
@@ -1313,16 +1321,22 @@ const HoldingCard = memo(function HoldingCard({
   const totalRate = holdingTotalPnlRate(h);
   const todayDividend = todayDividendAmount(h);
   const totalC    = profitColor(totalPnl);
+  const isFundHolding = h.market === "FUND" || h.assetType === "fund";
+  const hasComparablePrices = h.costPrice > 0 && h.currentPrice > 0;
   const badge     = getSecurityBadge(h.market, h.assetType, language);
   const group     = groups.find((g) => g.id === h.groupId);
   const sign      = pnlSign;
   const borderColor = isSelected || hovered ? "rgba(79,156,249,0.2)" : "var(--border-sub)";
   const sym = currencySymbol(h.currency);
   const priceDecimals = holdingUnitPriceDecimals(h);
+  const costPriceDecimals = Math.max(4, priceDecimals);
   const fmtMoney = (p: number) => sym + p.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const fmtUnitPrice = (p: number) => sym + p.toLocaleString("en-US", { minimumFractionDigits: priceDecimals, maximumFractionDigits: priceDecimals });
+  const fmtCostPrice = (p: number) => sym + p.toLocaleString("en-US", { minimumFractionDigits: costPriceDecimals, maximumFractionDigits: costPriceDecimals });
   const marketValueText = fmtMoney(holdingMarketValue(h));
   const todayPnlText = fmtMoney(Math.abs(h.todayPnl));
+  const totalPnlText = fmtMoney(Math.abs(totalPnl));
+  const totalPnlLabel = language === "en" ? "Unrealized" : totalPnl < 0 ? "浮亏" : totalPnl > 0 ? "浮盈" : "持平";
   const tradeStatus = resolveHoldingTradeStatus(h);
   const tradeStatusColor = tradeStatus.status === "normal"
     ? "#31D08B"
@@ -1344,7 +1358,16 @@ const HoldingCard = memo(function HoldingCard({
       ? { label: text.dcaPaused, color: "#94A3B8", bg: "rgba(148,163,184,0.12)" }
       : null;
   const priceDateLabel = h.priceDate
-    ? `${h.market === "FUND" || h.assetType === "fund" ? text.nav : text.quote} ${h.priceDate.slice(5).replace("-", "/")}`
+    ? `${isFundHolding ? text.nav : text.quote} ${h.priceDate.slice(5).replace("-", "/")}`
+    : "";
+  const estimateIsCurrent = h.estimatedNavAt?.slice(0, 10) === todayLocalYMD();
+  const estimateTime = h.estimatedNavAt?.match(/\s(\d{2}:\d{2})/)?.[1];
+  const dividendCountText = dividendSummary
+    ? dividendSummary.countIncomplete
+      ? dividendSummary.count > 0
+        ? (language === "en" ? `at least ${dividendSummary.count}` : `至少${dividendSummary.count}次`)
+        : (language === "en" ? "count unknown" : "次数未知")
+      : (language === "en" ? `${dividendSummary.count} times` : `${dividendSummary.count}次`)
     : "";
 
   return (
@@ -1384,9 +1407,9 @@ const HoldingCard = memo(function HoldingCard({
                 <span style={{ color: "var(--text-micro)", fontSize: 9, whiteSpace: "nowrap" }}>{priceDateLabel}</span>
               )}
             </div>
-            {(h.market === "FUND" || h.assetType === "fund") && h.estimatedNav != null && h.estimatedNav > 0 && (
+            {isFundHolding && estimateIsCurrent && h.estimatedNav != null && h.estimatedNav > 0 && (
               <div className="mt-0.5 flex items-center gap-1">
-                <span style={{ color: "var(--text-micro)", fontSize: 9 }}>{text.estimated}</span>
+                <span style={{ color: "var(--text-micro)", fontSize: 9 }}>{text.estimated}{estimateTime ? ` ${estimateTime}` : ""}</span>
                 <span style={{ color: "#F59E0B", fontSize: 9, fontWeight: 600 }}>{h.estimatedNav.toFixed(4)}</span>
                 {h.estimatedChangePercent != null && Number.isFinite(h.estimatedChangePercent) && (
                   <span style={{
@@ -1428,25 +1451,41 @@ const HoldingCard = memo(function HoldingCard({
               {sign(h.todayPnl)}{privacyMode ? `${sym || h.currency}--` : todayPnlText}
               &nbsp;<span style={{ fontSize: 10 }}>({`${sign(h.todayPnlRate)}${(Number.isFinite(h.todayPnlRate) ? h.todayPnlRate * 100 : 0).toFixed(2)}%`})</span>
             </p>
-            <p style={{ color: totalC, fontSize: 10, marginTop: 1 }}>
-              {language === "en" ? "Total" : "累计"} {sign(totalRate)}{(totalRate * 100).toFixed(2)}%
+            <p style={{ color: totalC, fontSize: 10, marginTop: 1, whiteSpace: "nowrap" }}>
+              {totalPnlLabel}{" "}
+              {privacyMode
+                ? `${sym || h.currency}-- (${sign(totalRate)}${(totalRate * 100).toFixed(2)}%)`
+                : `${sign(totalPnl)}${totalPnlText} (${sign(totalRate)}${(totalRate * 100).toFixed(2)}%)`}
             </p>
           </div>
         </div>
 
-        {/* Progress bar */}
+        {/* Cost-to-price comparison */}
         <div className="mt-2 pt-2" style={{ borderTop: "1px solid var(--border-sub)" }}>
-          <div className="flex items-center justify-between mb-1">
-            <span style={{ color: "var(--text-micro)", fontSize: 10 }}>{text.cost} <span style={{ color: "var(--text-secondary)" }}>{fmtUnitPrice(h.costPrice)}</span></span>
-            <span style={{ color: "var(--text-micro)", fontSize: 10 }}>{text.price} <span style={{ color: "var(--text-muted)", fontWeight: 500 }}>{fmtUnitPrice(h.currentPrice)}</span></span>
-          </div>
-          <div className="rounded-full overflow-hidden" style={{ height: 3, background: "var(--bg-surface2)" }}>
-            <div className="h-full rounded-full" style={{
-              width: h.costPrice > 0
-                ? `${Math.min(100, Math.max(0, ((h.currentPrice - h.costPrice) / h.costPrice + 1) * 50))}%`
-                : "0%",
-              background: totalC, transition: "width 0.3s",
-            }} />
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            {hasComparablePrices ? (
+              <>
+              <span className="shrink-0" style={{ color: "var(--text-micro)", fontSize: 10 }}>
+                {text.cost} <span style={{ color: "var(--text-secondary)", fontWeight: 500 }}>{privacyMode ? "***" : fmtCostPrice(h.costPrice)}</span>
+              </span>
+              <span aria-hidden="true" style={{ color: "var(--text-micro)", fontSize: 12 }}>→</span>
+              <span className="shrink-0" style={{ color: "var(--text-micro)", fontSize: 10 }}>
+                {isFundHolding ? text.latestNav : text.price}{" "}
+                <span style={{ color: "var(--text-secondary)", fontWeight: 600 }}>{fmtUnitPrice(h.currentPrice)}</span>
+              </span>
+              </>
+            ) : (
+              <span style={{ color: "var(--text-micro)", fontSize: 10 }}>{text.noComparablePrice}</span>
+            )}
+            {dividendSummary && (
+              <span
+                className="ml-auto shrink-0 rounded px-1.5 py-0.5"
+                style={{ color: "#F59E0B", background: "rgba(245,158,11,0.10)", fontSize: 9, fontWeight: 700 }}
+                title={language === "en" ? "Lifetime dividends for this holding" : "该持仓累计分红"}
+              >
+                {language === "en" ? "Dividends" : "分红"} {dividendCountText} · {privacyMode ? `${sym || h.currency}--` : fmtMoney(dividendSummary.amount)}
+              </span>
+            )}
           </div>
         </div>
       </button>
@@ -1492,9 +1531,10 @@ const HoldingCard = memo(function HoldingCard({
 });
 
 /* ─── Groups view ────────────────────────────────────── */
-function GroupsView({ groups, holdings, dcaPlans, baseCurrency, selectedId, onSelectHolding, onEditHolding, onDeleteHolding, onQuote, onDCA, onBuy, onSell }: {
+function GroupsView({ groups, holdings, dcaPlans, dividendSummaries, baseCurrency, selectedId, onSelectHolding, onEditHolding, onDeleteHolding, onQuote, onDCA, onBuy, onSell }: {
   groups: Group[]; holdings: Holding[];
   dcaPlans: DCAPlan[];
+  dividendSummaries: Map<string, HoldingDividendSummary>;
   baseCurrency: string;
   selectedId: string | null;
   onSelectHolding: (id: string) => void;
@@ -1654,6 +1694,7 @@ function GroupsView({ groups, holdings, dcaPlans, baseCurrency, selectedId, onSe
                               h={h}
                               groups={groups}
                               dcaPlans={dcaPlans}
+                              dividendSummary={dividendSummaries.get(h.id)}
                               isSelected={selectedId === h.id}
                               onSelect={onSelectHolding}
                               onEdit={onEditHolding}
@@ -1696,6 +1737,7 @@ function GroupsView({ groups, holdings, dcaPlans, baseCurrency, selectedId, onSe
                           h={h}
                           groups={groups}
                           dcaPlans={dcaPlans}
+                          dividendSummary={dividendSummaries.get(h.id)}
                           isSelected={selectedId === h.id}
                           onSelect={() => onSelectHolding(h.id)}
                           onEdit={() => onEditHolding(h)}
@@ -1893,6 +1935,12 @@ export function Holdings() {
   }, [activeGroup, closedHoldings, search]);
 
   const holdingById = useMemo(() => new Map(holdings.map((holding) => [holding.id, holding])), [holdings]);
+  const dividendSummaries = useMemo(() => new Map(
+    holdings.flatMap((holding) => {
+      const summary = summarizeHoldingDividends(holding, portfolioEvents);
+      return summary ? [[holding.id, summary] as const] : [];
+    }),
+  ), [holdings, portfolioEvents]);
   const closedById = useMemo(() => new Map(closedHoldings.map((holding) => [holding.id, holding])), [closedHoldings]);
   const filteredRealizedEvents = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -2398,6 +2446,7 @@ export function Holdings() {
                   groups={groups}
                   holdings={filtered}
                   dcaPlans={dcaPlans}
+                  dividendSummaries={dividendSummaries}
                   baseCurrency={currency}
                   selectedId={selectedId}
                   onSelectHolding={handleSelectHolding}
@@ -2418,6 +2467,7 @@ export function Holdings() {
                         <HoldingCard
                           h={h} groups={groups}
                           dcaPlans={dcaPlans}
+                          dividendSummary={dividendSummaries.get(h.id)}
                           isSelected={selectedId === h.id}
                           onSelect={handleSelectHolding}
                           onEdit={handleEditHolding}
@@ -2482,7 +2532,6 @@ export function Holdings() {
                 : blankForm()
             }
             groups={groups}
-            cashDividendTotal={sheetMode === "edit" ? editTarget?.cashDividendTotal ?? 0 : 0}
             onSave={handleSave}
             onClose={() => { setSheetMode(null); setEditTarget(null); }}
             isEdit={sheetMode === "edit"}

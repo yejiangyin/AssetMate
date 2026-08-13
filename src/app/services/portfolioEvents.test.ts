@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { ClosedHolding, Holding } from "../data/mockData";
 import type { PortfolioEvent } from "./portfolioEvents";
-import { compactPortfolioEventHistory, computeBaselineBreakdown, computeReturnBreakdown, getDailyReturns, getHoldingReturnContributions, getMonthlyReturns, getYearlyReturns, migratePortfolioEvents } from "./portfolioEvents";
+import { compactPortfolioEventHistory, computeBaselineBreakdown, computeReturnBreakdown, getDailyReturns, getHoldingReturnContributions, getModifiedDietzReturn, getMonthlyReturns, getYearlyReturns, migratePortfolioEvents, normalizePortfolioEvent } from "./portfolioEvents";
 
 function holding(patch: Partial<Holding> = {}): Holding {
   return {
@@ -54,6 +54,27 @@ function closedHolding(patch: Partial<ClosedHolding> = {}): ClosedHolding {
 }
 
 describe("migratePortfolioEvents", () => {
+  test("rejects impossible imported dates and normalizes expense signs", () => {
+    assert.equal(normalizePortfolioEvent({
+      id: "bad-date", date: "2026-99-99", type: "fee", amount: 2, amountInBase: 2,
+      currency: "CNY", source: "import", createdAt: "2026-01-01T00:00:00.000Z",
+    }), null);
+    const fee = normalizePortfolioEvent({
+      id: "fee", date: "2026-07-01", type: "fee", amount: 2, amountInBase: 14,
+      currency: "USD", source: "import", createdAt: "2026-07-01T00:00:00.000Z",
+    });
+    assert.equal(fee?.amount, -2);
+    assert.equal(fee?.amountInBase, -14);
+    assert.equal(fee?.fxRateEstimated, true);
+    const sell = normalizePortfolioEvent({
+      id: "sell", date: "2026-07-01", type: "sell", amount: 20, amountInBase: 20,
+      quantity: 2, price: 60, currency: "CNY", source: "import",
+      createdAt: "2026-07-01T00:00:00.000Z",
+    });
+    assert.equal(sell?.proceeds, 120);
+    assert.equal(sell?.capitalFlowInBase, -120);
+    assert.equal(sell?.capitalFlowIncomplete, undefined);
+  });
   test("migrates closed holdings as pure trading gains so dividends are not double counted", () => {
     const events = migratePortfolioEvents([
       holding({
@@ -94,6 +115,23 @@ describe("migratePortfolioEvents", () => {
     assert.equal(reinvest.amount, 20);
     assert.equal(reinvest.quantity, 5);
     assert.equal(computeReturnBreakdown(events).dividendPnl, 20);
+  });
+
+  test("recognizes dividend return on ex-date while preserving cash settlement date", () => {
+    const events = migratePortfolioEvents([holding({
+      corporateActions: [{
+        id: "div-ex-pay",
+        type: "cash_dividend",
+        date: "2026-07-01",
+        exDate: "2026-07-02",
+        payDate: "2026-07-10",
+        amount: 10,
+      }],
+    })], [], []);
+
+    const dividend = events.find((event) => event.corporateActionId === "div-ex-pay");
+    assert.equal(dividend?.date, "2026-07-02");
+    assert.equal(dividend?.settlementDate, "2026-07-10");
   });
 
   test("does not duplicate a manually recorded corporate-action fee during migration", () => {
@@ -342,6 +380,38 @@ describe("return aggregations", () => {
     assert.equal(daily.reduce((sum, row) => sum + row.totalPnl, 0), 35);
   });
 
+  test("attributes a delayed overseas quote to its actual valuation date", () => {
+    const daily = getDailyReturns([], [{
+      date: "2026-07-06", totalAsset: 100, todayPnl: 0, cumulativePnl: 0,
+      unrealizedPnl: 0, holdingUnrealizedPnl: { us: 0 }, holdingValuationDates: { us: "2026-07-06" },
+    }, {
+      date: "2026-07-07", totalAsset: 110, todayPnl: 0, cumulativePnl: 10,
+      unrealizedPnl: 10, holdingUnrealizedPnl: { us: 10 }, holdingValuationDates: { us: "2026-07-06" },
+    }], undefined, {
+      attributeWeekendUnrealized: true,
+      holdingMarkets: { us: "US" },
+    });
+
+    assert.equal(daily[0]?.totalPnl, 10);
+    assert.equal(daily[1]?.totalPnl, 0);
+  });
+
+  test("repairs legacy non-crypto snapshots stamped with a weekend valuation date", () => {
+    const daily = getDailyReturns([], [{
+      date: "2026-07-10", totalAsset: 100, todayPnl: 0, cumulativePnl: 0,
+      unrealizedPnl: 0, holdingUnrealizedPnl: { fund: 0 }, holdingValuationDates: { fund: "2026-07-10" },
+    }, {
+      date: "2026-07-11", totalAsset: 110, todayPnl: 0, cumulativePnl: 10,
+      unrealizedPnl: 10, holdingUnrealizedPnl: { fund: 10 }, holdingValuationDates: { fund: "2026-07-11" },
+    }], undefined, {
+      attributeWeekendUnrealized: true,
+      holdingMarkets: { fund: "FUND" },
+    });
+
+    assert.equal(daily[0]?.totalPnl, 10);
+    assert.equal(daily[1]?.totalPnl, 0);
+  });
+
   test("aggregates daily, monthly, and yearly returns from snapshots and events", () => {
     const daily = getDailyReturns([{
       id: "sell1",
@@ -446,6 +516,48 @@ describe("return aggregations", () => {
     assert.equal(getMonthlyReturns(daily)[0]?.totalPnl, 12);
   });
 
+  test("does not borrow a future snapshot value for an earlier event-only date", () => {
+    const daily = getDailyReturns([{
+      id: "old-dividend", date: "2026-06-01", type: "cash_dividend",
+      amount: 12, amountInBase: 12, currency: "CNY", source: "manual",
+      createdAt: "2026-06-01T00:00:00.000Z",
+    }], [{
+      date: "2026-07-01", totalAsset: 1000, todayPnl: 0,
+      cumulativePnl: 12, unrealizedPnl: 0,
+    }]);
+
+    assert.equal(daily[0]?.totalAsset, 0);
+    assert.equal(daily[0]?.incompleteBreakdown, true);
+  });
+
+  test("marks a multi-day valuation delta incomplete", () => {
+    const daily = getDailyReturns([], [{
+      date: "2026-07-01", totalAsset: 100, todayPnl: 0, cumulativePnl: 0, unrealizedPnl: 0,
+    }, {
+      date: "2026-07-04", totalAsset: 112, todayPnl: 0, cumulativePnl: 12, unrealizedPnl: 12,
+    }]);
+
+    assert.equal(daily[1]?.valuationSpanDays, 3);
+    assert.equal(daily[1]?.incompleteBreakdown, true);
+  });
+
+  test("uses position contributions in Modified Dietz return", () => {
+    const daily = getDailyReturns([{
+      id: "buy", date: "2026-07-02", type: "buy", amount: 100, amountInBase: 100,
+      capitalFlowInBase: 100, currency: "CNY", source: "manual",
+      createdAt: "2026-07-02T00:00:00.000Z",
+    }], [{
+      date: "2026-06-30", totalAsset: 100, todayPnl: 0, cumulativePnl: 0, unrealizedPnl: 0,
+    }, {
+      date: "2026-07-01", totalAsset: 100, todayPnl: 0, cumulativePnl: 0, unrealizedPnl: 0,
+    }, {
+      date: "2026-07-02", totalAsset: 210, todayPnl: 0, cumulativePnl: 10, unrealizedPnl: 10,
+    }]);
+
+    assert.equal(daily.at(-1)?.capitalFlow, 100);
+    assert.equal(getModifiedDietzReturn(daily, "2026-07-01", "2026-07-02"), 10 / 150);
+  });
+
   test("treats the first imported snapshot as a baseline instead of same-day profit", () => {
     const daily = getDailyReturns([], [{
       date: "2026-07-01",
@@ -487,6 +599,7 @@ describe("return aggregations", () => {
     assert.equal(computeBaselineBreakdown(compacted.baseline).realizedTradingPnl, 20);
     assert.equal(computeBaselineBreakdown(compacted.baseline).taxPnl, -2);
     assert.equal(compacted.baseline.realizedCostBasis, 100);
+    assert.equal(compacted.baseline.positionHistoryStart, "2026-01-01");
     const daily = getDailyReturns(compacted.events, [], compacted.baseline);
     assert.equal(daily.find((row) => row.date === "2026-01-01")?.totalPnl, 18);
   });
@@ -533,5 +646,19 @@ describe("return aggregations", () => {
     assert.equal(contributions[1]?.id, "h2");
     assert.equal(contributions[1]?.totalPnl, 5);
     assert.equal(contributions[0]?.incompleteBreakdown, undefined);
+  });
+
+  test("exposes an explicit unallocated row when ranking cannot reconcile to period return", () => {
+    const contributions = getHoldingReturnContributions([], [{
+      date: "2026-06-30", totalAsset: 100, todayPnl: 0, cumulativePnl: 0,
+      holdingUnrealizedPnl: { h1: 0 },
+    }, {
+      date: "2026-07-02", totalAsset: 110, todayPnl: 0, cumulativePnl: 10,
+      holdingUnrealizedPnl: { h1: 6 },
+    }], "2026-07-01", "2026-07-31", 10);
+
+    assert.equal(contributions.find((row) => row.id === "h1")?.totalPnl, 6);
+    assert.equal(contributions.find((row) => row.id === "__unallocated__")?.totalPnl, 4);
+    assert.equal(contributions.reduce((sum, row) => sum + row.totalPnl, 0), 10);
   });
 });
