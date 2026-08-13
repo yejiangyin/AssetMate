@@ -17,6 +17,7 @@ export interface HistoricalPortfolioSnapshot {
   estimateReason: "historical_backfill";
   fxFallback?: boolean;
   holdingUnrealizedPnl: Record<string, number>;
+  holdingValuationDates: Record<string, string>;
 }
 
 export interface SnapshotBackfillResult {
@@ -53,7 +54,7 @@ function utcDate(value: string) {
   return new Date(`${value}T00:00:00.000Z`);
 }
 
-function shiftDate(value: string, days: number) {
+export function shiftDate(value: string, days: number) {
   return new Date(utcDate(value).getTime() + days * DAY_MS).toISOString().slice(0, 10);
 }
 
@@ -156,13 +157,14 @@ function positionOnDate(
   return { quantity, costBasis: Math.max(0, costBasis) };
 }
 
-function latestPrice(points: DailyPricePoint[], date: string) {
-  let value: number | undefined;
+function latestPricePoint(points: DailyPricePoint[], date: string) {
+  let latest: DailyPricePoint | undefined;
   for (const point of points) {
-    if (point.date > date) break;
-    if (Number.isFinite(point.price) && point.price > 0) value = point.price;
+    if (point.date > date) continue;
+    if (!Number.isFinite(point.price) || point.price <= 0) continue;
+    if (!latest || point.date > latest.date) latest = point;
   }
-  return value;
+  return latest;
 }
 
 function cumulativeBreakdown(events: PortfolioEvent[], baseline: PortfolioEventBaseline, date: string) {
@@ -265,25 +267,32 @@ export async function backfillPortfolioSnapshots(input: {
 
   const snapshots: HistoricalPortfolioSnapshot[] = [];
   const completedDates: string[] = [];
-  const failedDates: string[] = [];
+  const failedDates: string[] = dates.filter((date) => Boolean(input.baseline.positionHistoryStart && date < input.baseline.positionHistoryStart));
   for (const date of dates) {
+    if (input.baseline.positionHistoryStart && date < input.baseline.positionHistoryStart) continue;
     let totalAsset = 0;
     let unrealizedPnl = 0;
     let failed = false;
     let fxFallback = false;
     const holdingUnrealizedPnl: Record<string, number> = {};
+    const holdingValuationDates: Record<string, string> = {};
     for (const identity of identities.values()) {
       const position = positionsByDate.get(date)!.get(identity.key)!;
       if (!(position.quantity > POSITION_EPSILON)) continue;
-      const price = identity.assetType === "cash" ? 1 : latestPrice(priceSeries.get(identity.key) ?? [], date);
+      const pricePoint = identity.assetType === "cash"
+        ? undefined
+        : latestPricePoint(priceSeries.get(identity.key) ?? [], date);
+      const price = identity.assetType === "cash" ? 1 : pricePoint?.price;
       if (!(price && price > 0)) {
         failed = true;
         continue;
       }
       const currency = identity.currency.toUpperCase();
       let rate = 1;
+      let ratePoint: DailyPricePoint | undefined;
       if (currency !== "CNY") {
-        const historicalRate = latestPrice(fxSeries.get(currency) ?? [], date);
+        ratePoint = latestPricePoint(fxSeries.get(currency) ?? [], date);
+        const historicalRate = ratePoint?.price;
         const fallbackRate = FX[currency as keyof typeof FX];
         if (historicalRate) {
           rate = historicalRate;
@@ -300,6 +309,13 @@ export async function backfillPortfolioSnapshots(input: {
       totalAsset += marketValue;
       unrealizedPnl += holdingPnl;
       holdingUnrealizedPnl[identity.holdingId ?? identity.key] = holdingPnl;
+      // Preserve the source quote/NAV date. A Friday NAV carried into a
+      // Saturday/Sunday snapshot must remain Friday; otherwise the returns
+      // engine mistakes a delayed publication/backfill for weekend profit.
+      // Foreign cash has no security quote, so its FX point is its valuation.
+      holdingValuationDates[identity.holdingId ?? identity.key] = identity.assetType === "cash"
+        ? (ratePoint?.date ?? date)
+        : pricePoint!.date;
     }
     if (failed) {
       failedDates.push(date);
@@ -322,9 +338,10 @@ export async function backfillPortfolioSnapshots(input: {
       estimateReason: "historical_backfill",
       fxFallback: fxFallback || undefined,
       holdingUnrealizedPnl,
+      holdingValuationDates,
     });
     completedDates.push(date);
   }
 
-  return { snapshots, completedDates, failedDates, errors };
+  return { snapshots, completedDates, failedDates: [...new Set(failedDates)].sort(), errors };
 }

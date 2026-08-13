@@ -21,6 +21,7 @@ import {
 } from "../utils/corporateActionNotices";
 import { groupName, t } from "../i18n";
 import type { PortfolioEvent } from "../services/portfolioEvents";
+import { latestPnlDateLabel } from "../utils/returnDateLabel";
 
 const UNGROUPED = { id: "", name: "未分组", color: "var(--text-micro)" };
 const SERIES_DISPLAY_POINTS = 30;
@@ -490,6 +491,8 @@ export function Dashboard() {
     });
   }, [holdings, pnlSort, assetFilter]);
 
+  const rankingToday = ymdFromTime(noticeToday.getTime());
+
   const visibleMovers = useMemo(
     () => getVisibleRanking(rankedMovers, rankingExpanded, DASHBOARD_RANKING_PREVIEW_LIMIT),
     [rankedMovers, rankingExpanded],
@@ -922,6 +925,7 @@ export function Dashboard() {
                   const c = profitColor(item.todayPnl);
                   const rankBadge = rankBadgeStyle(i);
                   const todayPnlCny = toCNY(item.todayPnl, item.currency);
+                  const dateLabel = latestPnlDateLabel(item, rankingToday, language);
                   return (
                     <button key={item.id}
                       onClick={() => openDetail({
@@ -952,9 +956,20 @@ export function Dashboard() {
                         }}>
                         {i + 1}
                       </span>
-                      <div className="flex-1">
-                        <span className="text-tp text-xs font-medium">{item.symbol}</span>
-                        <span className="text-tm text-[10px] ml-1.5">{item.name}</span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <span className="shrink-0 text-xs font-medium text-tp">{item.symbol}</span>
+                          <span className="truncate text-[10px] text-tm">{item.name}</span>
+                          {dateLabel && (
+                            <span
+                              className="shrink-0 rounded-full px-1.5 py-0.5 text-[8px] font-semibold"
+                              style={{ color: "#D97706", background: "rgba(217,119,6,0.11)" }}
+                              title={item.priceDate || dateLabel}
+                            >
+                              {dateLabel}
+                            </span>
+                          )}
+                        </div>
                       </div>
                       <div className="text-right">
                         <span style={{ color: c, fontSize: 12, fontWeight: 600, whiteSpace: "nowrap" }}>

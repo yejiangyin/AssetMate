@@ -5,6 +5,7 @@ import {
   buildClosedHolding,
   computeStats,
   loadInitialState,
+  preserveHoldingLedgerFields,
   resolveFundDividendReinvestPrice,
 } from "./AppContext";
 import type { Holding } from "../data/mockData";
@@ -34,6 +35,39 @@ function holding(patch: Partial<Holding> = {}): Holding {
     ...patch,
   };
 }
+
+describe("holding ledger edit guard", () => {
+  test("preserves financial identity, position, and corporate-action history", () => {
+    const previous = holding({
+      quantity: 10,
+      costPrice: 100,
+      cashDividendTotal: 5,
+      corporateActions: [{ id: "d1", type: "cash_dividend", date: "2026-01-01", amount: 5 }],
+    });
+    const next = holding({
+      symbol: "MSFT",
+      market: "A",
+      currency: "CNY",
+      quantity: 999,
+      costPrice: 1,
+      currentPrice: 130,
+      name: "Renamed",
+      groupId: "g2",
+      cashDividendTotal: 0,
+      corporateActions: [],
+    });
+
+    const guarded = preserveHoldingLedgerFields(previous, next);
+    assert.equal(guarded.symbol, "AAPL");
+    assert.equal(guarded.quantity, 10);
+    assert.equal(guarded.costPrice, 100);
+    assert.equal(guarded.cashDividendTotal, 5);
+    assert.equal(guarded.corporateActions?.length, 1);
+    assert.equal(guarded.currentPrice, 130);
+    assert.equal(guarded.name, "Renamed");
+    assert.equal(guarded.groupId, "g2");
+  });
+});
 
 describe("automatic corporate actions", () => {
   const fundHolding = (patch: Partial<Holding> = {}) => holding({

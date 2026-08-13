@@ -9,6 +9,23 @@ import { fetchTencentQuote, fetchTencentQuoteFromYahooSymbol, fetchTencentTradeS
 import { fetchBinanceCryptoQuote, fetchOkxCryptoQuote } from "./publicMarketApi";
 import { toYahooSymbol } from "./quoteApi";
 import type { TradeStatusValue } from "../utils/tradeStatus";
+import { isTradingDay } from "./tradingCalendar";
+
+function todayShanghaiYMD(now = new Date()): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(now);
+  const pick = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
+  return `${pick("year")}-${pick("month")}-${pick("day")}`;
+}
+
+function localDateFromYmd(value: string) {
+  const [year, month, day] = value.split("-").map(Number);
+  return new Date(year!, month! - 1, day!, 12);
+}
 
 export interface LivePrice {
   price:         number;
@@ -24,6 +41,8 @@ export interface LivePrice {
   fundNavHistory?:        Array<{ date: string; nav: number }>;
   estimatedNav?:           number;
   estimatedChangePercent?: number;
+  estimatedNavAt?:         string;
+  fundEstimateStatus?:     "available" | "unavailable" | "failed";
 }
 
 export interface HoldingLiveUpdate {
@@ -32,6 +51,28 @@ export interface HoldingLiveUpdate {
   autoTradeStatusNote?: string;
   autoTradeStatusSource?: LivePrice["source"] | null;
   fundBuyConfirmDays?: number;
+}
+
+export function resolveFundEstimateUpdate(
+  previous: Pick<LivePrice, "estimatedNav" | "estimatedChangePercent" | "estimatedNavAt">,
+  next: Pick<LivePrice, "estimatedNav" | "estimatedChangePercent" | "estimatedNavAt" | "fundEstimateStatus">,
+  today: string,
+) {
+  if (next.fundEstimateStatus === "available") {
+    return {
+      estimatedNav: next.estimatedNav,
+      estimatedChangePercent: next.estimatedChangePercent,
+      estimatedNavAt: next.estimatedNavAt,
+    };
+  }
+  if (next.fundEstimateStatus === "failed" && previous.estimatedNavAt?.slice(0, 10) === today) {
+    return {
+      estimatedNav: previous.estimatedNav,
+      estimatedChangePercent: previous.estimatedChangePercent,
+      estimatedNavAt: previous.estimatedNavAt,
+    };
+  }
+  return { estimatedNav: undefined, estimatedChangePercent: undefined, estimatedNavAt: undefined };
 }
 
 export type PriceMap = Record<string, HoldingLiveUpdate>;
@@ -247,7 +288,7 @@ function normalTradeStatusFromSource(source: LivePrice["source"]): Pick<HoldingL
   };
 }
 
-async function eastMoneyFundLive(code: string): Promise<LivePrice | null> {
+export async function eastMoneyFundLive(code: string, now: Date = new Date()): Promise<LivePrice | null> {
   try {
     const [estimate, history] = await Promise.all([
       fetchCnFundEstimate(code),
@@ -258,6 +299,11 @@ async function eastMoneyFundLive(code: string): Promise<LivePrice | null> {
     const gsz = estimate?.estimatedNav ?? 0;
     const dwjz = estimate?.officialNav ?? 0;
     const gszPct = estimate?.estimatedChangePercent ?? Number.NaN;
+    const fundEstimateStatus: LivePrice["fundEstimateStatus"] = gsz > 0
+      ? "available"
+      : estimate
+        ? "unavailable"
+        : "failed";
     const latestHistory = sortedHistory[0];
     const prevHistory = sortedHistory[1];
     const historyNav = latestHistory?.nav ?? 0;
@@ -267,25 +313,43 @@ async function eastMoneyFundLive(code: string): Promise<LivePrice | null> {
       estimateOfficialNav > 0 &&
       estimateOfficialDate &&
       (!latestHistory?.date || estimateOfficialDate > latestHistory.date);
-    const price = useEstimateOfficial
-      ? estimateOfficialNav
-      : (historyNav > 0
-        ? historyNav
-        : (officialNav ?? (estimateOfficialNav > 0 ? estimateOfficialNav : 0)));
-    if (!(price > 0)) return null;
-    const priceDate = useEstimateOfficial
+    const effectiveOfficialDate = useEstimateOfficial
       ? estimateOfficialDate
-      : (latestHistory?.date ?? estimate?.officialDate);
-    const prevClose = useEstimateOfficial && latestHistory?.nav && latestHistory.nav > 0
-      ? latestHistory.nav
-      : (prevHistory?.nav && prevHistory.nav > 0
-        ? prevHistory.nav
-        : price);
+      : (latestHistory?.date ?? estimateOfficialDate);
+    const todayShanghai = todayShanghaiYMD(now);
+    // When the latest official NAV is older than today and an intraday estimate
+    // (gsz) is available, use the estimate as the current price so today's
+    // synthetic snapshot reflects intraday movement instead of showing 0.
+    const useIntradayEstimate =
+      gsz > 0 &&
+      !useEstimateOfficial &&
+      effectiveOfficialDate < todayShanghai &&
+      isTradingDay("FUND", localDateFromYmd(todayShanghai));
+    const price = useIntradayEstimate
+      ? gsz
+      : (useEstimateOfficial
+        ? estimateOfficialNav
+        : (historyNav > 0
+          ? historyNav
+          : (officialNav ?? (estimateOfficialNav > 0 ? estimateOfficialNav : 0))));
+    if (!(price > 0)) return null;
+    const priceDate = useIntradayEstimate
+      ? todayShanghai
+      : (useEstimateOfficial ? estimateOfficialDate : (latestHistory?.date ?? estimate?.officialDate));
+    const prevClose = useIntradayEstimate
+      ? (historyNav > 0 ? historyNav : (estimateOfficialNav > 0 ? estimateOfficialNav : price))
+      : (useEstimateOfficial && latestHistory?.nav && latestHistory.nav > 0
+        ? latestHistory.nav
+        : (prevHistory?.nav && prevHistory.nav > 0
+          ? prevHistory.nav
+          : price));
     const change = price - prevClose;
     const historyPct = Number(latestHistory?.changePercent);
-    const pct = !useEstimateOfficial && Number.isFinite(historyPct) && historyPct !== 0
-      ? historyPct / 100
-      : (prevClose > 0 ? change / prevClose : 0);
+    const pct = useIntradayEstimate
+      ? (!isNaN(gszPct) ? gszPct / 100 : (prevClose > 0 ? change / prevClose : 0))
+      : (!useEstimateOfficial && Number.isFinite(historyPct) && historyPct !== 0
+        ? historyPct / 100
+        : (prevClose > 0 ? change / prevClose : 0));
     return {
       price, change, changePercent: pct, prevClose,
       high: price, low: price, volume: 0,
@@ -296,6 +360,8 @@ async function eastMoneyFundLive(code: string): Promise<LivePrice | null> {
         .map((row) => ({ date: row.date, nav: row.nav })),
       estimatedNav: gsz > 0 ? gsz : undefined,
       estimatedChangePercent: gsz > 0 && !isNaN(gszPct) ? gszPct / 100 : undefined,
+      estimatedNavAt: gsz > 0 ? (estimate?.estimateTime ?? todayShanghai) : undefined,
+      fundEstimateStatus,
     };
   } catch {
     return null;

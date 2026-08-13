@@ -37,6 +37,7 @@ export interface FundEstimateSnapshot {
   officialNav: number;
   estimatedNav: number;
   estimatedChangePercent: number;
+  estimateTime?: string;
 }
 
 export interface FundOfficialHistoryItem {
@@ -226,26 +227,67 @@ function mkAbort(ms: number): [AbortSignal, () => void] {
   return [ctrl.signal, () => clearTimeout(tid)];
 }
 
+function fundEstimateFromRow(row: Record<string, unknown>): FundEstimateSnapshot | null {
+  const officialNav = Number(row.NAV ?? row.dwjz);
+  const estimatedNav = Number(row.GSZ ?? row.gsz);
+  const estimatedChangePercent = Number(row.GSZZL ?? row.gszzl);
+  const officialDate = String(row.PDATE ?? row.jzrq ?? "");
+  const name = String(row.SHORTNAME ?? row.name ?? "");
+  const estimateTime = String(row.GZTIME ?? row.gztime ?? "");
+  if (!(officialNav > 0) && !(estimatedNav > 0)) return null;
+  return {
+    name: name || undefined,
+    officialDate: /^\d{4}-\d{2}-\d{2}$/.test(officialDate) ? officialDate : undefined,
+    officialNav: officialNav > 0 ? officialNav : Number.NaN,
+    estimatedNav: estimatedNav > 0 ? estimatedNav : Number.NaN,
+    estimatedChangePercent: Number.isFinite(estimatedChangePercent) ? estimatedChangePercent : Number.NaN,
+    estimateTime: /^\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?$/.test(estimateTime)
+      ? estimateTime
+      : undefined,
+  };
+}
+
 export async function fetchCnFundEstimate(code: string): Promise<FundEstimateSnapshot | null> {
+  const normalizedCode = code.trim();
+  const fields = "FCODE,SHORTNAME,GSZZL,GZTIME,GSZ,NAV,PDATE";
+  const hosts = ["fundcomapi.tiantianfunds.com", "fundcomapi.eastmoney.com"];
+  for (const host of hosts) {
+    const [signal, clear] = mkAbort(6000);
+    try {
+      const params = new URLSearchParams({ FCODES: normalizedCode, FIELDS: fields });
+      const res = await fetch(`https://${host}/mm/newCore/FundValuationLast?${params}`, {
+        signal,
+        cache: "no-store",
+        headers: { Referer: "https://h5.1234567.com.cn/" },
+      });
+      clear();
+      if (!res.ok) continue;
+      const json = await res.json();
+      const row = Array.isArray(json?.data)
+        ? json.data.find((item: Record<string, unknown>) => String(item?.FCODE ?? "") === normalizedCode) ?? json.data[0]
+        : json?.data;
+      if (row && typeof row === "object") {
+        // A valid row with GSZ=null means this fund currently has no published
+        // intraday estimate. Keep its official NAV instead of falling through
+        // to an obsolete endpoint and accidentally reviving stale data.
+        return fundEstimateFromRow(row as Record<string, unknown>);
+      }
+    } catch {
+      clear();
+    }
+  }
+
+  // Last-resort compatibility for deployments where the replacement endpoint
+  // is blocked but the legacy JSONP endpoint is still reachable.
   const [signal, clear] = mkAbort(6000);
   try {
-    const url = `https://fundgz.1234567.com.cn/js/${encodeURIComponent(code)}.js?rt=${Date.now()}`;
+    const url = `https://fundgz.1234567.com.cn/js/${encodeURIComponent(normalizedCode)}.js?rt=${Date.now()}`;
     const res = await fetch(url, { signal, cache: "no-store" });
     clear();
     if (!res.ok) return null;
-
     const text = await res.text();
     const match = text.match(/jsonpgz\((\{[\s\S]*?\})\)/);
-    if (!match) return null;
-
-    const data = JSON.parse(match[1]!);
-    return {
-      name: typeof data?.name === "string" ? data.name : undefined,
-      officialDate: typeof data?.jzrq === "string" ? data.jzrq : undefined,
-      officialNav: parseFloat(String(data?.dwjz ?? "")),
-      estimatedNav: parseFloat(String(data?.gsz ?? "")),
-      estimatedChangePercent: parseFloat(String(data?.gszzl ?? "")),
-    };
+    return match ? fundEstimateFromRow(JSON.parse(match[1]!)) : null;
   } catch {
     clear();
     return null;

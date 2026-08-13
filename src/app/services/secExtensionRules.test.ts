@@ -24,4 +24,10 @@ describe("SEC extension request identity", () => {
       assert.match(userAgent.value, /github\.com\/yejiangyin\/AssetMate\/issues/);
     }
   });
+
+  test("grants the production hosts used by realtime fund valuation", () => {
+    const manifest = JSON.parse(readFileSync("public/manifest.json", "utf8"));
+    assert.equal(manifest.host_permissions.includes("https://fundcomapi.tiantianfunds.com/mm/newCore/*"), true);
+    assert.equal(manifest.host_permissions.includes("https://fundcomapi.eastmoney.com/mm/newCore/*"), true);
+  });
 });

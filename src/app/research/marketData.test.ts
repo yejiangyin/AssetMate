@@ -5,6 +5,9 @@ import { buildPublicResearchContext } from "./contextBuilder";
 import { enrichResearchTarget, enrichResearchTargets, type ResearchMarketDataDependencies } from "./marketData";
 import type { ResearchTarget } from "./types";
 
+const TEST_DATA_DATE = new Date().toISOString().slice(0, 10);
+const TEST_PREVIOUS_DATE = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+
 function quote(symbol: string, price: number, currency = "USD"): QuoteInfo {
   return {
     symbol,
@@ -32,8 +35,8 @@ function chart(symbol: string, price: number, currency = "USD"): ChartData {
   return {
     quote: quote(symbol, price, currency),
     points: [
-      { time: "2026-07-17", dateLabel: "2026-07-17", timestamp: Date.parse("2026-07-17T00:00:00Z"), price: price - 1, volume: 900 },
-      { time: "2026-07-18", dateLabel: "2026-07-18", timestamp: Date.parse("2026-07-18T00:00:00+08:00"), price, volume: 1_000 },
+      { time: TEST_PREVIOUS_DATE, dateLabel: TEST_PREVIOUS_DATE, timestamp: Date.parse(`${TEST_PREVIOUS_DATE}T00:00:00Z`), price: price - 1, volume: 900 },
+      { time: TEST_DATA_DATE, dateLabel: TEST_DATA_DATE, timestamp: Date.parse(`${TEST_DATA_DATE}T00:00:00Z`), price, volume: 1_000 },
     ],
   };
 }
@@ -67,7 +70,7 @@ describe("research market-data enrichment", () => {
     assert.equal(contexts.length, 2);
     assert.equal(contexts[0]?.target.currentPrice, 200);
     assert.equal(contexts[1]?.target.currentPrice, 500);
-    assert.equal(contexts[0]?.recentPrices?.at(-1)?.date, "2026-07-18");
+    assert.equal(contexts[0]?.recentPrices?.at(-1)?.date, TEST_DATA_DATE);
     assert.equal(contexts[0]?.provenance.find((item) => item.dataset === "quote")?.provider, "AssetMate market data router");
     assert.equal(contexts[0]?.provenance.find((item) => item.dataset === "price_history")?.adjustmentMode, "unknown");
 
@@ -75,7 +78,7 @@ describe("research market-data enrichment", () => {
       targets: contexts.map((context) => context.target),
       targetContexts: contexts,
     });
-    assert.equal(publicContext.dataCutoff, "2026-07-18");
+    assert.equal(publicContext.dataCutoff, TEST_DATA_DATE);
     assert.equal(publicContext.dataStatus?.targetCount, 2);
     assert.equal(publicContext.targetContexts?.length, 2);
   });

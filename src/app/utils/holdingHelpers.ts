@@ -34,14 +34,6 @@ function canConfigureDividendReinvest(market: string, assetType: string) {
   return market === "FUND" && assetType === "fund";
 }
 
-function holdingFeeTaxTotal(actions: Holding["corporateActions"]) {
-  return (actions ?? []).reduce((sum, action) => (
-    action.type === "fee" || action.type === "tax"
-      ? sum - Math.abs(Number.isFinite(action.amount) ? action.amount ?? 0 : 0)
-      : sum
-  ), 0);
-}
-
 export function normalizeHolding(h: Holding): Holding {
   const normalizedType = normalizeHoldingType(h.symbol, h.name, h.market, h.assetType);
   const normalizedSymbol = normalizeHoldingSymbol(h.symbol, normalizedType.market);
@@ -77,9 +69,6 @@ export function normalizeHolding(h: Holding): Holding {
   const fundBuyConfirmDays = Number.isInteger(h.fundBuyConfirmDays) && h.fundBuyConfirmDays! >= 0 && h.fundBuyConfirmDays! <= 30
     ? h.fundBuyConfirmDays
     : undefined;
-  // Holding-level totalPnl remains total return for backward-compatible views;
-  // portfolio stats split dividends out of unrealized P/L.
-  const totalPnlWithDividend = totalPnl + cashDividendTotal + holdingFeeTaxTotal(corporateActions);
   return {
     ...h,
     symbol: normalizedSymbol,
@@ -93,14 +82,19 @@ export function normalizeHolding(h: Holding): Holding {
     fundBuyConfirmDays,
     priceDate: h.priceDate ?? "",
     fundNavHistory,
+    estimatedNav: Number.isFinite(h.estimatedNav) && h.estimatedNav! > 0 ? h.estimatedNav : undefined,
+    estimatedChangePercent: Number.isFinite(h.estimatedChangePercent) ? h.estimatedChangePercent : undefined,
+    estimatedNavAt: typeof h.estimatedNavAt === "string" ? h.estimatedNavAt : undefined,
     cashDividendTotal,
     dividendReinvest: canConfigureDividendReinvest(normalizedType.market, normalizedType.assetType) && typeof h.dividendReinvest === "boolean" ? h.dividendReinvest : null,
     autoCorporateActionSince: h.autoCorporateActionSince ?? "",
     corporateActions,
     transactionCostProfile: normalizeTransactionCostProfile(h.transactionCostProfile),
     marketValue,
-    totalPnl: totalPnlWithDividend,
-    totalPnlRate: costBasis > 0 ? totalPnlWithDividend / costBasis : 0,
+    // Holding-level metrics describe the open position only. Dividends,
+    // realized trades, fees and taxes belong to the portfolio return ledger.
+    totalPnl,
+    totalPnlRate: costBasis > 0 ? totalPnl / costBasis : 0,
   };
 }
 
@@ -114,9 +108,7 @@ export function recomputeHoldingMetrics(
   const marketValue = next.quantity * next.currentPrice;
   const costBasis = next.quantity * next.costPrice;
   const cashDividendTotal = Number.isFinite(next.cashDividendTotal) ? Math.max(0, next.cashDividendTotal ?? 0) : 0;
-  // Holding-level totalPnl remains total return for backward-compatible views;
-  // portfolio stats split dividends out of unrealized P/L.
-  const totalPnl = marketValue - costBasis + cashDividendTotal + holdingFeeTaxTotal(next.corporateActions);
+  const totalPnl = marketValue - costBasis;
   return {
     ...next,
     cashDividendTotal,
