@@ -69,6 +69,9 @@ export function normalizeHolding(h: Holding): Holding {
   const fundBuyConfirmDays = Number.isInteger(h.fundBuyConfirmDays) && h.fundBuyConfirmDays! >= 0 && h.fundBuyConfirmDays! <= 30
     ? h.fundBuyConfirmDays
     : undefined;
+  const fundSellConfirmDays = Number.isInteger(h.fundSellConfirmDays) && h.fundSellConfirmDays! >= 0 && h.fundSellConfirmDays! <= 30
+    ? h.fundSellConfirmDays
+    : undefined;
   return {
     ...h,
     symbol: normalizedSymbol,
@@ -79,7 +82,29 @@ export function normalizeHolding(h: Holding): Holding {
     autoTradeStatus: h.autoTradeStatus ?? null,
     autoTradeStatusNote: h.autoTradeStatusNote ?? "",
     autoTradeStatusSource: h.autoTradeStatusSource ?? null,
+    autoTradeStatusUpdatedAt: typeof h.autoTradeStatusUpdatedAt === "string" ? h.autoTradeStatusUpdatedAt : undefined,
+    autoTradeStatusStale: Boolean(h.autoTradeStatusStale),
+    autoTradeStatusRefreshNote: typeof h.autoTradeStatusRefreshNote === "string" ? h.autoTradeStatusRefreshNote : "",
     fundBuyConfirmDays,
+    fundSellConfirmDays,
+    fundPurchaseStatus: h.fundPurchaseStatus ?? "unknown",
+    fundDcaStatus: h.fundDcaStatus ?? "unknown",
+    fundRedemptionStatus: h.fundRedemptionStatus ?? "unknown",
+    fundPurchaseStatusNote: typeof h.fundPurchaseStatusNote === "string" ? h.fundPurchaseStatusNote : "",
+    fundDcaStatusNote: typeof h.fundDcaStatusNote === "string" ? h.fundDcaStatusNote : "",
+    fundRedemptionStatusNote: typeof h.fundRedemptionStatusNote === "string" ? h.fundRedemptionStatusNote : "",
+    fundMinPurchaseAmount: Number.isFinite(h.fundMinPurchaseAmount) && h.fundMinPurchaseAmount! > 0 ? h.fundMinPurchaseAmount : undefined,
+    fundMinDcaAmount: Number.isFinite(h.fundMinDcaAmount) && h.fundMinDcaAmount! > 0 ? h.fundMinDcaAmount : undefined,
+    fundMinRedemptionQuantity: Number.isFinite(h.fundMinRedemptionQuantity) && h.fundMinRedemptionQuantity! > 0 ? h.fundMinRedemptionQuantity : undefined,
+    fundMinRemainingQuantity: Number.isFinite(h.fundMinRemainingQuantity) && h.fundMinRemainingQuantity! > 0 ? h.fundMinRemainingQuantity : undefined,
+    fundBuyCutoffMinutes: Number.isInteger(h.fundBuyCutoffMinutes) && h.fundBuyCutoffMinutes! >= 0 && h.fundBuyCutoffMinutes! < 24 * 60 ? h.fundBuyCutoffMinutes : undefined,
+    fundSellCutoffMinutes: Number.isInteger(h.fundSellCutoffMinutes) && h.fundSellCutoffMinutes! >= 0 && h.fundSellCutoffMinutes! < 24 * 60 ? h.fundSellCutoffMinutes : undefined,
+    fundDcaCutoffMinutes: Number.isInteger(h.fundDcaCutoffMinutes) && h.fundDcaCutoffMinutes! >= 0 && h.fundDcaCutoffMinutes! < 24 * 60 ? h.fundDcaCutoffMinutes : undefined,
+    fundBuyCancellationAllowed: typeof h.fundBuyCancellationAllowed === "boolean" ? h.fundBuyCancellationAllowed : undefined,
+    fundSellCancellationAllowed: typeof h.fundSellCancellationAllowed === "boolean" ? h.fundSellCancellationAllowed : undefined,
+    fundDcaCancellationAllowed: typeof h.fundDcaCancellationAllowed === "boolean" ? h.fundDcaCancellationAllowed : undefined,
+    fundCancellationRuleSource: typeof h.fundCancellationRuleSource === "string" ? h.fundCancellationRuleSource : undefined,
+    fundTradeRulesUpdatedAt: typeof h.fundTradeRulesUpdatedAt === "string" ? h.fundTradeRulesUpdatedAt : undefined,
     priceDate: h.priceDate ?? "",
     fundNavHistory,
     estimatedNav: Number.isFinite(h.estimatedNav) && h.estimatedNav! > 0 ? h.estimatedNav : undefined,
@@ -154,9 +179,33 @@ export function buildHolding(input: HoldingInput, id: string): Holding {
     autoTradeStatus: input.autoTradeStatus ?? null,
     autoTradeStatusNote: input.autoTradeStatusNote ?? "",
     autoTradeStatusSource: input.autoTradeStatusSource ?? null,
+    autoTradeStatusUpdatedAt: typeof input.autoTradeStatusUpdatedAt === "string" ? input.autoTradeStatusUpdatedAt : undefined,
+    autoTradeStatusStale: Boolean(input.autoTradeStatusStale),
+    autoTradeStatusRefreshNote: input.autoTradeStatusRefreshNote ?? "",
     fundBuyConfirmDays: Number.isInteger(input.fundBuyConfirmDays) && input.fundBuyConfirmDays! >= 0 && input.fundBuyConfirmDays! <= 30
       ? input.fundBuyConfirmDays
       : undefined,
+    fundSellConfirmDays: Number.isInteger(input.fundSellConfirmDays) && input.fundSellConfirmDays! >= 0 && input.fundSellConfirmDays! <= 30
+      ? input.fundSellConfirmDays
+      : undefined,
+    fundPurchaseStatus: input.fundPurchaseStatus ?? "unknown",
+    fundDcaStatus: input.fundDcaStatus ?? "unknown",
+    fundRedemptionStatus: input.fundRedemptionStatus ?? "unknown",
+    fundPurchaseStatusNote: input.fundPurchaseStatusNote ?? "",
+    fundDcaStatusNote: input.fundDcaStatusNote ?? "",
+    fundRedemptionStatusNote: input.fundRedemptionStatusNote ?? "",
+    fundMinPurchaseAmount: Number.isFinite(input.fundMinPurchaseAmount) && input.fundMinPurchaseAmount! > 0 ? input.fundMinPurchaseAmount : undefined,
+    fundMinDcaAmount: Number.isFinite(input.fundMinDcaAmount) && input.fundMinDcaAmount! > 0 ? input.fundMinDcaAmount : undefined,
+    fundMinRedemptionQuantity: Number.isFinite(input.fundMinRedemptionQuantity) && input.fundMinRedemptionQuantity! > 0 ? input.fundMinRedemptionQuantity : undefined,
+    fundMinRemainingQuantity: Number.isFinite(input.fundMinRemainingQuantity) && input.fundMinRemainingQuantity! > 0 ? input.fundMinRemainingQuantity : undefined,
+    fundBuyCutoffMinutes: Number.isInteger(input.fundBuyCutoffMinutes) && input.fundBuyCutoffMinutes! >= 0 && input.fundBuyCutoffMinutes! < 24 * 60 ? input.fundBuyCutoffMinutes : undefined,
+    fundSellCutoffMinutes: Number.isInteger(input.fundSellCutoffMinutes) && input.fundSellCutoffMinutes! >= 0 && input.fundSellCutoffMinutes! < 24 * 60 ? input.fundSellCutoffMinutes : undefined,
+    fundDcaCutoffMinutes: Number.isInteger(input.fundDcaCutoffMinutes) && input.fundDcaCutoffMinutes! >= 0 && input.fundDcaCutoffMinutes! < 24 * 60 ? input.fundDcaCutoffMinutes : undefined,
+    fundBuyCancellationAllowed: typeof input.fundBuyCancellationAllowed === "boolean" ? input.fundBuyCancellationAllowed : undefined,
+    fundSellCancellationAllowed: typeof input.fundSellCancellationAllowed === "boolean" ? input.fundSellCancellationAllowed : undefined,
+    fundDcaCancellationAllowed: typeof input.fundDcaCancellationAllowed === "boolean" ? input.fundDcaCancellationAllowed : undefined,
+    fundCancellationRuleSource: typeof input.fundCancellationRuleSource === "string" ? input.fundCancellationRuleSource : undefined,
+    fundTradeRulesUpdatedAt: typeof input.fundTradeRulesUpdatedAt === "string" ? input.fundTradeRulesUpdatedAt : undefined,
     updatedAt:    new Date().toISOString(),
   };
 }

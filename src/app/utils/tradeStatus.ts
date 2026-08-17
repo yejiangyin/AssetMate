@@ -1,4 +1,6 @@
-export type TradeStatusValue = "normal" | "suspended" | "fund_limit" | "buy_disabled";
+export type TradeStatusValue = "normal" | "suspended" | "fund_limit" | "buy_disabled" | "unknown";
+export type TradeStatusRefreshState = "success" | "failed" | "unsupported";
+export const TRADE_STATUS_FRESHNESS_MS = 36 * 60 * 60 * 1000;
 
 export interface TradeStatusCarrier {
   tradeStatus?: TradeStatusValue;
@@ -6,6 +8,18 @@ export interface TradeStatusCarrier {
   autoTradeStatus?: TradeStatusValue | null;
   autoTradeStatusNote?: string;
   autoTradeStatusSource?: string | null;
+  autoTradeStatusUpdatedAt?: string;
+  autoTradeStatusStale?: boolean;
+  autoTradeStatusRefreshNote?: string;
+}
+
+export interface TradeStatusRefreshPatch {
+  autoTradeStatus?: TradeStatusValue | null;
+  autoTradeStatusNote?: string;
+  autoTradeStatusSource?: string | null;
+  autoTradeStatusUpdatedAt?: string;
+  autoTradeStatusRefreshState?: TradeStatusRefreshState;
+  autoTradeStatusRefreshNote?: string;
 }
 
 export function tradeStatusSourceLabel(source?: string | null) {
@@ -37,9 +51,51 @@ export function tradeStatusLabel(status: TradeStatusValue) {
       return "基金限购";
     case "buy_disabled":
       return "当前不可买入";
+    case "unknown":
+      return "交易状态未知";
     default:
       return "正常可买";
   }
+}
+
+export function mergeAutomaticTradeStatus(
+  current: TradeStatusCarrier,
+  incoming: TradeStatusRefreshPatch,
+) {
+  const refreshState = incoming.autoTradeStatusRefreshState;
+  if (refreshState === "success" || (!refreshState && incoming.autoTradeStatus != null)) {
+    return {
+      autoTradeStatus: incoming.autoTradeStatus ?? "unknown" as TradeStatusValue,
+      autoTradeStatusNote: incoming.autoTradeStatusNote ?? "",
+      autoTradeStatusSource: incoming.autoTradeStatusSource ?? null,
+      autoTradeStatusUpdatedAt: incoming.autoTradeStatusUpdatedAt ?? new Date().toISOString(),
+      autoTradeStatusStale: false,
+      autoTradeStatusRefreshNote: "",
+    };
+  }
+  if (refreshState === "failed" || refreshState === "unsupported") {
+    const previousStatus = current.autoTradeStatus && current.autoTradeStatus !== "unknown"
+      ? current.autoTradeStatus
+      : null;
+    const refreshNote = incoming.autoTradeStatusRefreshNote
+      ?? (refreshState === "unsupported" ? "当前数据源未提供交易状态" : "交易状态刷新失败");
+    return {
+      autoTradeStatus: previousStatus ?? "unknown" as TradeStatusValue,
+      autoTradeStatusNote: previousStatus ? (current.autoTradeStatusNote ?? "") : refreshNote,
+      autoTradeStatusSource: current.autoTradeStatusSource ?? incoming.autoTradeStatusSource ?? null,
+      autoTradeStatusUpdatedAt: current.autoTradeStatusUpdatedAt,
+      autoTradeStatusStale: true,
+      autoTradeStatusRefreshNote: refreshNote,
+    };
+  }
+  return {
+    autoTradeStatus: current.autoTradeStatus ?? null,
+    autoTradeStatusNote: current.autoTradeStatusNote ?? "",
+    autoTradeStatusSource: current.autoTradeStatusSource ?? null,
+    autoTradeStatusUpdatedAt: current.autoTradeStatusUpdatedAt,
+    autoTradeStatusStale: current.autoTradeStatusStale ?? false,
+    autoTradeStatusRefreshNote: current.autoTradeStatusRefreshNote ?? "",
+  };
 }
 
 export function cleanTradeSource(source: string) {
@@ -61,7 +117,13 @@ export function cleanTradeNote(note: string | undefined, label: string) {
 }
 
 export function resolveHoldingTradeStatus(item: TradeStatusCarrier) {
-  const autoBlocked = item.autoTradeStatus && item.autoTradeStatus !== "normal"
+  const updatedAtMs = Date.parse(item.autoTradeStatusUpdatedAt ?? "");
+  const timedOut = Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs > TRADE_STATUS_FRESHNESS_MS;
+  const automaticStatusStale = Boolean(item.autoTradeStatusStale || timedOut);
+  const lastSuccessfulCheck = item.autoTradeStatusUpdatedAt
+    ? `上次成功更新 ${item.autoTradeStatusUpdatedAt.replace("T", " ").slice(0, 16)}`
+    : "";
+  const autoBlocked = item.autoTradeStatus && item.autoTradeStatus !== "normal" && item.autoTradeStatus !== "unknown"
     ? {
         status: item.autoTradeStatus,
         note: item.autoTradeStatusNote ?? "",
@@ -73,7 +135,9 @@ export function resolveHoldingTradeStatus(item: TradeStatusCarrier) {
   if (autoBlocked) {
     return {
       ...autoBlocked,
+      note: [autoBlocked.note, automaticStatusStale ? (item.autoTradeStatusRefreshNote || "状态已过期，沿用上次成功结果") : "", automaticStatusStale ? lastSuccessfulCheck : ""].filter(Boolean).join("；"),
       label: tradeStatusLabel(autoBlocked.status),
+      stale: automaticStatusStale,
     };
   }
 
@@ -84,6 +148,18 @@ export function resolveHoldingTradeStatus(item: TradeStatusCarrier) {
       source: "手动",
       label: tradeStatusLabel(item.tradeStatus),
       automatic: false,
+      stale: false,
+    };
+  }
+
+  if (item.autoTradeStatus === "unknown" || automaticStatusStale) {
+    return {
+      status: "unknown" as const,
+      note: [item.autoTradeStatusRefreshNote || item.autoTradeStatusNote || "未取得可靠的交易状态", lastSuccessfulCheck].filter(Boolean).join("；"),
+      source: item.autoTradeStatusSource ? `自动 · ${tradeStatusSourceLabel(item.autoTradeStatusSource)}` : "自动",
+      label: tradeStatusLabel("unknown"),
+      automatic: true,
+      stale: automaticStatusStale,
     };
   }
 
@@ -95,5 +171,6 @@ export function resolveHoldingTradeStatus(item: TradeStatusCarrier) {
       : "",
     label: tradeStatusLabel("normal"),
     automatic: item.autoTradeStatus === "normal",
+    stale: false,
   };
 }

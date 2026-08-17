@@ -24,11 +24,22 @@ import {
   groupName,
   marketLabel,
   t,
+  translateDcaReason,
   translateTradeText,
 } from "../i18n";
 import type { Language } from "../context/AppContext";
 import type { PortfolioEvent } from "../services/portfolioEvents";
 import { summarizeHoldingDividends, type HoldingDividendSummary } from "../utils/holdingDividendSummary";
+import {
+  computeFundEffectiveDate,
+  computeFundOrderConfirmDate,
+  defaultFundConfirmDays,
+  fundOrderCancellationState,
+  fundOrderConfirmationQuote,
+  pendingSellQuantity,
+  resolveFundOrderCutoff,
+} from "../utils/fundOrders";
+import { buildTransactionRecords, type TransactionRecord } from "../utils/transactionRecords";
 
 /* ─── constants ──────────────────────────────────────── */
 function getSecurityBadge(market: string, assetType?: string, language: Language = "zh") {
@@ -757,6 +768,29 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
       autoTradeStatus: null,
       autoTradeStatusNote: "",
       autoTradeStatusSource: null,
+      autoTradeStatusUpdatedAt: undefined,
+      autoTradeStatusStale: false,
+      autoTradeStatusRefreshNote: "",
+      fundBuyConfirmDays: undefined,
+      fundSellConfirmDays: undefined,
+      fundPurchaseStatus: "unknown",
+      fundDcaStatus: "unknown",
+      fundRedemptionStatus: "unknown",
+      fundPurchaseStatusNote: "",
+      fundDcaStatusNote: "",
+      fundRedemptionStatusNote: "",
+      fundMinPurchaseAmount: undefined,
+      fundMinDcaAmount: undefined,
+      fundMinRedemptionQuantity: undefined,
+      fundMinRemainingQuantity: undefined,
+      fundBuyCutoffMinutes: undefined,
+      fundSellCutoffMinutes: undefined,
+      fundDcaCutoffMinutes: undefined,
+      fundBuyCancellationAllowed: undefined,
+      fundSellCancellationAllowed: undefined,
+      fundDcaCancellationAllowed: undefined,
+      fundCancellationRuleSource: undefined,
+      fundTradeRulesUpdatedAt: undefined,
     }));
   };
 
@@ -778,6 +812,29 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
       autoTradeStatus: null,
       autoTradeStatusNote: "",
       autoTradeStatusSource: null,
+      autoTradeStatusUpdatedAt: undefined,
+      autoTradeStatusStale: false,
+      autoTradeStatusRefreshNote: "",
+      fundBuyConfirmDays: undefined,
+      fundSellConfirmDays: undefined,
+      fundPurchaseStatus: "unknown",
+      fundDcaStatus: "unknown",
+      fundRedemptionStatus: "unknown",
+      fundPurchaseStatusNote: "",
+      fundDcaStatusNote: "",
+      fundRedemptionStatusNote: "",
+      fundMinPurchaseAmount: undefined,
+      fundMinDcaAmount: undefined,
+      fundMinRedemptionQuantity: undefined,
+      fundMinRemainingQuantity: undefined,
+      fundBuyCutoffMinutes: undefined,
+      fundSellCutoffMinutes: undefined,
+      fundDcaCutoffMinutes: undefined,
+      fundBuyCancellationAllowed: undefined,
+      fundSellCancellationAllowed: undefined,
+      fundDcaCancellationAllowed: undefined,
+      fundCancellationRuleSource: undefined,
+      fundTradeRulesUpdatedAt: undefined,
     }));
 
     // Search endpoints may include delayed or previous-session prices. Keep that
@@ -798,22 +855,62 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
 
     const market = normalizedType.market;
     const sym = normalizedSymbol;
+    const markTradeStatusUnknown = (note: string) => {
+      if (requestSeq !== requestSeqRef.current) return;
+      setForm((f) => f.symbol === sym && f.market === market
+        ? { ...f, autoTradeStatus: "unknown", autoTradeStatusNote: note, autoTradeStatusSource: market === "FUND" ? "eastmoney" : "tencent", autoTradeStatusStale: true, autoTradeStatusRefreshNote: note }
+        : f);
+    };
     if (market === "FUND") {
       void fetchCnFundTradeStatus(sym).then((status) => {
         if (requestSeq !== requestSeqRef.current) return;
-        if (!status) return;
+        if (!status) {
+          markTradeStatusUnknown("基金交易规则获取失败");
+          return;
+        }
         setForm((f) => f.symbol === sym && f.market === market
-          ? { ...f, autoTradeStatus: status.status, autoTradeStatusNote: status.note, autoTradeStatusSource: "eastmoney", fundBuyConfirmDays: status.buyConfirmDays }
+          ? {
+            ...f,
+            autoTradeStatus: status.status,
+            autoTradeStatusNote: status.note,
+            autoTradeStatusSource: "eastmoney",
+            autoTradeStatusUpdatedAt: new Date().toISOString(),
+            autoTradeStatusStale: false,
+            autoTradeStatusRefreshNote: "",
+            fundBuyConfirmDays: status.buyConfirmDays,
+            fundSellConfirmDays: status.sellConfirmDays,
+            fundPurchaseStatus: status.purchaseStatus,
+            fundDcaStatus: status.dcaStatus,
+            fundRedemptionStatus: status.redemptionStatus,
+            fundPurchaseStatusNote: status.purchaseStatusNote,
+            fundDcaStatusNote: status.dcaStatusNote,
+            fundRedemptionStatusNote: status.redemptionStatusNote,
+            fundMinPurchaseAmount: status.minPurchaseAmount,
+            fundMinDcaAmount: status.minDcaAmount,
+            fundMinRedemptionQuantity: status.minRedemptionQuantity,
+            fundMinRemainingQuantity: status.minRemainingQuantity,
+            fundBuyCutoffMinutes: status.buyCutoffMinutes,
+            fundSellCutoffMinutes: status.sellCutoffMinutes,
+            fundDcaCutoffMinutes: status.dcaCutoffMinutes,
+            fundBuyCancellationAllowed: status.buyCancellationAllowed,
+            fundSellCancellationAllowed: status.sellCancellationAllowed,
+            fundDcaCancellationAllowed: status.dcaCancellationAllowed,
+            fundCancellationRuleSource: status.cancellationRuleSource,
+            fundTradeRulesUpdatedAt: new Date().toISOString(),
+          }
           : f);
-      }).catch(() => null);
+      }).catch(() => markTradeStatusUnknown("基金交易规则获取失败"));
     } else if (market === "A" || market === "HK") {
       void fetchTencentTradeStatus(sym, market).then((status) => {
         if (requestSeq !== requestSeqRef.current) return;
-        if (!status) return;
+        if (!status) {
+          markTradeStatusUnknown("股票交易状态获取失败");
+          return;
+        }
         setForm((f) => f.symbol === sym && f.market === market
-          ? { ...f, autoTradeStatus: status.status, autoTradeStatusNote: status.note, autoTradeStatusSource: status.source }
+          ? { ...f, autoTradeStatus: status.status, autoTradeStatusNote: status.note, autoTradeStatusSource: status.source, autoTradeStatusUpdatedAt: new Date().toISOString(), autoTradeStatusStale: false, autoTradeStatusRefreshNote: "" }
           : f);
-      }).catch(() => null);
+      }).catch(() => markTradeStatusUnknown("股票交易状态获取失败"));
     }
   };
 
@@ -850,14 +947,14 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
 
           {form.autoTradeStatus && form.autoTradeStatus !== "normal" && (
             <div className="rounded-lg px-2.5 py-2" style={{
-              background: form.autoTradeStatus === "buy_disabled" ? "rgba(242,78,78,0.08)" : "rgba(245,158,11,0.08)",
-              border: `1px solid ${form.autoTradeStatus === "buy_disabled" ? "rgba(242,78,78,0.18)" : "rgba(245,158,11,0.18)"}`,
+              background: form.autoTradeStatus === "unknown" ? "rgba(148,163,184,0.08)" : form.autoTradeStatus === "buy_disabled" ? "rgba(242,78,78,0.08)" : "rgba(245,158,11,0.08)",
+              border: `1px solid ${form.autoTradeStatus === "unknown" ? "rgba(148,163,184,0.18)" : form.autoTradeStatus === "buy_disabled" ? "rgba(242,78,78,0.18)" : "rgba(245,158,11,0.18)"}`,
             }}>
               {(() => {
                 const rawLabel = tradeStatusLabel(form.autoTradeStatus);
                 const label = translateTradeText(rawLabel, language);
                 const note = translateTradeText(cleanTradeNote(form.autoTradeStatusNote, rawLabel), language);
-                const color = form.autoTradeStatus === "buy_disabled" ? "#F24E4E" : "#F59E0B";
+                const color = form.autoTradeStatus === "unknown" ? "#94A3B8" : form.autoTradeStatus === "buy_disabled" ? "#F24E4E" : "#F59E0B";
                 const source = translateTradeText(cleanTradeSource(form.autoTradeStatusSource ?? ""), language);
                 return (
                   <p style={{ color, fontSize: 11, fontWeight: 600 }}>
@@ -975,8 +1072,12 @@ function AdjustSheet({
   onSave: (input: HoldingAdjustmentInput) => void;
   onClose: () => void;
 }) {
-  const { language } = useApp();
+  const { language, holdings, fundOrders, submitFundOrder, cancelFundOrder } = useApp();
   const text = t(language).holdings;
+  const liveHolding = holdings.find((item) => item.id === holding.id) ?? holding;
+  const isOpenEndFund = liveHolding.market === "FUND" && liveHolding.assetType === "fund";
+  const [entryMode, setEntryMode] = useState<"recorded" | "submitted">("recorded");
+  const [submitError, setSubmitError] = useState("");
   const [inputMode, setInputMode] = useState<"quantity" | "amount">("quantity");
   const [quantity, setQuantity] = useState("");
   const [amount, setAmount] = useState("");
@@ -993,7 +1094,9 @@ function AdjustSheet({
   const [taxOverride, setTaxOverride] = useState<string | null>(null);
   const [rememberCostProfile, setRememberCostProfile] = useState(!hasConfiguredRule);
   const [saving, setSaving] = useState(false);
-  const maxSell = holding.quantity;
+  const [orderClock, setOrderClock] = useState(() => Date.now());
+  const pendingSell = pendingSellQuantity(fundOrders, liveHolding.id);
+  const maxSell = Math.max(0, liveHolding.quantity - (entryMode === "submitted" ? pendingSell : 0));
   const validPrice = Number(price);
   const wholeQuantityRequired = requiresWholeTradeQuantity(holding);
   const rawQuantity = inputMode === "amount"
@@ -1047,6 +1150,20 @@ function AdjustSheet({
   const estimatedSettlement = mode === "buy"
     ? estimatedAmount + transactionCosts
     : Math.max(0, estimatedAmount - transactionCosts);
+  const orderCutoffRule = resolveFundOrderCutoff(liveHolding, mode, "manual");
+  const effectiveOrderDate = entryMode === "submitted"
+    ? computeFundEffectiveDate(new Date(orderClock), orderCutoffRule.cutoffMinutes)
+    : date;
+  const expectedOrderConfirmDate = entryMode === "submitted" && isOpenEndFund && validDate
+    ? computeFundOrderConfirmDate(liveHolding, effectiveOrderDate, defaultFundConfirmDays(liveHolding, mode))
+    : "";
+  const relatedOrders = fundOrders.filter((order) => order.holdingId === liveHolding.id).slice(0, 5);
+  const hasPendingOrders = relatedOrders.some((order) => order.status === "pending");
+  useEffect(() => {
+    if (!hasPendingOrders && !(entryMode === "submitted" && isOpenEndFund)) return;
+    const timer = window.setInterval(() => setOrderClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [entryMode, hasPendingOrders, isOpenEndFund]);
   const hasDraftRule = feeRate.trim() !== "" || taxRate.trim() !== "" || minimumFee.trim() !== "";
   const profileChanged = parsedFeeRate !== configuredFeeRate
     || parsedTaxRate !== configuredTaxRate
@@ -1104,6 +1221,33 @@ function AdjustSheet({
             <p style={{ color: "var(--text-primary)", fontSize: 13, fontWeight: 700 }}>{holding.name}</p>
             <p style={{ color: "var(--text-secondary)", fontSize: 11 }}>{holding.symbol} · {language === "en" ? "Current" : "当前持仓"} {formatHoldingQuantity(holding.quantity)} {unit}</p>
           </div>
+          {isOpenEndFund && (
+            <div className="grid grid-cols-2 gap-2 rounded-xl p-1" style={{ background: "var(--bg-card)", border: "1px solid var(--border)" }}>
+              {([
+                ["recorded", language === "en" ? "Record filled trade" : "已成交补录"],
+                ["submitted", mode === "buy" ? (language === "en" ? "Submit purchase" : "提交申购") : (language === "en" ? "Submit redemption" : "提交赎回")],
+              ] as const).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => {
+                    setEntryMode(value);
+                    if (value === "submitted") setDate(todayLocalYMD());
+                    setSubmitError("");
+                  }}
+                  className="rounded-lg py-2"
+                  style={{
+                    background: entryMode === value ? "rgba(79,156,249,0.16)" : "transparent",
+                    color: entryMode === value ? "#4F9CF9" : "var(--text-secondary)",
+                    fontSize: 11,
+                    fontWeight: 700,
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-2 rounded-xl p-1" style={{ background: "var(--bg-card)", border: "1px solid var(--border)" }}>
             {([
               ["quantity", text.byQuantity],
@@ -1129,7 +1273,7 @@ function AdjustSheet({
           </div>
           <div className="grid grid-cols-2 gap-2">
             <Field label={text.transactionDate}>
-              <Input value={date} onChange={setDate} placeholder={text.inputTransactionDate} />
+              <Input value={date} onChange={setDate} placeholder={text.inputTransactionDate} disabled={entryMode === "submitted"} />
             </Field>
             <Field label={text.transactionPrice}>
               <Input type="number" value={price} onChange={setPrice} placeholder={text.inputTransactionPrice} />
@@ -1200,15 +1344,17 @@ function AdjustSheet({
                 <Input type="number" step="0.01" min="0" value={minimumFee} onChange={(value) => { setMinimumFee(value); setFeeOverride(null); }} placeholder="0" />
               </Field>
             </div>
-            <div className="grid grid-cols-2 gap-2 mt-2">
-              <Field label={text.actualFee(currency)}>
-                <Input type="number" step="0.01" min="0" value={fee} onChange={setFeeOverride} placeholder="0" />
-              </Field>
-              <Field label={text.actualTax(currency)}>
-                <Input type="number" step="0.01" min="0" value={tax} onChange={setTaxOverride} placeholder="0" />
-              </Field>
-            </div>
-            {(feeOverride != null || taxOverride != null) && (
+            {entryMode === "recorded" && (
+              <div className="grid grid-cols-2 gap-2 mt-2">
+                <Field label={text.actualFee(currency)}>
+                  <Input type="number" step="0.01" min="0" value={fee} onChange={setFeeOverride} placeholder="0" />
+                </Field>
+                <Field label={text.actualTax(currency)}>
+                  <Input type="number" step="0.01" min="0" value={tax} onChange={setTaxOverride} placeholder="0" />
+                </Field>
+              </div>
+            )}
+            {entryMode === "recorded" && (feeOverride != null || taxOverride != null) && (
               <button
                 type="button"
                 onClick={() => { setFeeOverride(null); setTaxOverride(null); }}
@@ -1247,9 +1393,18 @@ function AdjustSheet({
                 {formatExactMoney(estimatedAmount, currency)}
               </p>
               <p style={{ color: "var(--text-secondary)", fontSize: 10, marginTop: 2 }}>
-                {text.estimatedSettlement(mode)} {formatExactMoney(estimatedSettlement, currency)}
+                {entryMode === "submitted" && isOpenEndFund
+                  ? `${language === "en" ? "Estimated confirmation" : "预计确认"} ${expectedOrderConfirmDate || "—"}`
+                  : `${text.estimatedSettlement(mode)} ${formatExactMoney(estimatedSettlement, currency)}`}
                 {transactionCosts > 0 && ` · ${text.costsIncluded(formatExactMoney(transactionCosts, currency))}`}
               </p>
+              {entryMode === "submitted" && isOpenEndFund && (
+                <p style={{ color: "var(--text-micro)", fontSize: 10, marginTop: 2 }}>
+                  {language === "en"
+                    ? `Effective NAV date ${effectiveOrderDate}; position changes only after official NAV confirmation. ${orderCutoffRule.cutoffSource}`
+                    : `有效净值日 ${effectiveOrderDate}；取得正式净值后才变更持仓。${orderCutoffRule.cutoffSource}`}
+                </p>
+              )}
               {mode === "sell" && estimatedQuantity > 0 && (
                 <p style={{ color: "var(--text-micro)", fontSize: 10, marginTop: 2 }}>
                   {text.remaining(formatHoldingQuantity(Math.max(0, maxSell - estimatedQuantity)), unit)}
@@ -1267,11 +1422,60 @@ function AdjustSheet({
               {text.wholeQuantityError(unit)}
             </p>
           )}
+          {submitError && <p style={{ color: "#F24E4E", fontSize: 11 }}>{submitError}</p>}
+          {isOpenEndFund && relatedOrders.length > 0 && (
+            <div className="rounded-xl px-3 py-2.5" style={{ background: "var(--bg-card)", border: "1px solid var(--border)" }}>
+              <p style={{ color: "var(--text-muted)", fontSize: 10, marginBottom: 6 }}>{language === "en" ? "Recent submitted orders" : "最近申购/赎回订单"}</p>
+              <div className="flex flex-col gap-1.5">
+                {relatedOrders.map((order) => {
+                  const cancellationState = fundOrderCancellationState(order, new Date(orderClock));
+                  const statusLabel = order.status === "pending"
+                    ? cancellationState === "cancellable"
+                      ? (language === "en" ? "Awaiting acceptance" : "待受理")
+                      : cancellationState === "unknown"
+                        ? (language === "en" ? "Cancellation rule unavailable, awaiting confirmation" : "撤单规则未返回，待确认")
+                        : cancellationState === "not_cancellable"
+                          ? (language === "en" ? "Cancellation unavailable, awaiting confirmation" : "渠道不支持撤单，待确认")
+                          : order.rule.cutoffEstimated
+                            ? (language === "en" ? "Past estimated cutoff, awaiting confirmation" : "按通用规则推定已过截止，待确认")
+                            : (language === "en" ? "Accepted, awaiting confirmation" : "已受理待确认")
+                    : order.status === "confirmed"
+                      ? (language === "en" ? "Confirmed" : "已确认")
+                      : order.status === "cancelled"
+                        ? (language === "en" ? "Cancelled" : "已撤销")
+                        : (language === "en" ? "Rejected" : "未入账");
+                  return (
+                    <div key={order.id} className="flex items-center gap-2" style={{ fontSize: 10 }}>
+                      <span style={{ color: "var(--text-secondary)", flex: 1 }}>
+                        {order.source === "dca" ? (language === "en" ? "DCA" : "定投") : order.side === "buy" ? (language === "en" ? "Purchase" : "申购") : (language === "en" ? "Redemption" : "赎回")}
+                        {` · ${order.effectiveDate} · ${statusLabel}`}
+                        {cancellationState === "cancellable" && order.cancelDeadline && (
+                          <span style={{ color: "var(--text-micro)" }}>
+                            {language === "en"
+                              ? ` · cancellable before ${new Date(order.cancelDeadline).toLocaleTimeString("en-US", { timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit" })}${order.rule.cutoffEstimated ? " (general-rule estimate)" : ""}`
+                              : ` · ${new Date(order.cancelDeadline).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit", hour12: false })}前可撤${order.rule.cutoffEstimated ? "（通用规则预估）" : ""}`}
+                          </span>
+                        )}
+                      </span>
+                      {cancellationState === "cancellable" && (
+                        <button type="button" onClick={() => {
+                          const result = cancelFundOrder(order.id);
+                          if (!result.ok) setSubmitError(result.error ?? (language === "en" ? "Cancellation failed" : "撤单失败"));
+                        }} style={{ color: "#F24E4E", fontWeight: 700 }}>
+                          {language === "en" ? "Cancel" : "撤销"}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
           <button
             onClick={() => {
               if (!valid || saving) return;
               setSaving(true);
-              onSave({
+              const input: HoldingAdjustmentInput = {
                 type: mode,
                 quantity: validQuantity,
                 price: validPrice,
@@ -1285,7 +1489,18 @@ function AdjustSheet({
                 minimumFeeUsed: Number.isFinite(parsedMinimumFee) ? parsedMinimumFee : undefined,
                 estimatedFee: costEstimate.fee,
                 estimatedTax: costEstimate.tax,
-              });
+              };
+              if (entryMode === "submitted" && isOpenEndFund) {
+                const result = submitFundOrder(liveHolding.id, input);
+                if (!result.ok) {
+                  setSaving(false);
+                  setSubmitError(result.error ?? (language === "en" ? "Order could not be submitted" : "订单提交失败"));
+                  return;
+                }
+                onClose();
+                return;
+              }
+              onSave(input);
             }}
             disabled={!valid || saving}
             className="w-full rounded-xl py-3"
@@ -1296,7 +1511,11 @@ function AdjustSheet({
               fontWeight: 600,
             }}
           >
-            {saving ? t(language).common.saving : mode === "buy" ? text.confirmBuy : text.confirmSell}
+            {saving
+              ? t(language).common.saving
+              : entryMode === "submitted" && isOpenEndFund
+                ? mode === "buy" ? (language === "en" ? "Submit purchase" : "提交申购") : (language === "en" ? "Submit redemption" : "提交赎回")
+                : mode === "buy" ? text.confirmBuy : text.confirmSell}
           </button>
         </div>
       </motion.div>
@@ -1350,8 +1569,8 @@ const HoldingCard = memo(function HoldingCard({
   const tsNote = translateTradeText(cleanTradeNote(tradeStatus.note, tradeStatus.label), language);
   const tsLabelFull = tsNote ? `${tsLabel}, ${tsNote}` : tsLabel;
   const tradeStatusText = tsSource ? `${tsSource} · ${tsLabelFull}` : tsLabelFull;
-  const activeDCAPlans = dcaPlans.filter((plan) => plan.holdingId === h.id && plan.enabled);
-  const pausedDCAPlans = dcaPlans.filter((plan) => plan.holdingId === h.id && !plan.enabled);
+  const activeDCAPlans = dcaPlans.filter((plan) => plan.holdingId === h.id && plan.enabled && !plan.archived);
+  const pausedDCAPlans = dcaPlans.filter((plan) => plan.holdingId === h.id && !plan.enabled && !plan.archived);
   const dcaBadge = activeDCAPlans.length > 0
     ? { label: activeDCAPlans.length > 1 ? `${text.dca}×${activeDCAPlans.length}` : text.dca, color: "#4F9CF9", bg: "rgba(79,156,249,0.12)" }
     : pausedDCAPlans.length > 0
@@ -1834,19 +2053,141 @@ function NewGroupSheet({
   );
 }
 
+function transactionStatusMeta(record: TransactionRecord, language: Language, now: Date, confirmationReady = false) {
+  if (record.status === "recorded") return { label: language === "en" ? "Filled record" : "已成交补录", color: "#31D08B" };
+  if (record.status === "confirmed") return { label: language === "en" ? "Confirmed" : "已确认", color: "#31D08B" };
+  if (record.status === "cancelled") return { label: language === "en" ? "Cancelled" : "已撤销", color: "var(--text-muted)" };
+  if (record.status === "rejected") return { label: language === "en" ? "Not posted" : "未入账", color: "#F24E4E" };
+  if (confirmationReady) return { label: language === "en" ? "Pending · auto-posting" : "待确认 · 即将自动入账", color: "#F59E0B" };
+  const cancellationState = record.order ? fundOrderCancellationState(record.order, now) : "closed";
+  if (cancellationState === "cancellable") return { label: language === "en" ? "Pending · cancellable" : "待确认 · 可撤", color: "#F59E0B" };
+  if (cancellationState === "unknown") return { label: language === "en" ? "Pending · cancel rule unknown" : "待确认 · 撤单规则未知", color: "#F59E0B" };
+  if (cancellationState === "not_cancellable") return { label: language === "en" ? "Pending · not cancellable" : "待确认 · 不可撤", color: "#F59E0B" };
+  return {
+    label: record.order?.rule.cutoffEstimated
+      ? (language === "en" ? "Pending · past estimated cutoff" : "待确认 · 已过预估截止")
+      : (language === "en" ? "Accepted · pending confirmation" : "已受理 · 待确认"),
+    color: "#F59E0B",
+  };
+}
+
+function shanghaiDateKey(date: Date) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const value = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? "";
+  return `${value("year")}-${value("month")}-${value("day")}`;
+}
+
+function TransactionRecordsView({ records, holdingsById, privacyMode, language, clock, onCancel }: {
+  records: TransactionRecord[];
+  holdingsById: Map<string, Holding>;
+  privacyMode: boolean;
+  language: Language;
+  clock: number;
+  onCancel: (id: string) => void;
+}) {
+  if (records.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-14 gap-2">
+        <Repeat2 size={30} color="var(--text-micro)" />
+        <p style={{ color: "var(--text-micro)", fontSize: 13 }}>{language === "en" ? "No matching transaction records" : "暂无符合条件的交易记录"}</p>
+      </div>
+    );
+  }
+  const now = new Date(clock);
+  const asOfDate = shanghaiDateKey(now);
+  return (
+    <div className="flex flex-col gap-2 px-3 pb-4">
+      {records.map((record) => {
+        const confirmationReady = Boolean(
+          record.execution?.status === "pending"
+          && record.execution.price
+          && record.execution.price > 0
+          && record.execution.quantity
+          && record.execution.quantity > 0,
+        ) || Boolean(record.order && fundOrderConfirmationQuote(
+          record.holdingId ? holdingsById.get(record.holdingId) : undefined,
+          record.order,
+          asOfDate,
+        ));
+        const status = transactionStatusMeta(record, language, now, confirmationReady);
+        const cancellationState = record.order ? fundOrderCancellationState(record.order, now) : "closed";
+        const sideLabel = record.source === "dca"
+          ? (language === "en" ? "DCA purchase" : "定投买入")
+          : record.side === "buy"
+            ? (record.kind === "order" ? (language === "en" ? "Purchase" : "申购") : (language === "en" ? "Buy" : "买入"))
+            : (record.kind === "order" ? (language === "en" ? "Redemption" : "赎回") : (language === "en" ? "Sell" : "卖出"));
+        const sourceLabel = record.source === "dca"
+          ? (language === "en" ? "Auto-invest" : "自动定投")
+          : record.kind === "order"
+            ? (language === "en" ? "Submitted order" : "提交订单")
+            : record.source === "import" || record.source === "migration"
+              ? (language === "en" ? "Imported history" : "导入历史")
+              : (language === "en" ? "Filled record" : "成交补录");
+        return (
+          <div key={record.id} className="rounded-xl px-3 py-3" style={{ background: "var(--bg-card)", border: "1px solid var(--border-sub)" }}>
+            <div className="flex items-start gap-3">
+              <div className="flex items-center justify-center rounded-full shrink-0" style={{ width: 34, height: 34, background: record.side === "buy" ? "rgba(79,156,249,0.12)" : "rgba(242,78,78,0.11)", color: record.side === "buy" ? "#4F9CF9" : "#F24E4E" }}>
+                {record.side === "buy" ? <Plus size={16} /> : <Minus size={16} />}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <p className="truncate" style={{ color: "var(--text-primary)", fontSize: 13, fontWeight: 700 }}>{record.name}</p>
+                  <span className="shrink-0" style={{ color: status.color, fontSize: 10, fontWeight: 700 }}>{status.label}</span>
+                </div>
+                <p style={{ color: "var(--text-muted)", fontSize: 10, marginTop: 2 }}>{record.symbol} · {sideLabel} · {sourceLabel}</p>
+              </div>
+              <div className="text-right shrink-0">
+                <p style={{ color: record.side === "buy" ? "#4F9CF9" : "#F24E4E", fontSize: 13, fontWeight: 700 }}>
+                  {privacyMode ? "***" : record.amount != null ? formatExactMoney(record.amount, record.currency) : "—"}
+                </p>
+                <p style={{ color: "var(--text-micro)", fontSize: 10, marginTop: 2 }}>{record.date}</p>
+              </div>
+            </div>
+            <div className="grid grid-cols-3 gap-2 mt-3 pt-2.5" style={{ borderTop: "1px solid var(--border-sub)" }}>
+              <div><p style={{ color: "var(--text-micro)", fontSize: 9 }}>{language === "en" ? "Quantity" : "份额/数量"}</p><p className="truncate" style={{ color: "var(--text-secondary)", fontSize: 11, fontWeight: 600 }}>{privacyMode ? "***" : record.quantity != null ? formatExactNumber(record.quantity, 4, 4) : "—"}</p></div>
+              <div><p style={{ color: "var(--text-micro)", fontSize: 9 }}>{language === "en" ? "Price / NAV" : "成交价/净值"}</p><p className="truncate" style={{ color: "var(--text-secondary)", fontSize: 11, fontWeight: 600 }}>{privacyMode ? "***" : record.price != null ? formatExactNumber(record.price, 4, 4) : "—"}</p></div>
+              <div><p style={{ color: "var(--text-micro)", fontSize: 9 }}>{language === "en" ? "Costs" : "费用"}</p><p className="truncate" style={{ color: "var(--text-secondary)", fontSize: 11, fontWeight: 600 }}>{privacyMode ? "***" : record.fee != null || record.tax != null ? formatExactMoney((record.fee ?? 0) + (record.tax ?? 0), record.currency) : "—"}</p></div>
+            </div>
+            {record.kind === "order" && (
+              <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1" style={{ color: "var(--text-micro)", fontSize: 9 }}>
+                <span>{language === "en" ? "NAV date" : "有效净值日"} {record.effectiveDate ?? "—"}</span><span>·</span>
+                <span>{language === "en" ? "Expected confirmation" : "预计确认"} {record.expectedConfirmDate ?? "—"}</span>
+                {record.confirmedDate && <><span>·</span><span>{language === "en" ? "Confirmed" : "确认日"} {record.confirmedDate}</span></>}
+              </div>
+            )}
+            {record.reason && <p style={{ color: record.status === "pending" ? "#F59E0B" : "#F24E4E", fontSize: 10, marginTop: 6 }}>{translateDcaReason(record.reason, language)}</p>}
+            {cancellationState === "cancellable" && record.order && (
+              <div className="flex justify-end mt-2"><button type="button" onClick={() => onCancel(record.order!.id)} className="rounded-lg px-3 py-1.5" style={{ color: "#F24E4E", background: "rgba(242,78,78,0.10)", fontSize: 10, fontWeight: 700 }}>{language === "en" ? "Cancel order" : "撤销订单"}</button></div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 /* ═══════════════════════════════════════════════════════
    Main page
 ══════════════════════════════════════════════════════════ */
 export function Holdings() {
   const { holdings, closedHoldings, groups, privacyMode, profitColor, currency,
     addHolding, updateHolding, adjustHolding, removeHolding, removeClosedHolding, updatePortfolioEvent, removePortfolioEvent, addGroup, updateGroup, removeGroup,
-    openDetail, refresh, isRefreshing, lastRefreshed, lastRefreshAt, lastRefreshError, dcaPlans, openDCAPanel, togglePrivacy, language,
-    portfolioEvents } = useApp();
+    openDetail, refresh, isRefreshing, lastRefreshed, lastRefreshAt, lastRefreshError, dcaPlans, dcaExecutions, openDCAPanel, togglePrivacy, language,
+    portfolioEvents, fundOrders, cancelFundOrder } = useApp();
   const text = t(language);
 
-  const [viewMode,     setViewMode]     = useState<"current" | "closed">("current");
+  const [viewMode,     setViewMode]     = useState<"current" | "transactions" | "closed">("current");
   const [activeGroup,  setActiveGroup]  = useState("ALL");
   const [search,       setSearch]       = useState("");
+  const [transactionFilter, setTransactionFilter] = useState<"all" | "buy" | "sell" | "pending">("all");
+  const [transactionVisibleCount, setTransactionVisibleCount] = useState(100);
+  const [transactionClock, setTransactionClock] = useState(Date.now());
+  const [transactionError, setTransactionError] = useState("");
   const [sortKey,      setSortKey]      = useState<"marketValue" | "todayPnlRate" | "totalPnlRate">("marketValue");
   const [sortDesc,     setSortDesc]     = useState(true);
   const [selectedId,   setSelectedId]   = useState<string | null>(null);
@@ -1914,6 +2255,7 @@ export function Holdings() {
 
   useEffect(() => {
     if (activeGroup === "ALL") return;
+    if (viewMode === "transactions") return;
     if (activeGroup === "__ungrouped") {
       const hasUngroupedInView = viewMode === "closed" ? hasUngroupedClosedHoldings : hasUngroupedHoldings;
       if (!hasUngroupedInView) setActiveGroup("ALL");
@@ -1942,6 +2284,53 @@ export function Holdings() {
     }),
   ), [holdings, portfolioEvents]);
   const closedById = useMemo(() => new Map(closedHoldings.map((holding) => [holding.id, holding])), [closedHoldings]);
+  const transactionIdentities = useMemo(() => {
+    const byId = new Map(holdings.map((holding) => [holding.id, holding]));
+    for (const closed of closedHoldings) {
+      if (byId.has(closed.sourceHoldingId)) continue;
+      byId.set(closed.sourceHoldingId, {
+        id: closed.sourceHoldingId,
+        groupId: closed.groupId,
+        symbol: closed.symbol,
+        name: closed.name,
+        market: closed.market,
+        currency: closed.currency,
+      } as Holding);
+    }
+    return [...byId.values()];
+  }, [closedHoldings, holdings]);
+  const transactionRecords = useMemo(
+    () => buildTransactionRecords(fundOrders, portfolioEvents, transactionIdentities, dcaExecutions),
+    [dcaExecutions, fundOrders, portfolioEvents, transactionIdentities],
+  );
+  const filteredTransactionRecords = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return transactionRecords.filter((record) => {
+      if (activeGroup === "__ungrouped" && record.groupId) return false;
+      if (activeGroup !== "ALL" && activeGroup !== "__ungrouped" && record.groupId !== activeGroup) return false;
+      if (query && !record.symbol.toLowerCase().includes(query) && !record.name.toLowerCase().includes(query)) return false;
+      if (transactionFilter === "buy" && record.side !== "buy") return false;
+      if (transactionFilter === "sell" && record.side !== "sell") return false;
+      if (transactionFilter === "pending" && record.status !== "pending") return false;
+      return true;
+    });
+  }, [activeGroup, search, transactionFilter, transactionRecords]);
+  const visibleTransactionRecords = filteredTransactionRecords.slice(0, transactionVisibleCount);
+  useEffect(() => {
+    setTransactionVisibleCount(100);
+  }, [activeGroup, search, transactionFilter]);
+  const transactionStats = useMemo(() => ({
+    total: transactionRecords.length,
+    pending: transactionRecords.filter((record) => record.status === "pending").length,
+    completed: transactionRecords.filter((record) => record.status === "confirmed" || record.status === "recorded").length,
+    closed: transactionRecords.filter((record) => record.status === "cancelled" || record.status === "rejected").length,
+  }), [transactionRecords]);
+  const hasUngroupedTransactions = transactionRecords.some((record) => !record.groupId);
+  useEffect(() => {
+    if (viewMode !== "transactions" || transactionStats.pending === 0) return;
+    const timer = window.setInterval(() => setTransactionClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [transactionStats.pending, viewMode]);
   const filteredRealizedEvents = useMemo(() => {
     const query = search.trim().toLowerCase();
     return portfolioEvents.filter((event) => {
@@ -2063,6 +2452,16 @@ export function Holdings() {
     void refresh();
   }, [refresh, refreshingActive]);
 
+  const handleCancelTransaction = useCallback((id: string) => {
+    const result = cancelFundOrder(id);
+    if (result.ok) {
+      setTransactionError("");
+      setTransactionClock(Date.now());
+      return;
+    }
+    setTransactionError(result.error ?? (language === "en" ? "Cancellation failed" : "撤单失败"));
+  }, [cancelFundOrder, language]);
+
   return (
     <div className="relative h-full flex flex-col overflow-hidden">
 
@@ -2146,6 +2545,23 @@ export function Holdings() {
                 </p>
               </div>
             </>
+          ) : viewMode === "transactions" ? (
+            <>
+              <div className="flex-1 min-w-0">
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{language === "en" ? "All records" : "全部记录"}</p>
+                <p style={{ color: "var(--text-primary)", fontSize: 15, fontWeight: 700 }}>{transactionStats.total}</p>
+              </div>
+              <div style={{ width: 1, flexShrink: 0, background: "var(--bg-card)" }} />
+              <div className="flex-1 min-w-0">
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{language === "en" ? "Pending" : "待确认"}</p>
+                <p style={{ color: transactionStats.pending > 0 ? "#F59E0B" : "var(--text-primary)", fontSize: 15, fontWeight: 700 }}>{transactionStats.pending}</p>
+              </div>
+              <div style={{ width: 1, flexShrink: 0, background: "var(--bg-card)" }} />
+              <div className="flex-1 min-w-0">
+                <p style={{ color: "var(--text-muted)", fontSize: 10 }}>{language === "en" ? "Filled / confirmed" : "成交/确认"}</p>
+                <p style={{ color: "#31D08B", fontSize: 15, fontWeight: 700 }}>{transactionStats.completed}</p>
+              </div>
+            </>
           ) : (
             <>
               <div className="flex-1 min-w-0">
@@ -2175,6 +2591,7 @@ export function Holdings() {
         <div className="flex gap-2 px-4 py-2" style={{ borderBottom: "1px solid var(--border-sub)" }}>
           {([
             { key: "current" as const, label: language === "en" ? "Open Holdings" : "当前持仓" },
+            { key: "transactions" as const, label: language === "en" ? "Transactions" : "交易记录" },
             { key: "closed" as const, label: language === "en" ? "Realized P/L" : "已实现收益" },
           ]).map((item) => (
             <button
@@ -2189,7 +2606,7 @@ export function Holdings() {
                 fontWeight: 700,
               }}
             >
-              {item.label}{item.key === "closed" ? ` · ${realizedRecordCount}` : ""}
+              {item.label}{item.key === "closed" ? ` · ${realizedRecordCount}` : item.key === "transactions" ? ` · ${transactionStats.total}` : ""}
             </button>
           ))}
         </div>
@@ -2291,6 +2708,69 @@ export function Holdings() {
               onDeleteEvent={setDeleteEventTarget}
               language={language}
             />
+          </>
+        ) : viewMode === "transactions" ? (
+          <>
+            <div style={{ padding: "14px 12px 8px" }}>
+              <div className="flex items-center gap-2 rounded-xl px-3" style={{ background: "var(--bg-card)", height: 36, marginTop: 2 }}>
+                <Search size={14} color="var(--text-muted)" />
+                <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={language === "en" ? "Search symbol or name" : "搜索交易标的"}
+                  style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "var(--text-primary)", fontSize: 13 }} />
+                {search && <button onClick={() => setSearch("")} style={{ color: "var(--text-muted)", fontSize: 16 }}>×</button>}
+              </div>
+            </div>
+
+            <div className="px-3 mb-2">
+              <div className="flex items-center gap-1.5 overflow-x-auto" style={{ scrollbarWidth: "none" }}>
+                {([
+                  ["all", language === "en" ? "All" : "全部"],
+                  ["buy", language === "en" ? "Buy" : "买入/申购"],
+                  ["sell", language === "en" ? "Sell" : "卖出/赎回"],
+                  ["pending", language === "en" ? "Pending" : "待确认"],
+                ] as const).map(([key, label]) => (
+                  <button key={key} onClick={() => setTransactionFilter(key)} className="rounded-full shrink-0"
+                    style={{ padding: "5px 11px", fontSize: 10, fontWeight: 600, background: transactionFilter === key ? "rgba(79,156,249,0.15)" : "var(--bg-card)", color: transactionFilter === key ? "#4F9CF9" : "var(--text-muted)", border: transactionFilter === key ? "1px solid rgba(79,156,249,0.25)" : "1px solid var(--border)" }}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="px-3 mb-2">
+              <div className="flex items-center gap-1.5 overflow-x-auto" style={{ scrollbarWidth: "none" }}>
+                <button onClick={() => setActiveGroup("ALL")} className="rounded-full shrink-0"
+                  style={{ padding: "4px 12px", fontSize: 10, background: activeGroup === "ALL" ? "#4F9CF9" : "var(--bg-card)", color: activeGroup === "ALL" ? "#fff" : "var(--text-muted)", border: "1px solid var(--border)" }}>
+                  {text.common.all}
+                </button>
+                {groups.map((group) => (
+                  <button key={group.id} onClick={() => setActiveGroup(group.id)} className="rounded-full shrink-0 flex items-center gap-1.5"
+                    style={{ padding: "4px 12px", fontSize: 10, background: activeGroup === group.id ? "rgba(79,156,249,0.15)" : "var(--bg-card)", color: activeGroup === group.id ? "#4F9CF9" : "var(--text-muted)", border: "1px solid var(--border)" }}>
+                    <span className="rounded-full" style={{ width: 6, height: 6, background: group.color }} />{groupName(group.id, group.name, language)}
+                  </button>
+                ))}
+                {hasUngroupedTransactions && (
+                  <button onClick={() => setActiveGroup("__ungrouped")} className="rounded-full shrink-0"
+                    style={{ padding: "4px 12px", fontSize: 10, background: activeGroup === "__ungrouped" ? "rgba(79,156,249,0.15)" : "var(--bg-card)", color: activeGroup === "__ungrouped" ? "#4F9CF9" : "var(--text-muted)", border: "1px solid var(--border)" }}>
+                    {text.common.notGrouped}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 px-3 mb-2" style={{ color: "var(--text-muted)", fontSize: 10 }}>
+              <span>{language === "en" ? `${filteredTransactionRecords.length} records` : `${filteredTransactionRecords.length} 条记录`}</span>
+              {transactionStats.closed > 0 && <><span>·</span><span>{language === "en" ? `${transactionStats.closed} cancelled/not posted` : `${transactionStats.closed} 条撤销或未入账`}</span></>}
+            </div>
+            {transactionError && <p className="mx-3 mb-2 rounded-lg px-3 py-2" style={{ color: "#F24E4E", background: "rgba(242,78,78,0.08)", fontSize: 10 }}>{transactionError}</p>}
+            <TransactionRecordsView records={visibleTransactionRecords} holdingsById={holdingById} privacyMode={privacyMode} language={language} clock={transactionClock} onCancel={handleCancelTransaction} />
+            {visibleTransactionRecords.length < filteredTransactionRecords.length && (
+              <div className="flex justify-center pb-4">
+                <button type="button" onClick={() => setTransactionVisibleCount((count) => count + 100)} className="rounded-full px-4 py-2"
+                  style={{ color: "#4F9CF9", background: "rgba(79,156,249,0.10)", fontSize: 10, fontWeight: 700 }}>
+                  {language === "en" ? "Load more" : "加载更多"}
+                </button>
+              </div>
+            )}
           </>
         ) : (
         <>
@@ -2526,7 +3006,29 @@ export function Holdings() {
                     autoTradeStatus: editTarget.autoTradeStatus,
                     autoTradeStatusNote: editTarget.autoTradeStatusNote,
                     autoTradeStatusSource: editTarget.autoTradeStatusSource,
+                    autoTradeStatusUpdatedAt: editTarget.autoTradeStatusUpdatedAt,
+                    autoTradeStatusStale: editTarget.autoTradeStatusStale,
+                    autoTradeStatusRefreshNote: editTarget.autoTradeStatusRefreshNote,
                     fundBuyConfirmDays: editTarget.fundBuyConfirmDays,
+                    fundSellConfirmDays: editTarget.fundSellConfirmDays,
+                    fundPurchaseStatus: editTarget.fundPurchaseStatus,
+                    fundDcaStatus: editTarget.fundDcaStatus,
+                    fundRedemptionStatus: editTarget.fundRedemptionStatus,
+                    fundPurchaseStatusNote: editTarget.fundPurchaseStatusNote,
+                    fundDcaStatusNote: editTarget.fundDcaStatusNote,
+                    fundRedemptionStatusNote: editTarget.fundRedemptionStatusNote,
+                    fundMinPurchaseAmount: editTarget.fundMinPurchaseAmount,
+                    fundMinDcaAmount: editTarget.fundMinDcaAmount,
+                    fundMinRedemptionQuantity: editTarget.fundMinRedemptionQuantity,
+                    fundMinRemainingQuantity: editTarget.fundMinRemainingQuantity,
+                    fundBuyCutoffMinutes: editTarget.fundBuyCutoffMinutes,
+                    fundSellCutoffMinutes: editTarget.fundSellCutoffMinutes,
+                    fundDcaCutoffMinutes: editTarget.fundDcaCutoffMinutes,
+                    fundBuyCancellationAllowed: editTarget.fundBuyCancellationAllowed,
+                    fundSellCancellationAllowed: editTarget.fundSellCancellationAllowed,
+                    fundDcaCancellationAllowed: editTarget.fundDcaCancellationAllowed,
+                    fundCancellationRuleSource: editTarget.fundCancellationRuleSource,
+                    fundTradeRulesUpdatedAt: editTarget.fundTradeRulesUpdatedAt,
                     dividendReinvest: editTarget.dividendReinvest ?? null,
                     transactionCostProfile: editTarget.transactionCostProfile }
                 : blankForm()

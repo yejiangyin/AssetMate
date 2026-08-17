@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { getMarketBadge, getMarketBadgeWithBg } from "./marketBadge";
 import { currencySymbol, formatExactMoney, formatExactNumber, formatFixedNumber, formatPercent, formatSignedExactMoney } from "./numberFormat";
-import { cleanTradeNote, cleanTradeSource, resolveHoldingTradeStatus, tradeStatusLabel, tradeStatusSourceLabel } from "./tradeStatus";
+import { cleanTradeNote, cleanTradeSource, mergeAutomaticTradeStatus, resolveHoldingTradeStatus, TRADE_STATUS_FRESHNESS_MS, tradeStatusLabel, tradeStatusSourceLabel } from "./tradeStatus";
 
 describe("marketBadge", () => {
   test("falls back for unknown markets and computes alpha backgrounds", () => {
@@ -37,6 +37,7 @@ describe("tradeStatus", () => {
     assert.equal(tradeStatusLabel("suspended"), "停牌/暂停交易");
     assert.equal(tradeStatusLabel("fund_limit"), "基金限购");
     assert.equal(tradeStatusLabel("buy_disabled"), "当前不可买入");
+    assert.equal(tradeStatusLabel("unknown"), "交易状态未知");
     assert.equal(tradeStatusSourceLabel("eastmoney"), "东方财富");
     assert.equal(tradeStatusSourceLabel("tencent"), "腾讯行情");
     assert.equal(tradeStatusSourceLabel("yahoo"), "Yahoo Finance");
@@ -59,5 +60,68 @@ describe("tradeStatus", () => {
     assert.equal(status.note, "暂停申购");
     assert.equal(status.source, "自动 · 东方财富");
     assert.equal(cleanTradeSource(status.source), "东方财富");
+  });
+
+  test("keeps a previous restriction on refresh failure and marks it stale", () => {
+    const merged = mergeAutomaticTradeStatus({
+      autoTradeStatus: "fund_limit",
+      autoTradeStatusNote: "基金限购，5元",
+      autoTradeStatusSource: "eastmoney",
+      autoTradeStatusUpdatedAt: "2026-08-14T01:00:00.000Z",
+    }, {
+      autoTradeStatusRefreshState: "failed",
+      autoTradeStatusRefreshNote: "基金交易规则刷新失败",
+    });
+    assert.equal(merged.autoTradeStatus, "fund_limit");
+    assert.equal(merged.autoTradeStatusStale, true);
+    assert.equal(merged.autoTradeStatusUpdatedAt, "2026-08-14T01:00:00.000Z");
+    const resolved = resolveHoldingTradeStatus({ tradeStatus: "normal", ...merged });
+    assert.equal(resolved.status, "fund_limit");
+    assert.match(resolved.note, /沿用|刷新失败/);
+  });
+
+  test("does not present a stale normal result as normally buyable", () => {
+    const merged = mergeAutomaticTradeStatus({
+      autoTradeStatus: "normal",
+      autoTradeStatusNote: "自动行情源显示可正常交易",
+      autoTradeStatusSource: "tencent",
+    }, {
+      autoTradeStatusRefreshState: "failed",
+      autoTradeStatusRefreshNote: "股票交易状态刷新失败",
+    });
+    const resolved = resolveHoldingTradeStatus({ tradeStatus: "normal", ...merged });
+    assert.equal(merged.autoTradeStatus, "normal");
+    assert.equal(merged.autoTradeStatusStale, true);
+    assert.equal(resolved.status, "unknown");
+    assert.equal(resolved.label, "交易状态未知");
+  });
+
+  test("successful refresh replaces stale state and clears the failure marker", () => {
+    const merged = mergeAutomaticTradeStatus({
+      autoTradeStatus: "suspended",
+      autoTradeStatusStale: true,
+      autoTradeStatusRefreshNote: "上次失败",
+    }, {
+      autoTradeStatus: "normal",
+      autoTradeStatusNote: "自动行情源显示可正常交易",
+      autoTradeStatusSource: "eastmoney",
+      autoTradeStatusUpdatedAt: "2026-08-14T02:00:00.000Z",
+      autoTradeStatusRefreshState: "success",
+    });
+    assert.equal(merged.autoTradeStatus, "normal");
+    assert.equal(merged.autoTradeStatusStale, false);
+    assert.equal(merged.autoTradeStatusRefreshNote, "");
+  });
+
+  test("expires an old successful normal status even without a new refresh result", () => {
+    const resolved = resolveHoldingTradeStatus({
+      tradeStatus: "normal",
+      autoTradeStatus: "normal",
+      autoTradeStatusSource: "eastmoney",
+      autoTradeStatusUpdatedAt: new Date(Date.now() - TRADE_STATUS_FRESHNESS_MS - 1).toISOString(),
+    });
+    assert.equal(resolved.status, "unknown");
+    assert.equal(resolved.stale, true);
+    assert.match(resolved.note, /上次成功更新/);
   });
 });

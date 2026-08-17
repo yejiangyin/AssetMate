@@ -41,19 +41,34 @@ function dateLabel(d: string, language: Language): string {
 function planStatusMeta(holding: Holding | undefined, language: Language) {
   const text = t(language).dca;
   if (!holding) return { label: text.missingHolding, color: "#F24E4E" };
+  if ((holding.market === "FUND" || holding.assetType === "fund") && holding.fundDcaStatus === "buy_disabled") {
+    return { label: text.notBuyable, color: "#94A3B8", source: holding.fundDcaStatusNote ?? "" };
+  }
   const resolved = resolveHoldingTradeStatus(holding);
+  if (resolved.stale) return { label: language === "en" ? "Status stale" : "状态已过期", color: "#94A3B8", source: resolved.source };
   if (resolved.status === "suspended") return { label: text.suspended, color: "#F24E4E", source: resolved.source };
   if (resolved.status === "fund_limit") return { label: text.limited, color: "#F59E0B", source: resolved.source };
   if (resolved.status === "buy_disabled") return { label: text.notBuyable, color: "#94A3B8", source: resolved.source };
+  if (resolved.status === "unknown") return { label: language === "en" ? "Status unknown" : "状态未知", color: "#94A3B8", source: resolved.source };
   return { label: text.executable, color: "#31D08B", source: resolved.source };
 }
 
 function dcaBlockedStatus(holding: Holding | undefined, amountText: string, language: Language) {
   if (!holding) return null;
+  const amount = Number(amountText);
+  const dcaMinimum = holding.fundMinDcaAmount ?? holding.fundMinPurchaseAmount;
+  if ((holding.market === "FUND" || holding.assetType === "fund") && Number.isFinite(amount) && dcaMinimum != null && amount + 1e-8 < dcaMinimum) {
+    return {
+      label: language === "en" ? `Minimum ${dcaMinimum}` : `定投起点 ${dcaMinimum}`,
+      color: "#F59E0B",
+    };
+  }
+  if ((holding.market === "FUND" || holding.assetType === "fund") && holding.fundDcaStatus === "buy_disabled") {
+    return planStatusMeta(holding, language);
+  }
   const resolved = resolveHoldingTradeStatus(holding);
   if (resolved.status === "normal") return null;
   if (resolved.status === "fund_limit") {
-    const amount = Number(amountText);
     const limit = parseChineseMoneyLimit(resolved.note ?? "");
     if (Number.isFinite(amount) && limit != null && amount <= limit + 1e-8) return null;
   }
@@ -67,6 +82,9 @@ function executionStatusMeta(execution: DCAExecution, language: Language) {
   }
   if (execution.status === "pending") {
     return { label: text.pendingStatus, color: "#4F9CF9", bg: "rgba(79,156,249,0.12)" };
+  }
+  if (execution.status === "cancelled") {
+    return { label: language === "en" ? "Cancelled" : "已撤销", color: "#94A3B8", bg: "rgba(148,163,184,0.12)" };
   }
   return { label: text.skippedStatus, color: "#F59E0B", bg: "rgba(245,158,11,0.12)" };
 }
@@ -123,7 +141,9 @@ function PlanCard({
       ? text.latestConfirmed(dateLabel(latestExecution.confirmedDate || latestExecution.actualDate, language))
       : latestExecution.status === "pending"
         ? text.pending(dateLabel(latestExecution.actualDate, language))
-      : skippedSummary(latestExecution.reason, language)
+        : latestExecution.status === "cancelled"
+          ? (language === "en" ? "Cancelled" : "已撤销")
+          : skippedSummary(latestExecution.reason, language)
     : text.noExecutions;
 
   return (
@@ -182,7 +202,7 @@ function PlanCard({
             <p
               className="truncate"
               title={latestExecution?.reason ? translateDcaReason(latestExecution.reason, language) : undefined}
-              style={{ color: latestExecution?.status === "skipped" ? "#F59E0B" : "#4F9CF9", fontSize: 11, fontWeight: 600, maxWidth: 150 }}
+              style={{ color: latestExecution?.status === "skipped" || latestExecution?.status === "cancelled" ? "#F59E0B" : "#4F9CF9", fontSize: 11, fontWeight: 600, maxWidth: 150 }}
             >
               {latestText}
             </p>
@@ -596,6 +616,10 @@ function PlanForm({
     }
     if (!form.amount || isNaN(Number(form.amount)) || Number(form.amount) <= 0)
       e.amount = text.validateAmount;
+    const dcaMinimum = selectedHolding?.fundMinDcaAmount ?? selectedHolding?.fundMinPurchaseAmount;
+    if (dcaMinimum != null && Number(form.amount) + 1e-8 < dcaMinimum) {
+      e.amount = language === "en" ? `Minimum DCA amount is ${dcaMinimum}` : `定投金额不能低于 ${dcaMinimum}`;
+    }
     if (!isValidYMD(form.startDate)) e.startDate = text.previewError;
     return e;
   };
@@ -784,11 +808,12 @@ type PanelView = "list" | "create" | "edit" | "checker";
 
 export function DCAPanel() {
   const {
-    tc, holdings, dcaPlans, dcaExecutions, dcaPanelOpen, dcaPanelHoldingId,
+    tc, holdings, dcaPlans: allDcaPlans, dcaExecutions, dcaPanelOpen, dcaPanelHoldingId,
     addDCAPlan, updateDCAPlan, removeDCAPlan, toggleDCAPlan,
     closeDCAPanel, language,
   } = useApp();
   const text = t(language);
+  const dcaPlans = useMemo(() => allDcaPlans.filter((plan) => !plan.archived), [allDcaPlans]);
 
   const [view, setView] = useState<PanelView>("list");
   const [editPlan, setEditPlan] = useState<DCAPlan | null>(null);
@@ -856,7 +881,7 @@ export function DCAPanel() {
       dayOfWeek:  form.dayOfWeek,
       dayOfMonth: form.dayOfMonth,
       startDate:  form.startDate,
-      enabled:    true,
+      enabled:    view === "edit" && editPlan ? editPlan.enabled : true,
       note:       form.note,
       nextExecDate: nextPreview?.actual,
     };

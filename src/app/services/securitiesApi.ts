@@ -301,14 +301,93 @@ export function parseFundBuyConfirmDays(text: string): number | undefined {
   return Number.isInteger(days) && days >= 0 && days <= 30 ? days : undefined;
 }
 
+export function parseFundSellConfirmDays(text: string): number | undefined {
+  const raw = text.match(/(?:卖出|赎回)确认日\s*T\s*\+\s*(\d{1,2})/)?.[1];
+  if (raw === undefined) return undefined;
+  const days = Number(raw);
+  return Number.isInteger(days) && days >= 0 && days <= 30 ? days : undefined;
+}
+
 export function parseFundPurchaseLimitText(text: string): string {
   return text.match(/(?:单日累计购买上限|日累计申购限额)\s*((?:[0-9]+(?:\.[0-9]+)?\s*[万千百十]?[\s零]*)+\s*元?|---|不限|无限额)/)?.[1]?.trim() ?? "";
+}
+
+function parseFundRuleNumber(raw: string | undefined) {
+  if (!raw) return undefined;
+  const match = raw.match(/([0-9]+(?:\.[0-9]+)?)\s*(亿|万|千)?/);
+  if (!match) return undefined;
+  const base = Number(match[1]);
+  const multiplier = match[2] === "亿" ? 100_000_000 : match[2] === "万" ? 10_000 : match[2] === "千" ? 1_000 : 1;
+  const value = base * multiplier;
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+export function parseFundTradeMinimums(text: string) {
+  return {
+    minPurchaseAmount: parseFundRuleNumber(text.match(/(?:追加购买|追加申购)\s*([0-9]+(?:\.[0-9]+)?\s*(?:亿|万|千)?)/)?.[1]),
+    minDcaAmount: parseFundRuleNumber(text.match(/定投起点\s*([0-9]+(?:\.[0-9]+)?\s*(?:亿|万|千)?)/)?.[1]),
+    minRedemptionQuantity: parseFundRuleNumber(text.match(/最小赎回份额\s*([0-9]+(?:\.[0-9]+)?\s*(?:亿|万|千)?)/)?.[1]),
+    minRemainingQuantity: parseFundRuleNumber(text.match(/(?:部分赎回最低保留份额|最低持有份额)\s*([0-9]+(?:\.[0-9]+)?\s*(?:亿|万|千)?)/)?.[1]),
+  };
+}
+
+function parseClockMinutes(raw: string | undefined) {
+  if (!raw) return undefined;
+  const match = raw.match(/(\d{1,2})\s*[:：时]\s*(\d{1,2})?\s*分?/);
+  if (!match) return undefined;
+  const hour = Number(match[1]);
+  const minute = Number(match[2] ?? 0);
+  return Number.isInteger(hour) && hour >= 0 && hour <= 23 && Number.isInteger(minute) && minute >= 0 && minute <= 59
+    ? hour * 60 + minute
+    : undefined;
+}
+
+function scopedCutoff(text: string, scope: RegExp) {
+  const match = text.match(new RegExp(`${scope.source}[^。；,，]{0,32}(?:受理|交易|申请|撤单)?截止(?:时间)?[^0-9]{0,8}(\\d{1,2}\\s*[:：时]\\s*\\d{0,2}\\s*分?)`, "i"));
+  return parseClockMinutes(match?.[1]);
+}
+
+function scopedCancellationAllowed(text: string, scope: RegExp) {
+  const fragment = text.match(new RegExp(`${scope.source}[^。；,，]{0,36}(?:(?:不可|不允许|不支持)撤(?:单|销)|(?:可|允许|支持)撤(?:单|销))`, "i"))?.[0] ?? "";
+  if (!fragment) return undefined;
+  return /(?:不可|不允许|不支持)撤(?:单|销)/.test(fragment) ? false : true;
+}
+
+export function parseFundOrderChannelRules(text: string) {
+  const genericCutoff = scopedCutoff(text, /(?:基金)?(?:订单|交易)/);
+  const genericCancellationAllowed = scopedCancellationAllowed(text, /(?:基金)?(?:订单|交易)/);
+  return {
+    buyCutoffMinutes: scopedCutoff(text, /(?:申购|买入)/) ?? genericCutoff,
+    sellCutoffMinutes: scopedCutoff(text, /(?:赎回|卖出)/) ?? genericCutoff,
+    dcaCutoffMinutes: scopedCutoff(text, /定投/) ?? genericCutoff,
+    buyCancellationAllowed: scopedCancellationAllowed(text, /(?:申购|买入)/) ?? genericCancellationAllowed,
+    sellCancellationAllowed: scopedCancellationAllowed(text, /(?:赎回|卖出)/) ?? genericCancellationAllowed,
+    dcaCancellationAllowed: scopedCancellationAllowed(text, /定投/) ?? genericCancellationAllowed,
+  };
 }
 
 export async function fetchCnFundTradeStatus(code: string): Promise<{
   status: "normal" | "fund_limit" | "buy_disabled";
   note: string;
   buyConfirmDays?: number;
+  sellConfirmDays?: number;
+  purchaseStatus: "normal" | "fund_limit" | "buy_disabled" | "unknown";
+  dcaStatus: "normal" | "buy_disabled" | "unknown";
+  redemptionStatus: "normal" | "sell_disabled" | "unknown";
+  purchaseStatusNote: string;
+  dcaStatusNote: string;
+  redemptionStatusNote: string;
+  minPurchaseAmount?: number;
+  minDcaAmount?: number;
+  minRedemptionQuantity?: number;
+  minRemainingQuantity?: number;
+  buyCutoffMinutes?: number;
+  sellCutoffMinutes?: number;
+  dcaCutoffMinutes?: number;
+  buyCancellationAllowed?: boolean;
+  sellCancellationAllowed?: boolean;
+  dcaCancellationAllowed?: boolean;
+  cancellationRuleSource?: string;
 } | null> {
   const [signal, clear] = mkAbort(6000);
   try {
@@ -330,36 +409,68 @@ export async function fetchCnFundTradeStatus(code: string): Promise<{
       .trim();
     const purchase = text.match(/申购状态\s*(暂停申购|开放申购|限制大额申购|限大额|暂停|开放|不支持)/)?.[1] ?? "";
     const dca = text.match(/定投状态\s*(不支持|暂停|开放|支持)/)?.[1] ?? "";
+    const redemption = text.match(/赎回状态\s*(暂停赎回|开放赎回|暂停|开放|不支持)/)?.[1] ?? "";
     const limit = parseFundPurchaseLimitText(text);
     const buyConfirmDays = parseFundBuyConfirmDays(text);
-    const confirmPatch = buyConfirmDays !== undefined ? { buyConfirmDays } : {};
-
-    if (/不支持|暂停/.test(dca)) {
-      const parts = [
-        purchase ? `申购状态：${purchase}` : "",
-        `定投状态：${dca}`,
-      ].filter(Boolean);
-      return { status: "buy_disabled", note: parts.join("，") || "基金当前不可定投", ...confirmPatch };
-    }
+    const sellConfirmDays = parseFundSellConfirmDays(text);
+    const minimums = parseFundTradeMinimums(text);
+    const orderRules = parseFundOrderChannelRules(text);
+    const hasReturnedOrderRule = Object.values(orderRules).some((value) => value !== undefined);
+    const orderRulePatch = hasReturnedOrderRule
+      ? { ...orderRules, cancellationRuleSource: "东方财富基金交易规则" }
+      : {};
+    const confirmPatch = {
+      ...(buyConfirmDays !== undefined ? { buyConfirmDays } : {}),
+      ...(sellConfirmDays !== undefined ? { sellConfirmDays } : {}),
+    };
+    const purchaseStatus = /暂停|不支持/.test(purchase)
+      ? "buy_disabled" as const
+      : /限制|限大额/.test(purchase) || (limit && !/不限|无限额|---/.test(limit))
+        ? "fund_limit" as const
+        : /开放/.test(purchase)
+          ? "normal" as const
+          : "unknown" as const;
+    const dcaStatus = /不支持|暂停/.test(dca)
+      ? "buy_disabled" as const
+      : /开放|支持/.test(dca)
+        ? "normal" as const
+        : "unknown" as const;
+    const redemptionStatus = /暂停|不支持/.test(redemption)
+      ? "sell_disabled" as const
+      : /开放/.test(redemption)
+        ? "normal" as const
+        : "unknown" as const;
+    const structured = {
+      purchaseStatus,
+      dcaStatus,
+      redemptionStatus,
+      purchaseStatusNote: purchase ? `申购状态：${purchase}` : "申购状态未识别",
+      dcaStatusNote: dca ? `定投状态：${dca}` : "定投状态未识别",
+      redemptionStatusNote: redemption ? `赎回状态：${redemption}` : "赎回状态未识别",
+    };
 
     if (/暂停|不支持/.test(purchase)) {
       const parts = [
         purchase ? `申购状态：${purchase}` : "",
         dca ? `定投状态：${dca}` : "",
       ].filter(Boolean);
-      return { status: "buy_disabled", note: parts.join("，") || "基金当前不可买入", ...confirmPatch };
+      return { status: "buy_disabled", note: parts.join("，") || "基金当前不可买入", ...confirmPatch, ...minimums, ...orderRulePatch, ...structured };
     }
 
     if (/限制|限大额/.test(purchase) || (limit && !/不限|无限额|---/.test(limit))) {
-      return { status: "fund_limit", note: limit ? `基金限购，${limit}` : "基金限购", ...confirmPatch };
+      return { status: "fund_limit", note: limit ? `基金限购，${limit}` : "基金限购", ...confirmPatch, ...minimums, ...orderRulePatch, ...structured };
     }
 
-    if (/开放|支持/.test(purchase) || /开放|支持/.test(dca)) {
-      return { status: "normal", note: "东方财富基金交易状态显示可买", ...confirmPatch };
+    if (purchaseStatus === "normal") {
+      return { status: "normal", note: "东方财富基金交易状态显示可买", ...confirmPatch, ...minimums, ...orderRulePatch, ...structured };
     }
 
-    if (buyConfirmDays !== undefined) {
-      return { status: "normal", note: "已获取基金买入确认规则，交易状态未识别", buyConfirmDays };
+    if (buyConfirmDays !== undefined || sellConfirmDays !== undefined || hasReturnedOrderRule) {
+      return { status: "normal", note: "已获取基金确认规则，交易状态未识别", ...confirmPatch, ...minimums, ...orderRulePatch, ...structured };
+    }
+
+    if (dcaStatus !== "unknown" || redemptionStatus !== "unknown") {
+      return { status: "normal", note: "基金申购状态未识别", ...confirmPatch, ...minimums, ...orderRulePatch, ...structured };
     }
 
     return null;
