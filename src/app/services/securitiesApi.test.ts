@@ -9,7 +9,10 @@ import {
   fetchLivePrice,
   normalizeSearchSymbol,
   parseFundPurchaseLimitText,
+  parseFundOrderChannelRules,
+  parseFundTradeMinimums,
   parseFundBuyConfirmDays,
+  parseFundSellConfirmDays,
   resolveYahooUsPrice,
   searchSecuritiesLive,
 } from "./securitiesApi";
@@ -41,11 +44,72 @@ describe("parseFundBuyConfirmDays", () => {
   });
 });
 
+describe("parseFundSellConfirmDays", () => {
+  test("extracts sell and redemption confirmation days", () => {
+    assert.equal(parseFundSellConfirmDays("买入确认日 T+1 卖出确认日 T+2"), 2);
+    assert.equal(parseFundSellConfirmDays("赎回确认日 T + 3"), 3);
+    assert.equal(parseFundSellConfirmDays("买入确认日 T+1"), undefined);
+  });
+
+  test("keeps purchase, DCA, and redemption capabilities independent", async () => {
+    await withMockFetch((async () => ({
+      ok: true,
+      text: async () => "<html><body>申购状态 开放申购 定投状态 暂停 赎回状态 开放赎回 买入确认日 T+1 卖出确认日 T+2</body></html>",
+    }) as Response) as typeof fetch, async () => {
+      const status = await fetchCnFundTradeStatus("019305");
+      assert.equal(status?.status, "normal");
+      assert.equal(status?.purchaseStatus, "normal");
+      assert.equal(status?.dcaStatus, "buy_disabled");
+      assert.equal(status?.redemptionStatus, "normal");
+      assert.match(status?.dcaStatusNote ?? "", /定投状态：暂停/);
+      assert.match(status?.redemptionStatusNote ?? "", /赎回状态：开放赎回/);
+      assert.equal(status?.sellConfirmDays, 2);
+    });
+  });
+});
+
 describe("parseFundPurchaseLimitText", () => {
   test("keeps composite purchase limit amounts intact", () => {
     assert.equal(parseFundPurchaseLimitText("单日累计购买上限 1万5千元"), "1万5千元");
     assert.equal(parseFundPurchaseLimitText("日累计申购限额 1万零500元"), "1万零500元");
     assert.equal(parseFundPurchaseLimitText("日累计申购限额 不限"), "不限");
+  });
+});
+
+describe("parseFundTradeMinimums", () => {
+  test("extracts independent additional-purchase, DCA, redemption, and remaining-position minimums", () => {
+    assert.deepEqual(parseFundTradeMinimums("追加购买 10.00元 定投起点 100.00元 最小赎回份额 0.10份 部分赎回最低保留份额 1千份"), {
+      minPurchaseAmount: 10,
+      minDcaAmount: 100,
+      minRedemptionQuantity: 0.1,
+      minRemainingQuantity: 1000,
+    });
+  });
+});
+
+describe("parseFundOrderChannelRules", () => {
+  test("extracts side-specific returned cutoffs and cancellation capabilities", () => {
+    assert.deepEqual(parseFundOrderChannelRules(
+      "申购受理截止时间 14:30，申购允许撤单；赎回交易截止 15:00，赎回不支持撤单；定投截止时间 13时45分，定投可撤销",
+    ), {
+      buyCutoffMinutes: 870,
+      sellCutoffMinutes: 900,
+      dcaCutoffMinutes: 825,
+      buyCancellationAllowed: true,
+      sellCancellationAllowed: false,
+      dcaCancellationAllowed: true,
+    });
+  });
+
+  test("returns unknown fields when the provider page has no cutoff or cancellation rule", () => {
+    assert.deepEqual(parseFundOrderChannelRules("申购状态 开放，买入确认日 T+1"), {
+      buyCutoffMinutes: undefined,
+      sellCutoffMinutes: undefined,
+      dcaCutoffMinutes: undefined,
+      buyCancellationAllowed: undefined,
+      sellCancellationAllowed: undefined,
+      dcaCancellationAllowed: undefined,
+    });
   });
 });
 

@@ -8,8 +8,9 @@ import { fetchNasdaqQuote } from "./nasdaqApi";
 import { fetchTencentQuote, fetchTencentQuoteFromYahooSymbol, fetchTencentTradeStatus } from "./tencentQuote";
 import { fetchBinanceCryptoQuote, fetchOkxCryptoQuote } from "./publicMarketApi";
 import { toYahooSymbol } from "./quoteApi";
-import type { TradeStatusValue } from "../utils/tradeStatus";
+import type { TradeStatusRefreshState, TradeStatusValue } from "../utils/tradeStatus";
 import { isTradingDay } from "./tradingCalendar";
+import type { Holding } from "../data/mockData";
 
 function todayShanghaiYMD(now = new Date()): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -50,7 +51,29 @@ export interface HoldingLiveUpdate {
   autoTradeStatus?: TradeStatusValue | null;
   autoTradeStatusNote?: string;
   autoTradeStatusSource?: LivePrice["source"] | null;
-  fundBuyConfirmDays?: number;
+  autoTradeStatusUpdatedAt?: string;
+  autoTradeStatusRefreshState?: TradeStatusRefreshState;
+  autoTradeStatusRefreshNote?: string;
+  fundBuyConfirmDays?: number | null;
+  fundSellConfirmDays?: number | null;
+  fundPurchaseStatus?: Holding["fundPurchaseStatus"];
+  fundDcaStatus?: Holding["fundDcaStatus"];
+  fundRedemptionStatus?: Holding["fundRedemptionStatus"];
+  fundPurchaseStatusNote?: string;
+  fundDcaStatusNote?: string;
+  fundRedemptionStatusNote?: string;
+  fundMinPurchaseAmount?: number | null;
+  fundMinDcaAmount?: number | null;
+  fundMinRedemptionQuantity?: number | null;
+  fundMinRemainingQuantity?: number | null;
+  fundBuyCutoffMinutes?: number | null;
+  fundSellCutoffMinutes?: number | null;
+  fundDcaCutoffMinutes?: number | null;
+  fundBuyCancellationAllowed?: boolean | null;
+  fundSellCancellationAllowed?: boolean | null;
+  fundDcaCancellationAllowed?: boolean | null;
+  fundCancellationRuleSource?: string | null;
+  fundTradeRulesUpdatedAt?: string;
 }
 
 export function resolveFundEstimateUpdate(
@@ -280,11 +303,24 @@ function toLivePriceFromEastMoneyQuote(quote: Awaited<ReturnType<typeof fetchEas
   };
 }
 
-function normalTradeStatusFromSource(source: LivePrice["source"]): Pick<HoldingLiveUpdate, "autoTradeStatus" | "autoTradeStatusNote" | "autoTradeStatusSource"> {
+function normalTradeStatusFromSource(source: LivePrice["source"]): Pick<HoldingLiveUpdate,
+  "autoTradeStatus" | "autoTradeStatusNote" | "autoTradeStatusSource" | "autoTradeStatusUpdatedAt" | "autoTradeStatusRefreshState" | "autoTradeStatusRefreshNote"
+> {
   return {
     autoTradeStatus: "normal",
     autoTradeStatusNote: "自动行情源显示可正常交易",
     autoTradeStatusSource: source,
+    autoTradeStatusUpdatedAt: new Date().toISOString(),
+    autoTradeStatusRefreshState: "success",
+    autoTradeStatusRefreshNote: "",
+  };
+}
+
+function failedTradeStatusFromSource(source: LivePrice["source"], note: string): HoldingLiveUpdate {
+  return {
+    autoTradeStatusSource: source,
+    autoTradeStatusRefreshState: "failed",
+    autoTradeStatusRefreshNote: note,
   };
 }
 
@@ -313,6 +349,12 @@ export async function eastMoneyFundLive(code: string, now: Date = new Date()): P
       estimateOfficialNav > 0 &&
       estimateOfficialDate &&
       (!latestHistory?.date || estimateOfficialDate > latestHistory.date);
+    const officialHistory = [
+      ...(useEstimateOfficial ? [{ date: estimateOfficialDate, nav: estimateOfficialNav }] : []),
+      ...sortedHistory,
+    ].filter((row, index, rows) => (
+      row.date && Number.isFinite(row.nav) && row.nav > 0 && rows.findIndex((candidate) => candidate.date === row.date) === index
+    ));
     const effectiveOfficialDate = useEstimateOfficial
       ? estimateOfficialDate
       : (latestHistory?.date ?? estimateOfficialDate);
@@ -355,8 +397,7 @@ export async function eastMoneyFundLive(code: string, now: Date = new Date()): P
       high: price, low: price, volume: 0,
       fetchedAt: Date.now(), source: "eastmoney",
       priceDate,
-      fundNavHistory: sortedHistory
-        .filter((row) => row.date && Number.isFinite(row.nav) && row.nav > 0)
+      fundNavHistory: officialHistory
         .map((row) => ({ date: row.date, nav: row.nav })),
       estimatedNav: gsz > 0 ? gsz : undefined,
       estimatedChangePercent: gsz > 0 && !isNaN(gszPct) ? gszPct / 100 : undefined,
@@ -645,16 +686,20 @@ async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSi
       let update: HoldingLiveUpdate = {};
       if (h.market === "A" || h.market === "HK") {
         price = eastMoneyMap.get(`${h.market}:${h.symbol}`) ?? null;
-        if (!price) price = await raceWithSignal(fetchStockLike(h.symbol, h.market));
-        const status = eastMoneyStatusMap.get(`${h.market}:${h.symbol}`) ?? await raceWithSignal(fetchTencentTradeStatus(h.symbol, h.market));
+        if (!price) price = await raceWithSignal(fetchStockLike(h.symbol, h.market)).catch(() => null);
+        const status = eastMoneyStatusMap.get(`${h.market}:${h.symbol}`)
+          ?? await raceWithSignal(fetchTencentTradeStatus(h.symbol, h.market)).catch(() => null);
         if (status) {
           update = {
             autoTradeStatus: status.status,
             autoTradeStatusNote: status.note,
             autoTradeStatusSource: status.source,
+            autoTradeStatusUpdatedAt: new Date().toISOString(),
+            autoTradeStatusRefreshState: "success",
+            autoTradeStatusRefreshNote: "",
           };
-        } else if (price) {
-          update = normalTradeStatusFromSource(price.source);
+        } else {
+          update = failedTradeStatusFromSource("eastmoney", "股票交易状态刷新失败，未将行情价格视为正常交易证明");
         }
       } else if (h.market === "CRYPTO") {
         price = await raceWithSignal(fetchCrypto(h.symbol));
@@ -665,16 +710,38 @@ async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSi
           raceWithSignal(fetchCnFundTradeStatus(h.symbol)).catch(() => null),
         ]);
         price = fundPrice;
-        if (!price) price = await raceWithSignal(fetchStockLike(h.symbol, h.market));
+        if (!price) price = await raceWithSignal(fetchStockLike(h.symbol, h.market)).catch(() => null);
         if (fundStatus) {
           update = {
             autoTradeStatus: fundStatus.status,
             autoTradeStatusNote: fundStatus.note,
             autoTradeStatusSource: "eastmoney",
-            fundBuyConfirmDays: fundStatus.buyConfirmDays,
+            autoTradeStatusUpdatedAt: new Date().toISOString(),
+            autoTradeStatusRefreshState: "success",
+            autoTradeStatusRefreshNote: "",
+            fundBuyConfirmDays: fundStatus.buyConfirmDays ?? null,
+            fundSellConfirmDays: fundStatus.sellConfirmDays ?? null,
+            fundPurchaseStatus: fundStatus.purchaseStatus,
+            fundDcaStatus: fundStatus.dcaStatus,
+            fundRedemptionStatus: fundStatus.redemptionStatus,
+            fundPurchaseStatusNote: fundStatus.purchaseStatusNote,
+            fundDcaStatusNote: fundStatus.dcaStatusNote,
+            fundRedemptionStatusNote: fundStatus.redemptionStatusNote,
+            fundMinPurchaseAmount: fundStatus.minPurchaseAmount ?? null,
+            fundMinDcaAmount: fundStatus.minDcaAmount ?? null,
+            fundMinRedemptionQuantity: fundStatus.minRedemptionQuantity ?? null,
+            fundMinRemainingQuantity: fundStatus.minRemainingQuantity ?? null,
+            fundBuyCutoffMinutes: fundStatus.buyCutoffMinutes ?? null,
+            fundSellCutoffMinutes: fundStatus.sellCutoffMinutes ?? null,
+            fundDcaCutoffMinutes: fundStatus.dcaCutoffMinutes ?? null,
+            fundBuyCancellationAllowed: fundStatus.buyCancellationAllowed ?? null,
+            fundSellCancellationAllowed: fundStatus.sellCancellationAllowed ?? null,
+            fundDcaCancellationAllowed: fundStatus.dcaCancellationAllowed ?? null,
+            fundCancellationRuleSource: fundStatus.cancellationRuleSource ?? null,
+            fundTradeRulesUpdatedAt: new Date().toISOString(),
           };
-        } else if (price) {
-          update = normalTradeStatusFromSource(price.source);
+        } else {
+          update = failedTradeStatusFromSource("eastmoney", "基金交易规则刷新失败，未将净值更新视为正常可买证明");
         }
       } else {
         price = await raceWithSignal(fetchStockLike(h.symbol, h.market));
@@ -687,7 +754,7 @@ async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSi
 
   const map: PriceMap = {};
   for (const r of results) {
-    if (r.status === "fulfilled" && (r.value.update.price || r.value.update.autoTradeStatus != null)) {
+    if (r.status === "fulfilled" && (r.value.update.price || r.value.update.autoTradeStatus != null || r.value.update.autoTradeStatusRefreshState != null)) {
       for (const id of r.value.ids) {
         map[id] = r.value.update;
       }

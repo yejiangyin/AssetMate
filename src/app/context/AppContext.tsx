@@ -20,14 +20,32 @@ import {
   normalizePortfolioEventBaseline,
   ymdFromEventValue,
 } from "../services/portfolioEvents";
-import { normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction, reverseCorporateAction } from "../utils/holdingHelpers";
+import { normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction, recomputeHoldingMetrics, reverseCorporateAction } from "../utils/holdingHelpers";
 import { dedupeDCAExecutions, hydratePlans, repairDCAData, settleDueDCAPlans, syncPlanWithHolding, computeNextExec } from "../utils/dcaEngine";
 import { safeUUID } from "../utils/safeId";
 import { acknowledgeSnapshotDueDates, DEFAULT_OPEN_MODE, getConfiguredExtensionOpenMode, getSnapshotDueDates, normalizeOpenMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
 import { estimateTransactionCosts, mergeTransactionCostProfile } from "../utils/transactionCosts";
+import { affordableBuyAmount } from "../utils/transactionCosts";
 import { backfillPortfolioSnapshots, collectMissingSnapshotDates } from "../services/portfolioSnapshotBackfill";
 import { collectStaleSnapshotDates } from "../services/staleSnapshotDetector";
 import { backfillPortfolioEventFxRates } from "../services/portfolioEventFxBackfill";
+import { mergeAutomaticTradeStatus, resolveHoldingTradeStatus } from "../utils/tradeStatus";
+import {
+  computeFundEffectiveDate,
+  computeFundOrderCancelDeadline,
+  computeFundOrderConfirmDate,
+  defaultFundConfirmDays,
+  fundOrderReservedBuyAmount,
+  fundOrderMinimumViolation,
+  normalizeFundOrders,
+  parseChineseMoneyLimit,
+  pendingSellQuantity,
+  readyFundOrderConfirmations,
+  requestFundOrderCancellation,
+  resolveFundOrderCutoff,
+  type FundOrder,
+  type FundOrderRuleSnapshot,
+} from "../utils/fundOrders";
 
 /* ─── types ──────────────────────────────────────────── */
 type ColorScheme    = "red-up" | "green-up";
@@ -35,7 +53,7 @@ type Theme          = "dark" | "light" | "system";
 type Currency       = "CNY" | "USD" | "HKD";
 type RefreshInterval = 0 | 1 | 5 | 15 | 30 | 60;
 export type Language = "zh" | "en";
-export type HoldingTradeStatus = "normal" | "suspended" | "fund_limit" | "buy_disabled";
+export type HoldingTradeStatus = "normal" | "suspended" | "fund_limit" | "buy_disabled" | "unknown";
 export type HoldingAdjustmentType = "buy" | "sell";
 export type HoldingCorporateActionType = "cash_dividend" | "dividend_reinvest" | "share_dividend" | "split" | "interest" | "bond_coupon" | "fee" | "tax";
 
@@ -78,7 +96,29 @@ export type HoldingInput = {
   autoTradeStatus?: HoldingTradeStatus | null;
   autoTradeStatusNote?: string;
   autoTradeStatusSource?: string | null;
+  autoTradeStatusUpdatedAt?: string;
+  autoTradeStatusStale?: boolean;
+  autoTradeStatusRefreshNote?: string;
   fundBuyConfirmDays?: number;
+  fundSellConfirmDays?: number;
+  fundPurchaseStatus?: Holding["fundPurchaseStatus"];
+  fundDcaStatus?: Holding["fundDcaStatus"];
+  fundRedemptionStatus?: Holding["fundRedemptionStatus"];
+  fundPurchaseStatusNote?: string;
+  fundDcaStatusNote?: string;
+  fundRedemptionStatusNote?: string;
+  fundMinPurchaseAmount?: number;
+  fundMinDcaAmount?: number;
+  fundMinRedemptionQuantity?: number;
+  fundMinRemainingQuantity?: number;
+  fundBuyCutoffMinutes?: number;
+  fundSellCutoffMinutes?: number;
+  fundDcaCutoffMinutes?: number;
+  fundBuyCancellationAllowed?: boolean;
+  fundSellCancellationAllowed?: boolean;
+  fundDcaCancellationAllowed?: boolean;
+  fundCancellationRuleSource?: string;
+  fundTradeRulesUpdatedAt?: string;
   dividendReinvest?: boolean | null;
   transactionCostProfile?: TransactionCostProfile;
 };
@@ -198,9 +238,10 @@ export interface DCAPlan {
   execCount:    number;
   note?:        string;
   fundBuyConfirmDays?: number;
+  archived?: boolean;
 }
 
-export type DCAExecutionStatus = "pending" | "executed" | "skipped";
+export type DCAExecutionStatus = "pending" | "executed" | "skipped" | "cancelled";
 
 export interface DCAExecution {
   id:            string;
@@ -215,7 +256,11 @@ export interface DCAExecution {
   price?:        number;
   reason?:       string;
   navDate?:      string;
+  expectedConfirmDate?: string;
+  channelConfirmedAt?: string;
   confirmedDate?: string;
+  /** undefined = legacy execution; null = no costs at submission time. */
+  transactionCostProfile?: TransactionCostProfile | null;
 }
 
 /* ─── Theme colors ───────────────────────────────────── */
@@ -398,6 +443,7 @@ interface AppState {
   detailTarget:    DetailTarget | null;
   dcaPlans:        DCAPlan[];
   dcaExecutions:   DCAExecution[];
+  fundOrders:      FundOrder[];
   portfolioEvents: PortfolioEvent[];
   portfolioEventBaseline: PortfolioEventBaseline;
   assetSnapshots:  PortfolioSnapshot[];
@@ -428,6 +474,8 @@ interface AppContextType extends AppState {
   addHolding:         (h: HoldingInput) => void;
   updateHolding:      (id: string, h: HoldingInput) => void;
   adjustHolding:      (id: string, input: HoldingAdjustmentInput) => void;
+  submitFundOrder:    (id: string, input: HoldingAdjustmentInput) => { ok: boolean; error?: string };
+  cancelFundOrder:    (id: string) => { ok: boolean; error?: string };
   removeHolding:      (id: string) => void;
   removeClosedHolding: (id: string) => void;
   updatePortfolioEvent: (id: string, patch: Pick<PortfolioEvent, "date" | "amount" | "note">) => void;
@@ -450,7 +498,7 @@ const AppContext = createContext<AppContextType | null>(null);
 const STORAGE_KEY = "asset-helper:v2";
 const STORAGE_BACKUP_KEY = "asset-helper:v2:backup";
 const SAVED_BACKTESTS_KEY = "asset-helper:saved-backtests:v1";
-const STORAGE_VERSION = 3;
+const STORAGE_VERSION = 6;
 const REFRESH_META_KEY = "asset-helper:portfolio-refresh-meta:v1";
 const REFRESH_RECENT_TTL = 45_000;
 const REFRESH_LOCK_TTL = 25_000;
@@ -498,6 +546,7 @@ type PersistedState = Partial<Pick<
   | "defaultOpenMode"
   | "dcaPlans"
   | "dcaExecutions"
+  | "fundOrders"
   | "portfolioEvents"
   | "portfolioEventBaseline"
   | "assetSnapshots"
@@ -520,6 +569,10 @@ function optionalNonNegativeNumber(value: unknown) {
   if (value == null || value === "") return undefined;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function refreshedFundRule<T>(incoming: T | null | undefined, current: T | undefined) {
+  return incoming === undefined ? current : incoming ?? undefined;
 }
 
 function normalizeClosedHolding(raw: Partial<ClosedHolding> & Record<string, unknown>): ClosedHolding | null {
@@ -745,11 +798,24 @@ function appendDCAExecutionEvents(
   executions: DCAExecution[],
   source: PortfolioEventSource = "auto",
 ) {
-  const existingExecutionIds = new Set(events.map((event) => event.relatedEventId).filter(Boolean));
-  const holdingById = new Map(holdings.map((holding) => [holding.id, holding]));
+  const executionStatus = new Map(executions.map((execution) => [execution.id, execution.status]));
+  const invalidExecutionIds = new Set(
+    executions.filter((execution) => execution.status !== "executed").map((execution) => execution.id),
+  );
+  const retainedEvents = events.filter((event) => !(
+    event.relatedEventId && executionStatus.has(event.relatedEventId) && invalidExecutionIds.has(event.relatedEventId)
+  ));
+  const existingExecutionIds = new Set(retainedEvents.map((event) => event.relatedEventId).filter(Boolean));
+  const holdingById = new Map(holdings.map((holding) => {
+    const corporateActions = (holding.corporateActions ?? []).filter((action) => {
+      const match = action.id.match(/^dca:(.+):(fee|tax)$/);
+      return !match?.[1] || !invalidExecutionIds.has(match[1]);
+    });
+    return [holding.id, corporateActions.length === (holding.corporateActions ?? []).length ? holding : { ...holding, corporateActions }] as const;
+  }));
   let nextHoldings = holdings;
-  const nextEvents = [...events];
-  let changed = false;
+  const nextEvents = [...retainedEvents];
+  let changed = retainedEvents.length !== events.length || [...holdingById.values()].some((holding, index) => holding !== holdings[index]);
   for (const execution of executions) {
     if (execution.status !== "executed" || existingExecutionIds.has(execution.id)) continue;
     if (!(execution.quantity && execution.quantity > 0 && execution.price && execution.price > 0)) continue;
@@ -765,7 +831,10 @@ function appendDCAExecutionEvents(
     });
     nextEvents.push(buyEvent);
     const tradeAmount = execution.quantity * execution.price;
-    const { fee, tax } = estimateTransactionCosts(holding.transactionCostProfile, "buy", tradeAmount);
+    const executionCostProfile = execution.transactionCostProfile === undefined
+      ? holding.transactionCostProfile
+      : execution.transactionCostProfile ?? undefined;
+    const { fee, tax } = estimateTransactionCosts(executionCostProfile, "buy", tradeAmount);
     for (const [costType, costAmount] of [["fee", fee], ["tax", tax]] as const) {
       if (!(costAmount > 0)) continue;
       const actionId = `dca:${execution.id}:${costType}`;
@@ -793,6 +862,287 @@ function appendDCAExecutionEvents(
   return {
     holdings: nextHoldings,
     portfolioEvents: changed ? dedupePortfolioEvents(nextEvents) : events,
+  };
+}
+
+function fundOrderRuleForHolding(
+  holding: Holding,
+  side: "buy" | "sell",
+  capturedAt: string,
+  transactionCostProfile = holding.transactionCostProfile,
+  source: "manual" | "dca" = "manual",
+): FundOrderRuleSnapshot {
+  const resolved = resolveHoldingTradeStatus(holding);
+  const confirmDays = defaultFundConfirmDays(holding, side);
+  const tradeStatus: FundOrderRuleSnapshot["tradeStatus"] = side === "buy"
+    ? holding.fundPurchaseStatus && holding.fundPurchaseStatus !== "unknown"
+      ? holding.autoTradeStatusStale && holding.fundPurchaseStatus === "normal" ? "unknown" : holding.fundPurchaseStatus
+      : resolved.status
+    : holding.fundRedemptionStatus === "sell_disabled"
+      ? "sell_disabled"
+      : holding.fundRedemptionStatus === "normal"
+        ? holding.autoTradeStatusStale ? "unknown" : "normal"
+        : "unknown";
+  const tradeStatusNote = side === "buy"
+    ? holding.fundPurchaseStatusNote || resolved.note
+    : holding.fundRedemptionStatusNote || (tradeStatus === "sell_disabled" ? "基金当前暂停赎回" : resolved.note);
+  const cutoffRule = resolveFundOrderCutoff(holding, side, source);
+  return {
+    tradeStatus,
+    tradeStatusNote,
+    tradeStatusSource: resolved.source || null,
+    purchaseLimit: side === "buy" ? parseChineseMoneyLimit(resolved.note ?? "") ?? undefined : undefined,
+    minimumPurchaseAmount: side === "buy" ? holding.fundMinPurchaseAmount : undefined,
+    minimumRedemptionQuantity: side === "sell" ? holding.fundMinRedemptionQuantity : undefined,
+    minimumRemainingQuantity: side === "sell" ? holding.fundMinRemainingQuantity : undefined,
+    confirmDays,
+    cutoffMinutes: cutoffRule.cutoffMinutes,
+    cutoffSource: cutoffRule.cutoffSource,
+    cutoffEstimated: cutoffRule.cutoffEstimated,
+    cancellationPolicy: cutoffRule.cancellationPolicy,
+    cancellationPolicySource: cutoffRule.cancellationPolicySource,
+    transactionCostProfile: transactionCostProfile ?? null,
+    capturedAt,
+  };
+}
+
+function syncDCAFundOrders(
+  existingOrders: FundOrder[],
+  holdings: Holding[],
+  plans: DCAPlan[],
+  executions: DCAExecution[],
+) {
+  const holdingById = new Map(holdings.map((holding) => [holding.id, holding]));
+  const planById = new Map(plans.map((plan) => [plan.id, plan]));
+  const byId = new Map(existingOrders.map((order) => [order.id, order]));
+  for (const execution of executions) {
+    const plan = planById.get(execution.planId);
+    const holding = holdingById.get(execution.holdingId);
+    if (!plan || !holding || !(plan.market === "FUND" || plan.assetType === "fund")) continue;
+    const existing = byId.get(execution.id);
+    const requestedAt = existing?.requestedAt ?? `${execution.actualDate}T14:30:00.000+08:00`;
+    const executionCostProfile = execution.transactionCostProfile === undefined
+      ? holding.transactionCostProfile
+      : execution.transactionCostProfile ?? undefined;
+    const rule = {
+      ...(existing?.rule ?? fundOrderRuleForHolding(holding, "buy", requestedAt, executionCostProfile, "dca")),
+      cancellationPolicy: "not_cancellable" as const,
+      cancellationPolicySource: "自动定投触发单不可手工撤销",
+    };
+    const status: FundOrder["status"] = execution.status === "executed"
+      ? "confirmed"
+      : execution.status === "cancelled"
+        ? "cancelled"
+      : execution.status === "skipped"
+        ? "rejected"
+        : "pending";
+    byId.set(execution.id, {
+      id: execution.id,
+      holdingId: execution.holdingId,
+      symbol: holding.symbol,
+      planId: execution.planId,
+      source: "dca",
+      entryMode: "submitted",
+      side: "buy",
+      status,
+      requestedAt,
+      requestedDate: execution.actualDate,
+      effectiveDate: execution.actualDate,
+      requestedAmount: execution.amount,
+      estimatedPrice: existing?.estimatedPrice ?? holding.currentPrice,
+      expectedConfirmDate: execution.expectedConfirmDate ?? computeFundOrderConfirmDate(holding, execution.actualDate, rule.confirmDays),
+      channelConfirmedAt: execution.channelConfirmedAt ?? existing?.channelConfirmedAt,
+      cancelDeadline: undefined,
+      cancelledAt: status === "cancelled" ? existing?.cancelledAt : undefined,
+      confirmedDate: execution.confirmedDate,
+      navDate: execution.navDate,
+      confirmedPrice: execution.price,
+      confirmedQuantity: execution.quantity,
+      confirmedAmount: execution.quantity && execution.price ? execution.quantity * execution.price : undefined,
+      reason: execution.reason,
+      rule,
+      createdAt: existing?.createdAt ?? requestedAt,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+  return [...byId.values()].sort((a, b) => b.requestedAt.localeCompare(a.requestedAt));
+}
+
+export function settleManualFundOrders(
+  holdings: Holding[],
+  closedHoldings: ClosedHolding[],
+  orders: FundOrder[],
+  events: PortfolioEvent[],
+  asOfDate: string,
+) {
+  const confirmations = readyFundOrderConfirmations(holdings, orders, asOfDate);
+  const nextHoldings = [...holdings];
+  let nextClosed = [...closedHoldings];
+  let nextOrders = [...orders];
+  const nextEvents = [...events];
+  let changed = false;
+
+  for (const confirmation of confirmations) {
+    const orderIndex = nextOrders.findIndex((order) => order.id === confirmation.orderId && order.status === "pending");
+    if (orderIndex < 0) continue;
+    const order = nextOrders[orderIndex]!;
+    const holdingIndex = nextHoldings.findIndex((holding) => holding.id === order.holdingId);
+    if (holdingIndex < 0) {
+      nextOrders[orderIndex] = { ...order, status: "rejected", reason: "关联持仓不存在", updatedAt: new Date().toISOString() };
+      changed = true;
+      continue;
+    }
+    const target = nextHoldings[holdingIndex]!;
+    const transactionCostProfile = order.rule.transactionCostProfile === undefined
+      ? target.transactionCostProfile
+      : order.rule.transactionCostProfile ?? undefined;
+    const eventDate = order.effectiveDate;
+    if (order.side === "buy") {
+      const requestedAmount = order.requestedAmount ?? 0;
+      const tradeAmount = affordableBuyAmount(transactionCostProfile, requestedAmount);
+      const quantity = tradeAmount / confirmation.price;
+      if (!(quantity > 0)) {
+        nextOrders[orderIndex] = { ...order, status: "rejected", reason: "确认份额计算失败", updatedAt: new Date().toISOString() };
+        changed = true;
+        continue;
+      }
+      let adjusted = applyHoldingAdjustment(target, { type: "buy", quantity, price: confirmation.price }) ?? target;
+      const buyEvent = buildBuyEvent(target, {
+        quantity,
+        price: confirmation.price,
+        date: eventDate,
+        source: "manual",
+        relatedEventId: order.id,
+      });
+      nextEvents.push(buyEvent);
+      const { fee, tax } = estimateTransactionCosts(transactionCostProfile, "buy", tradeAmount);
+      for (const [costType, costAmount] of [["fee", fee], ["tax", tax]] as const) {
+        if (!(costAmount > 0)) continue;
+        adjusted = applyHoldingCorporateAction(adjusted, {
+          id: `fund-order:${order.id}:${costType}`,
+          type: costType,
+          date: eventDate,
+          amount: costAmount,
+          source: "manual",
+          note: "fund order transaction cost",
+        });
+        const action = adjusted.corporateActions?.find((item) => item.id === `fund-order:${order.id}:${costType}`);
+        const costEvent = action ? buildPortfolioEventFromCorporateAction(adjusted, action, "manual") : null;
+        if (costEvent) nextEvents.push({ ...costEvent, relatedEventId: order.id });
+      }
+      nextHoldings[holdingIndex] = adjusted;
+      nextOrders[orderIndex] = {
+        ...order,
+        status: "confirmed",
+        confirmedDate: confirmation.confirmedDate,
+        navDate: confirmation.navDate,
+        confirmedPrice: confirmation.price,
+        confirmedQuantity: quantity,
+        confirmedAmount: tradeAmount,
+        fee,
+        tax,
+        reason: undefined,
+        updatedAt: new Date().toISOString(),
+      };
+      changed = true;
+      continue;
+    }
+
+    const quantity = order.requestedQuantity ?? 0;
+    if (!(quantity > 0)) {
+      nextOrders[orderIndex] = { ...order, status: "rejected", reason: "可赎回份额不足", updatedAt: new Date().toISOString() };
+      changed = true;
+      continue;
+    }
+    if (quantity > target.quantity + 1e-8) {
+      nextOrders[orderIndex] = { ...order, status: "rejected", reason: "确认时可赎回份额不足，未执行部分赎回", updatedAt: new Date().toISOString() };
+      changed = true;
+      continue;
+    }
+    const grossAmount = quantity * confirmation.price;
+    const { fee, tax } = estimateTransactionCosts(transactionCostProfile, "sell", grossAmount);
+    const closed = buildClosedHolding(target, confirmation.price, eventDate, quantity, { fee, tax });
+    const adjusted = applyHoldingAdjustment(target, { type: "sell", quantity, price: confirmation.price });
+    nextClosed = [closed, ...nextClosed];
+    nextEvents.push(buildSellEvent(target, {
+      quantity,
+      price: confirmation.price,
+      date: eventDate,
+      source: "manual",
+      relatedEventId: closed.id,
+    }));
+    let costCarrier = adjusted ?? target;
+    for (const [costType, costAmount] of [["fee", fee], ["tax", tax]] as const) {
+      if (!(costAmount > 0)) continue;
+      costCarrier = applyHoldingCorporateAction(costCarrier, {
+        id: `fund-order:${order.id}:${costType}`,
+        type: costType,
+        date: eventDate,
+        amount: costAmount,
+        source: "manual",
+        note: "fund redemption transaction cost",
+      });
+      const action = costCarrier.corporateActions?.find((item) => item.id === `fund-order:${order.id}:${costType}`);
+      const costEvent = action ? buildPortfolioEventFromCorporateAction(costCarrier, action, "manual") : null;
+      if (costEvent) nextEvents.push({ ...costEvent, relatedEventId: closed.id });
+    }
+    if (adjusted) {
+      nextHoldings[holdingIndex] = costCarrier;
+    } else {
+      const hasPendingPurchase = nextOrders.some((candidate) => (
+        candidate.id !== order.id &&
+        candidate.holdingId === order.holdingId &&
+        candidate.side === "buy" &&
+        candidate.status === "pending"
+      ));
+      if (hasPendingPurchase) {
+        // A full redemption and a later purchase are independent accepted
+        // orders at the fund account. Keep an empty carrier so the purchase can
+        // still confirm instead of becoming an orphan when the old units close.
+        nextHoldings[holdingIndex] = recomputeHoldingMetrics(target, {
+          quantity: 0,
+          costPrice: 0,
+          cashDividendTotal: 0,
+          corporateActions: [],
+        }, true);
+      } else {
+        nextHoldings.splice(holdingIndex, 1);
+      }
+    }
+    nextOrders[orderIndex] = {
+      ...order,
+      status: "confirmed",
+      confirmedDate: confirmation.confirmedDate,
+      navDate: confirmation.navDate,
+      confirmedPrice: confirmation.price,
+      confirmedQuantity: quantity,
+      confirmedAmount: Math.max(0, grossAmount - fee - tax),
+      fee,
+      tax,
+      reason: undefined,
+      updatedAt: new Date().toISOString(),
+    };
+    changed = true;
+  }
+
+  const remainingHoldingIds = new Set(nextHoldings.map((holding) => holding.id));
+  nextOrders = nextOrders.map((order) => {
+    if (order.status !== "pending" || remainingHoldingIds.has(order.holdingId)) return order;
+    changed = true;
+    return {
+      ...order,
+      status: "rejected" as const,
+      reason: "关联持仓不存在",
+      updatedAt: new Date().toISOString(),
+    };
+  });
+
+  return {
+    holdings: nextHoldings,
+    closedHoldings: nextClosed,
+    orders: nextOrders,
+    portfolioEvents: changed ? dedupePortfolioEvents(nextEvents) : events,
+    changed,
   };
 }
 
@@ -1006,6 +1356,7 @@ function defaultState(): AppState {
     detailTarget:    null,
     dcaPlans:        hydratePlans(initialDCAPlans),
     dcaExecutions:   [],
+    fundOrders:      [],
     portfolioEvents: [],
     portfolioEventBaseline: { daily: {}, realizedCostBasis: 0 },
     assetSnapshots:  [],
@@ -1030,6 +1381,7 @@ function blankState(current: AppState): AppState {
     closedHoldings:  [],
     dcaPlans:        [],
     dcaExecutions:   [],
+    fundOrders:      [],
     portfolioEvents: [],
     portfolioEventBaseline: { daily: {}, realizedCostBasis: 0 },
     assetSnapshots:  [],
@@ -1065,6 +1417,7 @@ function buildPersistedState(state: AppState): PersistedState {
     defaultOpenMode: state.defaultOpenMode,
     dcaPlans: state.dcaPlans,
     dcaExecutions: pruneDCAExecutions(state.dcaExecutions),
+    fundOrders: state.fundOrders,
     portfolioEvents: history.events,
     portfolioEventBaseline: history.baseline,
     assetSnapshots: prunePortfolioSnapshots(state.assetSnapshots),
@@ -1081,6 +1434,7 @@ function compactPersistedStateForStorage(snapshot: PersistedState): PersistedSta
   return {
     ...snapshot,
     dcaExecutions: pruneDCAExecutions(snapshot.dcaExecutions ?? []),
+    fundOrders: normalizeFundOrders(snapshot.fundOrders),
     portfolioEvents: history.events,
     portfolioEventBaseline: history.baseline,
     assetSnapshots: snapshots.map((item, index) => (
@@ -1212,6 +1566,7 @@ export function loadInitialState(): AppState {
     const dcaExecutions = repaired.executions;
     const dcaPlans = repaired.plans.length > 0 ? hydratePlans(repaired.plans, dcaExecutions) : base.dcaPlans;
     const finalHoldings = repaired.changed ? repaired.holdings : holdings;
+    const fundOrders = syncDCAFundOrders(normalizeFundOrders(saved.fundOrders), finalHoldings, dcaPlans, dcaExecutions);
     const existingEvents = normalizePortfolioEvents(saved.portfolioEvents);
     const portfolioEventBaseline = normalizePortfolioEventBaseline(saved.portfolioEventBaseline);
     const hasArchivedEvents = Object.keys(portfolioEventBaseline.daily).length > 0;
@@ -1264,6 +1619,7 @@ export function loadInitialState(): AppState {
       closedHoldings,
       dcaPlans,
       dcaExecutions,
+      fundOrders,
       portfolioEvents,
       portfolioEventBaseline,
       assetSnapshots,
@@ -1353,6 +1709,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     plans: DCAPlan[],
     executions: DCAExecution[],
     settleDue = false,
+    fundOrders: FundOrder[] = [],
   ) => {
     const repaired = plans.length > 0
       ? repairDCAData(holdings, plans, executions)
@@ -1363,6 +1720,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       repaired.executions,
       new Date(),
       settleDue,
+      fundOrders,
     );
     return {
       holdings: settled.holdings,
@@ -1503,13 +1861,31 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           const liveUpdate = priceMap[h.id];
           if (!liveUpdate) return h;
           const lp = liveUpdate.price;
+          const automaticTradeStatus = mergeAutomaticTradeStatus(h, liveUpdate);
           if (!lp) {
             return {
               ...h,
-            autoTradeStatus: liveUpdate.autoTradeStatus ?? null,
-            autoTradeStatusNote: liveUpdate.autoTradeStatusNote ?? "",
-            autoTradeStatusSource: liveUpdate.autoTradeStatusSource ?? null,
-            fundBuyConfirmDays: liveUpdate.fundBuyConfirmDays ?? h.fundBuyConfirmDays,
+            ...automaticTradeStatus,
+            fundBuyConfirmDays: refreshedFundRule(liveUpdate.fundBuyConfirmDays, h.fundBuyConfirmDays),
+            fundSellConfirmDays: refreshedFundRule(liveUpdate.fundSellConfirmDays, h.fundSellConfirmDays),
+            fundPurchaseStatus: liveUpdate.fundPurchaseStatus ?? h.fundPurchaseStatus,
+            fundDcaStatus: liveUpdate.fundDcaStatus ?? h.fundDcaStatus,
+            fundRedemptionStatus: liveUpdate.fundRedemptionStatus ?? h.fundRedemptionStatus,
+            fundPurchaseStatusNote: liveUpdate.fundPurchaseStatusNote ?? h.fundPurchaseStatusNote,
+            fundDcaStatusNote: liveUpdate.fundDcaStatusNote ?? h.fundDcaStatusNote,
+            fundRedemptionStatusNote: liveUpdate.fundRedemptionStatusNote ?? h.fundRedemptionStatusNote,
+            fundMinPurchaseAmount: refreshedFundRule(liveUpdate.fundMinPurchaseAmount, h.fundMinPurchaseAmount),
+            fundMinDcaAmount: refreshedFundRule(liveUpdate.fundMinDcaAmount, h.fundMinDcaAmount),
+            fundMinRedemptionQuantity: refreshedFundRule(liveUpdate.fundMinRedemptionQuantity, h.fundMinRedemptionQuantity),
+            fundMinRemainingQuantity: refreshedFundRule(liveUpdate.fundMinRemainingQuantity, h.fundMinRemainingQuantity),
+            fundBuyCutoffMinutes: refreshedFundRule(liveUpdate.fundBuyCutoffMinutes, h.fundBuyCutoffMinutes),
+            fundSellCutoffMinutes: refreshedFundRule(liveUpdate.fundSellCutoffMinutes, h.fundSellCutoffMinutes),
+            fundDcaCutoffMinutes: refreshedFundRule(liveUpdate.fundDcaCutoffMinutes, h.fundDcaCutoffMinutes),
+            fundBuyCancellationAllowed: refreshedFundRule(liveUpdate.fundBuyCancellationAllowed, h.fundBuyCancellationAllowed),
+            fundSellCancellationAllowed: refreshedFundRule(liveUpdate.fundSellCancellationAllowed, h.fundSellCancellationAllowed),
+            fundDcaCancellationAllowed: refreshedFundRule(liveUpdate.fundDcaCancellationAllowed, h.fundDcaCancellationAllowed),
+            fundCancellationRuleSource: refreshedFundRule(liveUpdate.fundCancellationRuleSource, h.fundCancellationRuleSource),
+            fundTradeRulesUpdatedAt: liveUpdate.fundTradeRulesUpdatedAt ?? h.fundTradeRulesUpdatedAt,
             priceDate: h.priceDate ?? "",
             fundNavHistory: h.fundNavHistory,
           };
@@ -1531,10 +1907,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             todayPnlRate: Number.isFinite(lp.changePercent) ? lp.changePercent : 0,
             totalPnl,
             totalPnlRate: costBasis > 0 ? totalPnl / costBasis : 0,
-            autoTradeStatus: liveUpdate.autoTradeStatus ?? null,
-            autoTradeStatusNote: liveUpdate.autoTradeStatusNote ?? "",
-            autoTradeStatusSource: liveUpdate.autoTradeStatusSource ?? null,
-            fundBuyConfirmDays: liveUpdate.fundBuyConfirmDays ?? h.fundBuyConfirmDays,
+            ...automaticTradeStatus,
+            fundBuyConfirmDays: refreshedFundRule(liveUpdate.fundBuyConfirmDays, h.fundBuyConfirmDays),
+            fundSellConfirmDays: refreshedFundRule(liveUpdate.fundSellConfirmDays, h.fundSellConfirmDays),
+            fundPurchaseStatus: liveUpdate.fundPurchaseStatus ?? h.fundPurchaseStatus,
+            fundDcaStatus: liveUpdate.fundDcaStatus ?? h.fundDcaStatus,
+            fundRedemptionStatus: liveUpdate.fundRedemptionStatus ?? h.fundRedemptionStatus,
+            fundPurchaseStatusNote: liveUpdate.fundPurchaseStatusNote ?? h.fundPurchaseStatusNote,
+            fundDcaStatusNote: liveUpdate.fundDcaStatusNote ?? h.fundDcaStatusNote,
+            fundRedemptionStatusNote: liveUpdate.fundRedemptionStatusNote ?? h.fundRedemptionStatusNote,
+            fundMinPurchaseAmount: refreshedFundRule(liveUpdate.fundMinPurchaseAmount, h.fundMinPurchaseAmount),
+            fundMinDcaAmount: refreshedFundRule(liveUpdate.fundMinDcaAmount, h.fundMinDcaAmount),
+            fundMinRedemptionQuantity: refreshedFundRule(liveUpdate.fundMinRedemptionQuantity, h.fundMinRedemptionQuantity),
+            fundMinRemainingQuantity: refreshedFundRule(liveUpdate.fundMinRemainingQuantity, h.fundMinRemainingQuantity),
+            fundBuyCutoffMinutes: refreshedFundRule(liveUpdate.fundBuyCutoffMinutes, h.fundBuyCutoffMinutes),
+            fundSellCutoffMinutes: refreshedFundRule(liveUpdate.fundSellCutoffMinutes, h.fundSellCutoffMinutes),
+            fundDcaCutoffMinutes: refreshedFundRule(liveUpdate.fundDcaCutoffMinutes, h.fundDcaCutoffMinutes),
+            fundBuyCancellationAllowed: refreshedFundRule(liveUpdate.fundBuyCancellationAllowed, h.fundBuyCancellationAllowed),
+            fundSellCancellationAllowed: refreshedFundRule(liveUpdate.fundSellCancellationAllowed, h.fundSellCancellationAllowed),
+            fundDcaCancellationAllowed: refreshedFundRule(liveUpdate.fundDcaCancellationAllowed, h.fundDcaCancellationAllowed),
+            fundCancellationRuleSource: refreshedFundRule(liveUpdate.fundCancellationRuleSource, h.fundCancellationRuleSource),
+            fundTradeRulesUpdatedAt: liveUpdate.fundTradeRulesUpdatedAt ?? h.fundTradeRulesUpdatedAt,
             priceDate: lp.priceDate ?? h.priceDate ?? "",
             fundNavHistory: lp.fundNavHistory ?? h.fundNavHistory,
             ...fundEstimate,
@@ -1547,16 +1940,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         });
         const t   = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}:${String(now.getSeconds()).padStart(2,"0")}`;
         writeRefreshMeta({ startedAt: 0, finishedAt: now.getTime() });
-        const dcaState = applyDCAState(updated, s.dcaPlans, s.dcaExecutions, true);
+        const dcaState = applyDCAState(updated, s.dcaPlans, s.dcaExecutions, true, s.fundOrders);
         const dcaLedger = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
-        const portfolioEvents = dcaLedger.portfolioEvents;
+        const syncedOrders = syncDCAFundOrders(s.fundOrders, dcaLedger.holdings, dcaState.dcaPlans, dcaState.dcaExecutions);
+        const manualSettlement = settleManualFundOrders(
+          dcaLedger.holdings,
+          s.closedHoldings,
+          syncedOrders,
+          dcaLedger.portfolioEvents,
+          todayShanghaiYMD(now),
+        );
+        const portfolioEvents = manualSettlement.portfolioEvents;
+        const remainingHoldingIds = new Set(manualSettlement.holdings.map((holding) => holding.id));
         return {
           ...s,
-          holdings: dcaLedger.holdings,
-          dcaPlans: dcaState.dcaPlans,
+          holdings: manualSettlement.holdings,
+          closedHoldings: manualSettlement.closedHoldings,
+          dcaPlans: dcaState.dcaPlans.map((plan) => remainingHoldingIds.has(plan.holdingId) ? plan : { ...plan, enabled: false, archived: true }),
           dcaExecutions: dcaState.dcaExecutions,
+          fundOrders: manualSettlement.orders,
           portfolioEvents,
-          assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaLedger.holdings, portfolioEvents, now, s.portfolioEventBaseline),
+          assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, manualSettlement.holdings, portfolioEvents, now, s.portfolioEventBaseline),
           isRefreshing: false,
           lastRefreshed: t,
           lastRefreshAt: now.getTime(),
@@ -1783,13 +2187,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const exportPortfolio = useCallback(() => JSON.stringify({
     exportedAt: new Date().toISOString(),
     app: "资产助手",
-    version: 4,
+    version: STORAGE_VERSION,
     data: {
       groups: state.groups,
       holdings: state.holdings,
       closedHoldings: state.closedHoldings,
       dcaPlans: state.dcaPlans,
       dcaExecutions: state.dcaExecutions,
+      fundOrders: state.fundOrders,
       portfolioEvents: state.portfolioEvents,
       portfolioEventBaseline: state.portfolioEventBaseline,
       assetSnapshots: state.assetSnapshots,
@@ -1833,6 +2238,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const dcaExecutions = Array.isArray(data.dcaExecutions) ? pruneDCAExecutions(data.dcaExecutions) : current.dcaExecutions;
       const dcaPlans = Array.isArray(data.dcaPlans) ? hydratePlans(data.dcaPlans, dcaExecutions) : current.dcaPlans;
       const dcaState = applyDCAState(holdings, dcaPlans, dcaExecutions);
+      const fundOrders = syncDCAFundOrders(normalizeFundOrders(Array.isArray(data.fundOrders) ? data.fundOrders : []), dcaState.holdings, dcaState.dcaPlans, dcaState.dcaExecutions);
       const portfolioEventBaseline = normalizePortfolioEventBaseline(data.portfolioEventBaseline);
       const importedEvents = normalizePortfolioEvents(data.portfolioEvents);
       const portfolioEvents = Object.keys(portfolioEventBaseline.daily).length > 0
@@ -1847,6 +2253,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         closedHoldings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
+        fundOrders,
         portfolioEvents,
         portfolioEventBaseline,
         // upsertPortfolioSnapshot(snapshots, holdings, date) keeps all
@@ -2013,6 +2420,29 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           autoTradeStatus: previous.autoTradeStatus ?? null,
           autoTradeStatusNote: previous.autoTradeStatusNote ?? "",
           autoTradeStatusSource: previous.autoTradeStatusSource ?? null,
+          autoTradeStatusUpdatedAt: previous.autoTradeStatusUpdatedAt,
+          autoTradeStatusStale: previous.autoTradeStatusStale,
+          autoTradeStatusRefreshNote: previous.autoTradeStatusRefreshNote,
+          fundBuyConfirmDays: previous.fundBuyConfirmDays,
+          fundSellConfirmDays: previous.fundSellConfirmDays,
+          fundPurchaseStatus: previous.fundPurchaseStatus,
+          fundDcaStatus: previous.fundDcaStatus,
+          fundRedemptionStatus: previous.fundRedemptionStatus,
+          fundPurchaseStatusNote: previous.fundPurchaseStatusNote,
+          fundDcaStatusNote: previous.fundDcaStatusNote,
+          fundRedemptionStatusNote: previous.fundRedemptionStatusNote,
+          fundMinPurchaseAmount: previous.fundMinPurchaseAmount,
+          fundMinDcaAmount: previous.fundMinDcaAmount,
+          fundMinRedemptionQuantity: previous.fundMinRedemptionQuantity,
+          fundMinRemainingQuantity: previous.fundMinRemainingQuantity,
+          fundBuyCutoffMinutes: previous.fundBuyCutoffMinutes,
+          fundSellCutoffMinutes: previous.fundSellCutoffMinutes,
+          fundDcaCutoffMinutes: previous.fundDcaCutoffMinutes,
+          fundBuyCancellationAllowed: previous.fundBuyCancellationAllowed,
+          fundSellCancellationAllowed: previous.fundSellCancellationAllowed,
+          fundDcaCancellationAllowed: previous.fundDcaCancellationAllowed,
+          fundCancellationRuleSource: previous.fundCancellationRuleSource,
+          fundTradeRulesUpdatedAt: previous.fundTradeRulesUpdatedAt,
           priceDate: previous.priceDate ?? "",
           fundNavHistory: previous.fundNavHistory,
           estimatedNav: previous.estimatedNav,
@@ -2097,15 +2527,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           if (adjusted) adjusted = costHolding;
         }
       }
+      const hasPendingPurchase = willClose && s.fundOrders.some((order) => (
+        order.holdingId === id && order.side === "buy" && order.status === "pending"
+      ));
+      if (!adjusted && hasPendingPurchase) {
+        // Bookkeeping a completed full redemption must not cancel an already
+        // submitted purchase. Retain only the security/rule identity until the
+        // pending purchase posts; historical dividends and actions stay in the
+        // closed position and portfolio ledger.
+        adjusted = recomputeHoldingMetrics(target, {
+          quantity: 0,
+          costPrice: 0,
+          cashDividendTotal: 0,
+          corporateActions: [],
+        }, true);
+      }
       const updatedHoldings = adjusted
         ? s.holdings.map((item) => item.id === id ? adjusted : item)
         : s.holdings.filter((item) => item.id !== id);
       const updatedPlans = adjusted
         ? s.dcaPlans.map((plan) => (plan.holdingId === id ? syncPlanWithHolding(plan, adjusted) : plan))
-        : s.dcaPlans.filter((plan) => plan.holdingId !== id);
-      const updatedExecutions = adjusted
-        ? s.dcaExecutions
-        : s.dcaExecutions.filter((item) => item.holdingId !== id);
+        : s.dcaPlans.map((plan) => plan.holdingId === id ? { ...plan, enabled: false, archived: true } : plan);
+      const updatedExecutions = s.dcaExecutions;
       const dcaState = applyDCAState(updatedHoldings, updatedPlans, updatedExecutions);
       // Full close: closedHolding is set and adjusted is null → prepend.
       // Partial close: closedHolding is set and adjusted is non-null → still prepend.
@@ -2133,20 +2576,199 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         holdings: dcaLedger.holdings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
+        fundOrders: isSell ? s.fundOrders.map((order) => (
+          order.holdingId === id && order.status === "pending" && order.side === "sell"
+            ? { ...order, status: "rejected" as const, reason: willClose ? "持仓已补录清仓，原赎回订单需重新核对" : "持仓已补录卖出，原赎回订单需重新核对", updatedAt: new Date().toISOString() }
+            : order
+        )) : s.fundOrders,
         closedHoldings: nextClosedHoldings,
         portfolioEvents,
         assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaLedger.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
       };
     });
   }, [applyDCAState]);
+  const submitFundOrder = useCallback((id: string, input: HoldingAdjustmentInput) => {
+    const current = stateRef.current;
+    const holding = current.holdings.find((item) => item.id === id);
+    if (!holding || holding.market !== "FUND" || holding.assetType !== "fund") {
+      return { ok: false, error: current.language === "en" ? "Only open-end funds support submitted orders" : "仅场外基金支持提交申购/赎回" };
+    }
+    const quantity = Number(input.quantity);
+    const price = Number(input.price);
+    if (!(quantity > 0) || !(price > 0)) {
+      return { ok: false, error: current.language === "en" ? "Enter a valid amount or quantity" : "请输入有效金额或份额" };
+    }
+    const now = new Date();
+    const requestedAt = now.toISOString();
+    const requestedDate = todayShanghaiYMD(now);
+    const side = input.type;
+    const orderCostProfile = mergeTransactionCostProfile(holding.transactionCostProfile, input.costProfilePatch);
+    const rule = fundOrderRuleForHolding(holding, side, requestedAt, orderCostProfile);
+    const effectiveDate = computeFundEffectiveDate(now, rule.cutoffMinutes);
+    if (resolveHoldingTradeStatus(holding).stale) {
+      return { ok: false, error: current.language === "en" ? "Trading status is stale; refresh the rules before submitting" : "交易状态已过期，请刷新成功后再提交" };
+    }
+    if (side === "buy" && (rule.tradeStatus === "buy_disabled" || rule.tradeStatus === "suspended")) {
+      return { ok: false, error: rule.tradeStatusNote || (current.language === "en" ? "Fund is not currently buyable" : "基金当前不可申购") };
+    }
+    if (side === "buy" && rule.tradeStatus === "unknown") {
+      return { ok: false, error: current.language === "en" ? "Purchase status is unavailable; refresh the fund rules before submitting" : "未取得可靠的申购状态，请刷新基金交易规则后再提交" };
+    }
+    if (side === "buy" && rule.tradeStatus === "fund_limit" && rule.purchaseLimit == null) {
+      return {
+        ok: false,
+        error: current.language === "en"
+          ? "The fund is purchase-limited but its current quota is unavailable; refresh the rules before submitting"
+          : "基金处于限购状态但未获取到有效额度，请刷新交易规则后再提交",
+      };
+    }
+    if (side === "sell" && rule.tradeStatus === "sell_disabled") {
+      return { ok: false, error: rule.tradeStatusNote || (current.language === "en" ? "Fund redemption is currently suspended" : "基金当前暂停赎回") };
+    }
+    if (side === "sell" && rule.tradeStatus === "unknown") {
+      return { ok: false, error: current.language === "en" ? "Redemption status is unavailable; refresh the fund rules before submitting" : "未取得可靠的赎回状态，请刷新基金交易规则后再提交" };
+    }
+    const requestedAmount = side === "buy" ? quantity * price : undefined;
+    const buyMinimumViolation = side === "buy"
+      ? fundOrderMinimumViolation(side, rule, { requestedAmount })
+      : null;
+    if (buyMinimumViolation?.type === "purchase_minimum") {
+      return {
+        ok: false,
+        error: current.language === "en"
+          ? `Minimum additional purchase is ${buyMinimumViolation.minimum} ${holding.currency}`
+          : `追加申购起点为 ${buyMinimumViolation.minimum} ${holding.currency}`,
+      };
+    }
+    if (side === "buy" && rule.purchaseLimit != null) {
+      const reserved = fundOrderReservedBuyAmount(current.fundOrders, holding, effectiveDate);
+      if ((requestedAmount ?? 0) + reserved > rule.purchaseLimit + 1e-8) {
+        const remaining = Math.max(0, rule.purchaseLimit - reserved);
+        return {
+          ok: false,
+          error: current.language === "en"
+            ? `Daily purchase limit exceeded; remaining ${remaining.toFixed(2)} ${holding.currency}`
+            : `超出单日累计限购，剩余额度 ${remaining.toFixed(2)} ${holding.currency}`,
+        };
+      }
+    }
+    if (side === "sell") {
+      const available = Math.max(0, holding.quantity - pendingSellQuantity(current.fundOrders, holding.id));
+      if (quantity > available + 1e-8) {
+        return { ok: false, error: current.language === "en" ? `Only ${available} units are available` : `可赎回份额仅剩 ${available}` };
+      }
+      const minimumViolation = fundOrderMinimumViolation(side, rule, {
+        requestedQuantity: quantity,
+        availableQuantity: available,
+      });
+      if (minimumViolation?.type === "redemption_minimum") {
+        return {
+          ok: false,
+          error: current.language === "en"
+            ? `Minimum redemption is ${minimumViolation.minimum} units`
+            : `单笔最小赎回份额为 ${minimumViolation.minimum} 份`,
+        };
+      }
+      if (minimumViolation?.type === "remaining_minimum") {
+        return {
+          ok: false,
+          error: current.language === "en"
+            ? `At least ${minimumViolation.minimum} units must remain; redeem all available units instead`
+            : `赎回后至少保留 ${minimumViolation.minimum} 份，否则请赎回全部可用份额`,
+        };
+      }
+    }
+    const orderId = `fund_order_${safeUUID()}`;
+    const order: FundOrder = {
+      id: orderId,
+      holdingId: holding.id,
+      symbol: holding.symbol,
+      source: "manual",
+      entryMode: "submitted",
+      side,
+      status: "pending",
+      requestedAt,
+      requestedDate,
+      effectiveDate,
+      requestedAmount,
+      requestedQuantity: side === "sell" ? quantity : undefined,
+      estimatedPrice: price,
+      expectedConfirmDate: computeFundOrderConfirmDate(holding, effectiveDate, rule.confirmDays),
+      cancelDeadline: rule.cancellationPolicy === "channel_cutoff" || rule.cancellationPolicy === "standard_cutoff"
+        ? computeFundOrderCancelDeadline(effectiveDate, rule.cutoffMinutes)
+        : undefined,
+      rule,
+      createdAt: requestedAt,
+      updatedAt: requestedAt,
+    };
+    setState((state) => {
+      let holdings = state.holdings;
+      if (input.rememberCostProfile && input.costProfilePatch) {
+        holdings = holdings.map((item) => item.id === id ? {
+          ...item,
+          transactionCostProfile: mergeTransactionCostProfile(item.transactionCostProfile, input.costProfilePatch),
+        } : item);
+      }
+      const settlement = settleManualFundOrders(
+        holdings,
+        state.closedHoldings,
+        [order, ...state.fundOrders],
+        state.portfolioEvents,
+        todayShanghaiYMD(now),
+      );
+      const remainingHoldingIds = new Set(settlement.holdings.map((item) => item.id));
+      return {
+        ...state,
+        holdings: settlement.holdings,
+        closedHoldings: settlement.closedHoldings,
+        dcaPlans: state.dcaPlans.map((plan) => remainingHoldingIds.has(plan.holdingId) ? plan : { ...plan, enabled: false, archived: true }),
+        fundOrders: settlement.orders,
+        portfolioEvents: settlement.portfolioEvents,
+        assetSnapshots: settlement.changed
+          ? upsertPortfolioSnapshot(state.assetSnapshots, settlement.holdings, settlement.portfolioEvents, now, state.portfolioEventBaseline)
+          : state.assetSnapshots,
+      };
+    });
+    return { ok: true };
+  }, []);
+
+  const cancelFundOrder = useCallback((id: string) => {
+    const current = stateRef.current;
+    const now = new Date();
+    const result = requestFundOrderCancellation(current.fundOrders, id, now);
+    if (!result.ok) {
+      const english = current.language === "en";
+      const errors = {
+        not_found: english ? "Order not found" : "订单不存在",
+        not_pending: english ? "Only pending orders can be cancelled" : "订单已结束，不能撤销",
+        not_cancellable: english ? "This order type cannot be cancelled" : "该类型订单不支持撤销",
+        rule_unknown: english ? "The channel did not return a cancellation rule; cancellation is disabled to avoid a false success" : "渠道未返回撤单规则，为避免误报成功，暂不允许本地撤单",
+        deadline_passed: english ? "The acceptance cutoff has passed; the order cannot be cancelled" : "已超过受理截止时间，订单不能撤销",
+      } as const;
+      return { ok: false, error: errors[result.error ?? "not_found"] };
+    }
+    setState((state) => {
+      const latest = requestFundOrderCancellation(state.fundOrders, id, now);
+      if (!latest.ok) return state;
+      const target = state.fundOrders.find((order) => order.id === id);
+      const dcaExecutions = target?.source === "dca"
+        ? state.dcaExecutions.map((execution) => execution.id === id && execution.status === "pending"
+          ? { ...execution, status: "cancelled" as const, reason: "用户在渠道截止时间前撤销定投触发单" }
+          : execution)
+        : state.dcaExecutions;
+      return { ...state, fundOrders: latest.orders, dcaExecutions };
+    });
+    return { ok: true };
+  }, []);
+
   const removeHolding = useCallback((id: string) => {
     setState((s) => {
       const target = s.holdings.find((h) => h.id === id);
       if (!target) return s;
       const updatedHoldings = s.holdings.filter((h) => h.id !== id);
       pruneCorporateActionCheckedAt(updatedHoldings);
-      const updatedPlans = s.dcaPlans.filter((plan) => plan.holdingId !== id);
-      const updatedExecutions = s.dcaExecutions.filter((item) => item.holdingId !== id);
+      const updatedPlans = s.dcaPlans.map((plan) => plan.holdingId === id ? { ...plan, enabled: false, archived: true } : plan);
+      const updatedExecutions = s.dcaExecutions;
       const dcaState = applyDCAState(updatedHoldings, updatedPlans, updatedExecutions);
       const historicalCloseIds = new Set(
         s.closedHoldings.filter((item) => item.sourceHoldingId === id).map((item) => item.id),
@@ -2164,6 +2786,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         holdings: dcaLedger.holdings,
         dcaPlans: dcaState.dcaPlans,
         dcaExecutions: dcaState.dcaExecutions,
+        fundOrders: s.fundOrders.map((order) => (
+          order.holdingId === id && order.status === "pending"
+            ? { ...order, status: "rejected" as const, reason: "关联持仓已删除", updatedAt: new Date().toISOString() }
+            : order
+        )),
         closedHoldings: s.closedHoldings,
         portfolioEvents,
         assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaLedger.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
@@ -2260,7 +2887,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const addDCAPlan = useCallback((p: Omit<DCAPlan, "id" | "nextExecDate" | "totalInvested" | "execCount">) => {
     const linkedHolding = stateRef.current.holdings.find((holding) => holding.id === p.holdingId);
     if (!linkedHolding) return;
-    if (stateRef.current.dcaPlans.some((plan) => plan.holdingId === p.holdingId)) return;
+    if (stateRef.current.dcaPlans.some((plan) => !plan.archived && plan.holdingId === p.holdingId)) return;
     const plan: DCAPlan = {
       ...syncPlanWithHolding({
         ...p,
@@ -2326,24 +2953,34 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const removeDCAPlan = useCallback((id: string) => {
     setState((s) => ({
       ...s,
-      dcaPlans: s.dcaPlans.filter((p) => p.id !== id),
-      dcaExecutions: s.dcaExecutions.filter((item) => item.planId !== id),
+      // Keep an archived rule snapshot so already-submitted fund orders can
+      // still confirm after the future schedule is removed.
+      dcaPlans: s.dcaPlans.map((plan) => plan.id === id ? { ...plan, enabled: false, archived: true } : plan),
+      // Removing a schedule must not erase submitted/confirmed order history.
+      dcaExecutions: s.dcaExecutions,
     }));
   }, []);
 
   const toggleDCAPlan = useCallback((id: string) => {
     setState((s) => {
-      const nextPlans = s.dcaPlans.map((p) =>
-        p.id === id ? { ...p, enabled: !p.enabled } : p
-	      );
-	      const dcaState = applyDCAState(s.holdings, nextPlans, s.dcaExecutions, true);
+      const nextPlans = s.dcaPlans.map((p) => {
+        if (p.id !== id) return p;
+        if (p.enabled) return { ...p, enabled: false };
+        const enabled = { ...p, enabled: true };
+        // Resuming starts from the next valid occurrence; missed periods remain
+        // historical misses instead of being fabricated at today's price.
+        return { ...enabled, nextExecDate: computeNextExec(enabled, new Date(), true) };
+      });
+	      const dcaState = applyDCAState(s.holdings, nextPlans, s.dcaExecutions, true, s.fundOrders);
 	      const dcaLedger = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);
 	      const portfolioEvents = dcaLedger.portfolioEvents;
+	      const fundOrders = syncDCAFundOrders(s.fundOrders, dcaLedger.holdings, dcaState.dcaPlans, dcaState.dcaExecutions);
 	      return {
 	        ...s,
 	        holdings: dcaLedger.holdings,
 	        dcaPlans: dcaState.dcaPlans,
 	        dcaExecutions: dcaState.dcaExecutions,
+	        fundOrders,
 	        portfolioEvents,
         assetSnapshots: upsertPortfolioSnapshot(s.assetSnapshots, dcaLedger.holdings, portfolioEvents, new Date(), s.portfolioEventBaseline),
 	      };
@@ -2370,14 +3007,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setTradeTimeOnly, setDividendReinvest, setDefaultOpenMode, refresh,
     exportPortfolio, importPortfolio, clearLocalData,
     addGroup, updateGroup, removeGroup,
-    addHolding, updateHolding, adjustHolding, removeHolding, removeClosedHolding, updatePortfolioEvent, removePortfolioEvent,
+    addHolding, updateHolding, adjustHolding, submitFundOrder, cancelFundOrder, removeHolding, removeClosedHolding, updatePortfolioEvent, removePortfolioEvent,
     openDetail, closeDetail,
     profitColor,
     addDCAPlan, updateDCAPlan, removeDCAPlan, toggleDCAPlan,
     openDCAPanel, closeDCAPanel,
   }), [
     state, stats, tc, profitColor, refresh, exportPortfolio, importPortfolio, clearLocalData,
-    addGroup, updateGroup, removeGroup, addHolding, updateHolding, adjustHolding, removeHolding,
+    addGroup, updateGroup, removeGroup, addHolding, updateHolding, adjustHolding, submitFundOrder, cancelFundOrder, removeHolding,
     removeClosedHolding, updatePortfolioEvent, removePortfolioEvent, openDetail, closeDetail,
     addDCAPlan, updateDCAPlan, removeDCAPlan, toggleDCAPlan, openDCAPanel, closeDCAPanel,
     togglePrivacy, setDefaultPrivacyMode, setColorScheme, setTheme, setCurrency, setLanguage,

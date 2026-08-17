@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { DCAExecution, DCAPlan } from "../context/AppContext";
 import type { Holding } from "../data/mockData";
+import type { FundOrder } from "./fundOrders";
 import {
   computeFundConfirmationDate,
   computeNextExec,
@@ -210,7 +211,7 @@ describe("parseChineseMoneyLimit", () => {
 
   test("rejects missing or invalid limits", () => {
     assert.equal(parseChineseMoneyLimit("不限额"), null);
-    assert.equal(parseChineseMoneyLimit("限购 0元"), null);
+    assert.equal(parseChineseMoneyLimit("限购 0元"), 0);
   });
 });
 
@@ -235,6 +236,21 @@ describe("dedupeDCAExecutions", () => {
     assert.equal(deduped.length, 1);
     assert.equal(deduped[0]?.id, "executed");
   });
+
+  test("does not resurrect a cancelled execution from a duplicate pending row", () => {
+    const pending = {
+      id: "pending",
+      planId: "p1",
+      holdingId: "h1",
+      scheduledDate: "2026-06-10",
+      actualDate: "2026-06-10",
+      amount: 100,
+      adjusted: false,
+      status: "pending" as const,
+    };
+    const cancelled = { ...pending, id: "cancelled", status: "cancelled" as const, reason: "用户撤销" };
+    assert.equal(dedupeDCAExecutions([pending, cancelled])[0]?.status, "cancelled");
+  });
 });
 
 describe("repairDCAData", () => {
@@ -252,7 +268,7 @@ describe("repairDCAData", () => {
 });
 
 describe("settleDueDCAPlans", () => {
-  test("catches up due non-fund executions and advances the next date", () => {
+  test("marks missed non-fund periods skipped and automatically posts the valid current trigger", () => {
     const duePlan = plan({
       market: "US",
       assetType: "stock",
@@ -271,8 +287,24 @@ describe("settleDueDCAPlans", () => {
 
     assert.equal(settled.executions.length, 2);
     assert.deepEqual(settled.executions.map((item) => item.actualDate).sort(), ["2026-06-01", "2026-06-02"]);
-    assert.equal(settled.executions.every((item) => item.status === "executed"), true);
+    assert.equal(settled.executions.find((item) => item.actualDate === "2026-06-01")?.status, "skipped");
+    const current = settled.executions.find((item) => item.actualDate === "2026-06-02");
+    assert.equal(current?.status, "executed");
+    assert.equal(current?.price, 120);
+    assert.ok((current?.quantity ?? 0) > 0);
+    assert.equal(current?.reason, undefined);
+    assert.ok((settled.holdings[0]?.quantity ?? 0) > 10);
     assert.equal(settled.plans[0]?.nextExecDate, "2026-06-03");
+
+    const repeated = settleDueDCAPlans(
+      settled.holdings,
+      settled.plans,
+      settled.executions,
+      new Date("2026-06-02T12:00:00Z"),
+      true,
+    );
+    assert.equal(repeated.holdings[0]?.quantity, settled.holdings[0]?.quantity);
+    assert.equal(repeated.executions.filter((item) => item.actualDate === "2026-06-02").length, 1);
   });
 
   test("allows one-hour-old non-fund quotes but skips quotes older than one day", () => {
@@ -337,6 +369,32 @@ describe("settleDueDCAPlans", () => {
     assert.equal(settled.executions[0]?.status, "pending");
   });
 
+  test("does not execute against a stale last-known purchase limit", () => {
+    const settled = settleDueDCAPlans(
+      [holding({
+        market: "FUND",
+        assetType: "fund",
+        symbol: "006479",
+        name: "测试限购基金",
+        currency: "CNY",
+        currentPrice: 1.2,
+        autoTradeStatus: "fund_limit",
+        autoTradeStatusNote: "基金限购，5元",
+        autoTradeStatusSource: "eastmoney",
+        autoTradeStatusUpdatedAt: "2026-06-09T08:00:00.000Z",
+        autoTradeStatusStale: true,
+        autoTradeStatusRefreshNote: "基金交易规则刷新失败",
+      })],
+      [plan({ amount: 5, nextExecDate: "2026-06-10", startDate: "2026-06-10" })],
+      [],
+      new Date("2026-06-10T12:00:00+08:00"),
+      true,
+    );
+
+    assert.equal(settled.executions[0]?.status, "skipped");
+    assert.match(settled.executions[0]?.reason ?? "", /刷新失败|过期/);
+  });
+
   test("skips fund DCA when the amount is above the current purchase limit", () => {
     const limitedPlan = plan({
       amount: 100,
@@ -365,7 +423,123 @@ describe("settleDueDCAPlans", () => {
     assert.match(settled.executions[0]?.reason ?? "", /计划金额 100 元，限购 10 元/);
   });
 
-  test("rechecks purchase limits before posting pending fund executions", () => {
+  test("uses the independent DCA minimum before the additional-purchase minimum", () => {
+    const settled = settleDueDCAPlans(
+      [holding({
+        market: "FUND",
+        assetType: "fund",
+        symbol: "019305",
+        name: "测试基金",
+        currency: "CNY",
+        currentPrice: 1.2,
+        fundMinPurchaseAmount: 1,
+        fundMinDcaAmount: 100,
+      })],
+      [plan({ amount: 10, nextExecDate: "2026-06-10", startDate: "2026-06-10" })],
+      [],
+      new Date("2026-06-10T12:00:00+08:00"),
+      true,
+    );
+    assert.equal(settled.executions[0]?.status, "skipped");
+    assert.match(settled.executions[0]?.reason ?? "", /低于定投起点 100 元/);
+  });
+
+  test("shares the daily purchase limit with manually submitted fund orders", () => {
+    const limitedPlan = plan({ amount: 10, nextExecDate: "2026-06-10", startDate: "2026-06-10" });
+    const fundHolding = holding({
+      market: "FUND",
+      assetType: "fund",
+      symbol: "019305",
+      name: "摩根标普500指数(QDII)人民币C",
+      currency: "CNY",
+      currentPrice: 1.2,
+      autoTradeStatus: "fund_limit",
+      autoTradeStatusNote: "基金限购，10元",
+      autoTradeStatusSource: "eastmoney",
+    });
+    const manualOrder: FundOrder = {
+      id: "manual-order",
+      holdingId: fundHolding.id,
+      symbol: fundHolding.symbol,
+      source: "manual",
+      entryMode: "submitted",
+      side: "buy",
+      status: "pending",
+      requestedAt: "2026-06-10T01:00:00.000Z",
+      requestedDate: "2026-06-10",
+      effectiveDate: "2026-06-10",
+      requestedAmount: 5,
+      expectedConfirmDate: "2026-06-12",
+      rule: { tradeStatus: "fund_limit", purchaseLimit: 10, confirmDays: 2, cutoffMinutes: 900, capturedAt: "2026-06-10T01:00:00.000Z" },
+      createdAt: "2026-06-10T01:00:00.000Z",
+      updatedAt: "2026-06-10T01:00:00.000Z",
+    };
+
+    const settled = settleDueDCAPlans(
+      [fundHolding],
+      [limitedPlan],
+      [],
+      new Date("2026-06-10T12:00:00+08:00"),
+      true,
+      [manualOrder],
+    );
+
+    assert.equal(settled.executions[0]?.status, "skipped");
+    assert.match(settled.executions[0]?.reason ?? "", /计划金额 15 元，限购 10 元/);
+  });
+
+  test("counts mirrored DCA fund orders once when sharing the daily limit", () => {
+    const fundHolding = holding({
+      market: "FUND",
+      assetType: "fund",
+      symbol: "019305",
+      name: "测试基金",
+      currency: "CNY",
+      currentPrice: 1.2,
+      autoTradeStatus: "fund_limit",
+      autoTradeStatusNote: "基金限购，10元",
+    });
+    const previousExecution: DCAExecution = {
+      id: "mirrored-dca",
+      planId: "old-plan",
+      holdingId: fundHolding.id,
+      scheduledDate: "2026-06-10",
+      actualDate: "2026-06-10",
+      amount: 5,
+      adjusted: false,
+      status: "pending",
+    };
+    const mirroredOrder: FundOrder = {
+      id: previousExecution.id,
+      holdingId: fundHolding.id,
+      symbol: fundHolding.symbol,
+      planId: previousExecution.planId,
+      source: "dca",
+      entryMode: "submitted",
+      side: "buy",
+      status: "pending",
+      requestedAt: "2026-06-10T01:00:00.000Z",
+      requestedDate: "2026-06-10",
+      effectiveDate: "2026-06-10",
+      requestedAmount: 5,
+      expectedConfirmDate: "2026-06-12",
+      rule: { tradeStatus: "fund_limit", purchaseLimit: 10, confirmDays: 2, cutoffMinutes: 900, cancellationPolicy: "not_cancellable", capturedAt: "2026-06-10T01:00:00.000Z" },
+      createdAt: "2026-06-10T01:00:00.000Z",
+      updatedAt: "2026-06-10T01:00:00.000Z",
+    };
+    const settled = settleDueDCAPlans(
+      [fundHolding],
+      [plan({ amount: 5, nextExecDate: "2026-06-10", startDate: "2026-06-10" })],
+      [previousExecution],
+      new Date("2026-06-10T12:00:00+08:00"),
+      true,
+      [mirroredOrder],
+    );
+    const currentExecution = settled.executions.find((item) => item.planId === "p1");
+    assert.equal(currentExecution?.status, "pending");
+  });
+
+  test("does not retroactively reject an accepted order when the current limit changes", () => {
     const limitedPlan = plan({
       amount: 100,
       nextExecDate: "2026-06-12",
@@ -403,7 +577,76 @@ describe("settleDueDCAPlans", () => {
       true,
     );
 
-    assert.equal(settled.executions.find((item) => item.id === "pending-limit")?.status, "skipped");
+    assert.equal(settled.executions.find((item) => item.id === "pending-limit")?.status, "executed");
+  });
+
+  test("uses the transaction-cost snapshot captured by a pending fund DCA order", () => {
+    const pending: DCAExecution = {
+      id: "pending-cost-snapshot",
+      planId: "p1",
+      holdingId: "h1",
+      scheduledDate: "2026-06-08",
+      actualDate: "2026-06-08",
+      amount: 121,
+      adjusted: false,
+      status: "pending",
+      channelConfirmedAt: "2026-06-12T01:00:00.000Z",
+      transactionCostProfile: { buyFeeRate: 0.01 },
+    };
+    const settled = settleDueDCAPlans(
+      [holding({
+        market: "FUND",
+        assetType: "fund",
+        symbol: "019305",
+        name: "摩根标普500指数(QDII)人民币C",
+        currency: "CNY",
+        currentPrice: 1.2,
+        priceDate: "2026-06-08",
+        fundNavHistory: [{ date: "2026-06-08", nav: 1.2 }],
+        transactionCostProfile: { buyFeeRate: 0.5 },
+      })],
+      [plan({ amount: 121, nextExecDate: "2026-06-15", startDate: "2026-06-08" })],
+      [pending],
+      new Date("2026-06-12T12:00:00+08:00"),
+      true,
+    );
+    const execution = settled.executions.find((item) => item.id === pending.id);
+    assert.equal(execution?.status, "executed");
+    assert.ok(Math.abs((execution?.quantity ?? 0) - (121 / 1.01 / 1.2)) < 1e-8);
+  });
+
+  test("uses the confirmation date captured when a fund DCA order was submitted", () => {
+    const pending: DCAExecution = {
+      id: "pending-confirm-snapshot",
+      planId: "p1",
+      holdingId: "h1",
+      scheduledDate: "2026-06-08",
+      actualDate: "2026-06-08",
+      amount: 100,
+      adjusted: false,
+      status: "pending",
+      channelConfirmedAt: "2026-06-09T01:00:00.000Z",
+      expectedConfirmDate: "2026-06-09",
+    };
+    const settled = settleDueDCAPlans(
+      [holding({
+        market: "FUND",
+        assetType: "fund",
+        symbol: "019305",
+        name: "摩根标普500指数(QDII)人民币C",
+        currency: "CNY",
+        currentPrice: 1.2,
+        priceDate: "2026-06-08",
+        fundNavHistory: [{ date: "2026-06-08", nav: 1.2 }],
+      })],
+      [plan({ fundBuyConfirmDays: 10, nextExecDate: "2026-06-15", startDate: "2026-06-08" })],
+      [pending],
+      new Date("2026-06-09T12:00:00+08:00"),
+      true,
+    );
+    const execution = settled.executions.find((item) => item.id === pending.id);
+    assert.equal(execution?.status, "executed");
+    assert.equal(execution?.confirmedDate, "2026-06-09");
   });
 
   test("does not apply current purchase-limit checks before the official NAV is available", () => {
@@ -422,6 +665,7 @@ describe("settleDueDCAPlans", () => {
       amount: 100,
       adjusted: false,
       status: "pending",
+      channelConfirmedAt: "2026-06-12T01:00:00.000Z",
       reason: "等待正式净值确认后入账",
     };
 
@@ -464,6 +708,7 @@ describe("settleDueDCAPlans", () => {
       amount: 100,
       adjusted: false,
       status: "pending",
+      channelConfirmedAt: "2026-06-12T01:00:00.000Z",
       reason: "等待正式净值确认后入账",
     };
 
@@ -502,6 +747,7 @@ describe("settleDueDCAPlans", () => {
       amount: 100,
       adjusted: false,
       status: "pending",
+      channelConfirmedAt: "2026-06-11T01:00:00.000Z",
       reason: "等待正式净值确认后入账",
     };
 
@@ -542,6 +788,7 @@ describe("settleDueDCAPlans", () => {
       amount: 100,
       adjusted: false,
       status: "pending",
+      channelConfirmedAt: "2026-06-11T01:00:00.000Z",
       reason: "等待正式净值确认后入账",
     };
 
@@ -616,7 +863,7 @@ describe("settleDueDCAPlans", () => {
     assert.equal(settled.plans[0]?.totalInvested, 300);
   });
 
-  test("backfills missed weekly fund executions and posts them when official NAV is available", () => {
+  test("does not fabricate missed weekly fund executions", () => {
     const weeklyPlan = plan({
       frequency: "weekly",
       dayOfWeek: 1,
@@ -644,13 +891,12 @@ describe("settleDueDCAPlans", () => {
     );
 
     const missed = settled.executions.find((item) => item.actualDate === "2026-06-15");
-    assert.equal(missed?.status, "executed");
-    assert.equal(missed?.confirmedDate, "2026-06-16");
+    assert.equal(missed, undefined);
     assert.equal(settled.executions.some((item) => item.actualDate === "2026-06-01"), false);
     assert.equal(settled.executions.some((item) => item.actualDate === "2026-06-08"), false);
   });
 
-  test("backfills missed monthly fund executions without using current limits as historical truth", () => {
+  test("does not fabricate missed monthly fund executions", () => {
     const monthlyPlan = plan({
       frequency: "monthly",
       dayOfMonth: 15,
@@ -682,12 +928,10 @@ describe("settleDueDCAPlans", () => {
     );
 
     const missed = settled.executions.find((item) => item.actualDate === "2026-06-15");
-    assert.equal(missed?.status, "executed");
-    assert.equal(missed?.price, 1.1);
-    assert.equal(missed?.confirmedDate, "2026-06-17");
+    assert.equal(missed, undefined);
   });
 
-  test("skips stale pending fund executions and recovers them when official NAV appears", () => {
+  test("keeps stale fund executions pending and allows confirmation when official NAV appears", () => {
     const fundPlan = plan({
       amount: 100,
       nextExecDate: "2026-06-20",
@@ -703,6 +947,7 @@ describe("settleDueDCAPlans", () => {
       amount: 100,
       adjusted: false,
       status: "pending",
+      channelConfirmedAt: "2026-06-15T01:00:00.000Z",
     };
 
     const skipped = settleDueDCAPlans(
@@ -742,8 +987,8 @@ describe("settleDueDCAPlans", () => {
     const skippedRecord = skipped.executions.find((item) => item.id === "pending-stale-nav");
     const recoveredRecord = recovered.executions.find((item) => item.id === "pending-stale-nav");
 
-    assert.equal(skippedRecord?.status, "skipped");
-    assert.match(skippedRecord?.reason ?? "", /正式净值/);
+    assert.equal(skippedRecord?.status, "pending");
+    assert.match(skippedRecord?.reason ?? "", /等待人工核对/);
     assert.equal(recoveredRecord?.status, "executed");
     assert.equal(recoveredRecord?.price, 1.25);
   });

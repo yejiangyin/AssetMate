@@ -70,6 +70,20 @@ describe("normalizeHolding", () => {
     assert.equal(normalizeHolding(holding({ fundBuyConfirmDays: 0 })).fundBuyConfirmDays, 0);
   });
 
+  test("persists automatic trade-status freshness metadata", () => {
+    const normalized = normalizeHolding(holding({
+      autoTradeStatus: "fund_limit",
+      autoTradeStatusNote: "基金限购，5元",
+      autoTradeStatusSource: "eastmoney",
+      autoTradeStatusUpdatedAt: "2026-08-14T02:00:00.000Z",
+      autoTradeStatusStale: true,
+      autoTradeStatusRefreshNote: "基金交易规则刷新失败",
+    }));
+    assert.equal(normalized.autoTradeStatusUpdatedAt, "2026-08-14T02:00:00.000Z");
+    assert.equal(normalized.autoTradeStatusStale, true);
+    assert.equal(normalized.autoTradeStatusRefreshNote, "基金交易规则刷新失败");
+  });
+
   test("removes announced A-share dividends that never received an ex-dividend date", () => {
     const normalized = normalizeHolding(holding({
       market: "A",

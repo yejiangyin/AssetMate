@@ -924,6 +924,11 @@ export function translateTradeText(text: string | undefined | null, language: La
     .replaceAll("基金限购", "Fund limited")
     .replaceAll("限购", "Limited")
     .replaceAll("当前不可买入", "Not buyable")
+    .replaceAll("交易状态未知", "Trading status unknown")
+    .replaceAll("基金交易规则刷新失败", "Fund trading rules refresh failed")
+    .replaceAll("股票交易状态刷新失败", "Stock trading status refresh failed")
+    .replaceAll("状态已过期，沿用上次成功结果", "Status is stale; using the last successful result")
+    .replaceAll("上次成功更新", "Last successful update")
     .replaceAll("正常可买", "Buyable")
     .replaceAll("可执行", "Ready")
     .replaceAll("不可买", "Not buyable")
@@ -936,6 +941,10 @@ export function translateTradeText(text: string | undefined | null, language: La
 export function translateDcaReason(reason: string | undefined | null, language: Language) {
   if (language === "zh" || !reason) return reason ?? "";
   return reason
+    .replaceAll("正式净值已就绪，等待渠道成交确认", "Official NAV is ready; waiting for channel fill confirmation")
+    .replaceAll("等待渠道成交确认", "Waiting for channel fill confirmation")
+    .replaceAll("渠道确认交易失败，未入账", "Channel confirmed the trade failed; not posted")
+    .replaceAll("等待人工核对", "waiting for manual verification")
     .replaceAll("等待正式净值确认后入账", "Waiting for official NAV confirmation")
     .replaceAll("关联持仓不存在", "Linked holding does not exist")
     .replaceAll("待入账记录已不再关联基金持仓", "Pending record is no longer linked to a fund holding")
@@ -943,6 +952,10 @@ export function translateDcaReason(reason: string | undefined | null, language: 
     .replaceAll("买入份额计算失败", "Buy quantity calculation failed")
     .replaceAll("暂无有效报价", "No valid quote")
     .replaceAll("报价未刷新，跳过自动定投", "Quote is stale, DCA skipped")
+    .replaceAll("基金交易规则刷新失败", "Fund trading rules refresh failed")
+    .replaceAll("股票交易状态刷新失败", "Stock trading status refresh failed")
+    .replaceAll("状态已过期", "Status is stale")
+    .replaceAll("上次成功更新", "Last successful update")
     .replaceAll("补录待确认定投", "Backfilled pending DCA")
     .replaceAll("正式净值", "official NAV")
     .replaceAll("未获取到", "Could not get")
