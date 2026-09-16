@@ -13,7 +13,7 @@ import { toYahooSymbol } from "../services/quoteApi";
 import { FX } from "../services/priceRefresher";
 import { motion, AnimatePresence, LayoutGroup } from "motion/react";
 import { currencySymbol, formatExactMoney, formatExactNumber, formatPercent } from "../utils/numberFormat";
-import { resolveHoldingTradeStatus, tradeStatusLabel, cleanTradeSource, cleanTradeNote } from "../utils/tradeStatus";
+import { resolveHoldingTradeStatus, tradeStatusLabel, cleanTradeNote } from "../utils/tradeStatus";
 import { getMarketBadgeWithBg } from "../utils/marketBadge";
 import { normalizeHoldingSymbol, normalizeHoldingType } from "../utils/holdingHelpers";
 import { canSaveHoldingForm } from "../utils/holdingForm";
@@ -955,10 +955,9 @@ function FormSheet({ initial, groups, onSave, onClose, isEdit }: {
                 const label = translateTradeText(rawLabel, language);
                 const note = translateTradeText(cleanTradeNote(form.autoTradeStatusNote, rawLabel), language);
                 const color = form.autoTradeStatus === "unknown" ? "#94A3B8" : form.autoTradeStatus === "buy_disabled" ? "#F24E4E" : "#F59E0B";
-                const source = translateTradeText(cleanTradeSource(form.autoTradeStatusSource ?? ""), language);
                 return (
                   <p style={{ color, fontSize: 11, fontWeight: 600 }}>
-                    {source ? `${source} · ` : ""}{label}{note ? `, ${note}` : ""}
+                    {label}{note ? ` · ${note}` : ""}
                   </p>
                 );
               })()}
@@ -1564,11 +1563,10 @@ const HoldingCard = memo(function HoldingCard({
       : tradeStatus.status === "fund_limit"
         ? "#F59E0B"
         : "#94A3B8";
-  const tsSource = translateTradeText(cleanTradeSource(tradeStatus.source), language);
   const tsLabel = translateTradeText(tradeStatus.label, language);
   const tsNote = translateTradeText(cleanTradeNote(tradeStatus.note, tradeStatus.label), language);
   const tsLabelFull = tsNote ? `${tsLabel}, ${tsNote}` : tsLabel;
-  const tradeStatusText = tsSource ? `${tsSource} · ${tsLabelFull}` : tsLabelFull;
+  const tradeStatusText = tsLabelFull;
   const activeDCAPlans = dcaPlans.filter((plan) => plan.holdingId === h.id && plan.enabled && !plan.archived);
   const pausedDCAPlans = dcaPlans.filter((plan) => plan.holdingId === h.id && !plan.enabled && !plan.archived);
   const dcaBadge = activeDCAPlans.length > 0

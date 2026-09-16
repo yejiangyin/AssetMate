@@ -21,7 +21,7 @@ import {
   ymdFromEventValue,
 } from "../services/portfolioEvents";
 import { normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction, recomputeHoldingMetrics, reverseCorporateAction } from "../utils/holdingHelpers";
-import { dedupeDCAExecutions, hydratePlans, repairDCAData, settleDueDCAPlans, syncPlanWithHolding, computeNextExec } from "../utils/dcaEngine";
+import { dedupeDCAExecutions, hydratePlans, repairDCAData, settleDueDCAPlans, syncPlanWithHolding, computeNextExec, recordDcaPlanChange } from "../utils/dcaEngine";
 import { safeUUID } from "../utils/safeId";
 import { acknowledgeSnapshotDueDates, DEFAULT_OPEN_MODE, getConfiguredExtensionOpenMode, getSnapshotDueDates, normalizeOpenMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
 import { estimateTransactionCosts, mergeTransactionCostProfile } from "../utils/transactionCosts";
@@ -239,7 +239,11 @@ export interface DCAPlan {
   note?:        string;
   fundBuyConfirmDays?: number;
   archived?: boolean;
+  catchUpFromDate?: string; // Do not backfill periods before the latest explicit resume.
+  ruleHistory?: { effectiveDate: string; rule: DCAPlanRule }[];
 }
+
+export type DCAPlanRule = Pick<DCAPlan, "holdingId" | "name" | "symbol" | "market" | "assetType" | "amount" | "currency" | "frequency" | "dayOfWeek" | "dayOfMonth" | "startDate" | "fundBuyConfirmDays">;
 
 export type DCAExecutionStatus = "pending" | "executed" | "skipped" | "cancelled";
 
@@ -255,6 +259,7 @@ export interface DCAExecution {
   quantity?:     number;
   price?:        number;
   reason?:       string;
+  evaluationKey?: string;
   navDate?:      string;
   expectedConfirmDate?: string;
   channelConfirmedAt?: string;
@@ -2931,10 +2936,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             return plan;
           }
           const targetHolding = s.holdings.find((holding) => holding.id === (partial.holdingId ?? plan.holdingId));
-          const updated = targetHolding
+          const candidate = targetHolding
             ? syncPlanWithHolding({ ...plan, ...partial }, targetHolding)
             : { ...plan, ...partial };
+          const updated = recordDcaPlanChange(plan, candidate);
           updated.nextExecDate = computeNextExec(updated);
+          if (!plan.enabled && updated.enabled) updated.catchUpFromDate = updated.nextExecDate;
           return updated;
         });
 	        const dcaState = applyDCAState(s.holdings, nextPlans, s.dcaExecutions);
@@ -2967,9 +2974,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (p.id !== id) return p;
         if (p.enabled) return { ...p, enabled: false };
         const enabled = { ...p, enabled: true };
-        // Resuming starts from the next valid occurrence; missed periods remain
-        // historical misses instead of being fabricated at today's price.
-        return { ...enabled, nextExecDate: computeNextExec(enabled, new Date(), true) };
+        const nextExecDate = computeNextExec(enabled, new Date(), true);
+        return { ...enabled, nextExecDate, catchUpFromDate: nextExecDate };
       });
 	      const dcaState = applyDCAState(s.holdings, nextPlans, s.dcaExecutions, true, s.fundOrders);
 	      const dcaLedger = appendDCAExecutionEvents(s.portfolioEvents, dcaState.holdings, dcaState.dcaExecutions);

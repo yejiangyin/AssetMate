@@ -699,7 +699,7 @@ async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSi
             autoTradeStatusRefreshNote: "",
           };
         } else {
-          update = failedTradeStatusFromSource("eastmoney", "股票交易状态刷新失败，未将行情价格视为正常交易证明");
+          update = failedTradeStatusFromSource("eastmoney", "交易状态暂未更新");
         }
       } else if (h.market === "CRYPTO") {
         price = await raceWithSignal(fetchCrypto(h.symbol));
@@ -741,7 +741,7 @@ async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSi
             fundTradeRulesUpdatedAt: new Date().toISOString(),
           };
         } else {
-          update = failedTradeStatusFromSource("eastmoney", "基金交易规则刷新失败，未将净值更新视为正常可买证明");
+          update = failedTradeStatusFromSource("eastmoney", "交易状态暂未更新");
         }
       } else {
         price = await raceWithSignal(fetchStockLike(h.symbol, h.market));
