@@ -4,10 +4,10 @@
  */
 
 import type { Holding } from "../data/mockData";
-import type { DCAPlan, DCAExecution } from "../context/AppContext";
+import type { DCAPlan, DCAExecution, DCAPlanRule } from "../context/AppContext";
 import type { MarketType } from "../services/tradingCalendar";
 import { nextExecutionDate, isTradingDay, marketDate, effectiveDcaMarket, closureReason } from "../services/tradingCalendar";
-import { resolveHoldingTradeStatus } from "../utils/tradeStatus";
+import { resolveDcaTradeStatus } from "../utils/tradeStatus";
 import { normalizeHoldingType, normalizeHoldingSymbol, applyHoldingAdjustment, recomputeHoldingMetrics } from "./holdingHelpers";
 import { safeUUID } from "./safeId";
 import { affordableBuyAmount, normalizeTransactionCostProfile } from "./transactionCosts";
@@ -18,6 +18,22 @@ export { parseChineseMoneyLimit } from "./fundOrders";
 const DCA_QUOTE_FRESHNESS_MS = 24 * 60 * 60 * 1000;
 
 /* ─── date helpers ──────────────────────────────────── */
+
+export function recentDcaCutoff(now: Date) {
+  const first = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const lastDay = new Date(now.getFullYear(), now.getMonth(), 0).getDate();
+  first.setDate(Math.min(now.getDate(), lastDay));
+  return todayYMD(first);
+}
+
+export function recentDcaExecutions(executions: DCAExecution[], now = new Date()) {
+  const cutoff = recentDcaCutoff(now);
+  const today = todayYMD(now);
+  return executions.filter((item) => {
+    const date = item.actualDate || item.scheduledDate;
+    return date >= cutoff && date <= today;
+  }).sort((a, b) => (b.actualDate || b.scheduledDate).localeCompare(a.actualDate || a.scheduledDate));
+}
 
 export function fromYMDLocal(s: string) {
   const [year, month, day] = s.split("-").map(Number);
@@ -46,6 +62,27 @@ export function todayYMD(date = new Date()) {
 
 /* ─── plan helpers ──────────────────────────────────── */
 
+function planRule(plan: DCAPlan): DCAPlanRule {
+  const { holdingId, name, symbol, market, assetType, amount, currency, frequency, dayOfWeek, dayOfMonth, startDate, fundBuyConfirmDays } = plan;
+  return { holdingId, name, symbol, market, assetType, amount, currency, frequency, dayOfWeek, dayOfMonth, startDate, fundBuyConfirmDays };
+}
+
+export function recordDcaPlanChange(previous: DCAPlan, next: DCAPlan, now = new Date()): DCAPlan {
+  if (JSON.stringify(planRule(previous)) === JSON.stringify(planRule(next))) return next;
+  const effectiveDate = todayYMD(dcaScheduleDate(next, now));
+  const history = previous.ruleHistory?.length ? previous.ruleHistory : [{ effectiveDate: "0000-01-01", rule: planRule(previous) }];
+  return { ...next, ruleHistory: [
+    ...history.filter((entry) => entry.effectiveDate < effectiveDate),
+    { effectiveDate, rule: planRule(next) },
+  ] };
+}
+
+export function dcaPlanAtDate(plan: DCAPlan, date: string): DCAPlan {
+  const entry = plan.ruleHistory?.filter((item) => item.effectiveDate <= date)
+    .sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate))[0];
+  return entry ? { ...plan, ...entry.rule } : plan;
+}
+
 export function originalScheduledDate(plan: DCAPlan, adjustedDate: string): string {
   if (plan.frequency === "daily") return adjustedDate;
   const d = fromYMDLocal(adjustedDate);
@@ -71,12 +108,16 @@ function normalizeDayOfWeek(value: number | undefined) {
 }
 
 export function computeNextExec(plan: DCAPlan, from = new Date(), includeFrom = true): string {
-  return nextExecutionDate(effectiveDcaMarket(plan.market, plan.name), {
-    frequency:  plan.frequency,
-    dayOfWeek:  plan.frequency === "weekly" ? normalizeDayOfWeek(plan.dayOfWeek) : plan.dayOfWeek,
-    dayOfMonth: plan.dayOfMonth,
-    startDate:  plan.startDate,
+  const date = todayYMD(from);
+  const rule = dcaPlanAtDate(plan, date);
+  const next = nextExecutionDate(effectiveDcaMarket(rule.market, rule.name), {
+    frequency: rule.frequency,
+    dayOfWeek: rule.frequency === "weekly" ? normalizeDayOfWeek(rule.dayOfWeek) : rule.dayOfWeek,
+    dayOfMonth: rule.dayOfMonth,
+    startDate: rule.startDate,
   }, from, includeFrom);
+  const boundary = plan.ruleHistory?.map((item) => item.effectiveDate).filter((day) => day > date && day <= next).sort()[0];
+  return boundary ? computeNextExec(plan, marketNoonFromYMD(boundary), true) : next;
 }
 
 export function syncPlanWithHolding(plan: DCAPlan, holding: Holding): DCAPlan {
@@ -125,11 +166,12 @@ export function repairDCAData(
   const settlementToday = todayYMD(marketDate("A", new Date()));
 
   const repairedExecs = executions.map((exec) => {
-    const plan = planMap.get(exec.planId);
-    if (!plan) return exec;
+    const currentPlan = planMap.get(exec.planId);
+    if (!currentPlan) return exec;
+    const plan = dcaPlanAtDate(currentPlan, exec.actualDate);
     const holding = holdingMap.get(plan.holdingId);
 
-    const correctedScheduled = originalScheduledDate(plan, exec.actualDate);
+    const correctedScheduled = plan.ruleHistory?.length ? exec.scheduledDate : originalScheduledDate(plan, exec.actualDate);
     const scheduledFixed = correctedScheduled !== exec.scheduledDate;
 
     const execDate = fromYMDLocal(exec.actualDate);
@@ -287,7 +329,7 @@ export function hydratePlans(plans: DCAPlan[], executions: DCAExecution[] = []):
     return {
       ...p,
       nextExecDate: shouldRecoverFirstDueDate
-        ? computeNextExec(p, fromYMDLocal(p.startDate), true)
+        ? computeNextExec(p, fromYMDLocal(p.catchUpFromDate && p.catchUpFromDate > p.startDate ? p.catchUpFromDate : p.startDate), true)
         : (p.nextExecDate || computeNextExec(p)),
       totalInvested: p.totalInvested ?? 0,
       execCount: p.execCount ?? 0,
@@ -300,6 +342,24 @@ export function hydratePlans(plans: DCAPlan[], executions: DCAExecution[] = []):
 function fundLimitReason(note: string, amount?: number, limit?: number) {
   const details = limit != null && amount != null ? `，计划金额 ${amount} 元，限购 ${limit} 元` : "";
   return `${note || "基金限购"}${details}，自动定投已跳过`;
+}
+
+function dcaEvaluationKey(holding: Holding, plan: DCAPlan) {
+  const status = resolveDcaTradeStatus(holding);
+  return JSON.stringify([planRule(plan), status.status, status.stale,
+    holding.tradeStatus, holding.tradeStatusNote, holding.autoTradeStatusNote,
+    holding.fundDcaStatus, holding.fundDcaStatusNote,
+    holding.fundMinDcaAmount ?? holding.fundMinPurchaseAmount]);
+}
+
+function reservedDcaAmount(holding: Holding, date: string, holdings: Holding[], executions: DCAExecution[], orders: FundOrder[]) {
+  const mirrored = new Set(orders.filter((order) => order.source === "dca"
+    && (order.status === "pending" || order.status === "confirmed")).map((order) => order.id));
+  const byId = new Map(holdings.map((item) => [item.id, item]));
+  return fundOrderReservedBuyAmount(orders, holding, date) + executions.reduce((total, item) =>
+    item.actualDate === date && (item.status === "pending" || item.status === "executed")
+      && !mirrored.has(item.id) && byId.get(item.holdingId)?.symbol === holding.symbol
+      ? total + item.amount : total, 0);
 }
 
 function evaluateHoldingBuyStatus(
@@ -318,22 +378,27 @@ function evaluateHoldingBuyStatus(
   if ((holding.market === "FUND" || holding.assetType === "fund") && holding.fundDcaStatus === "buy_disabled") {
     return { ok: false, reason: holding.fundDcaStatusNote || "基金当前不可定投" };
   }
-  const resolved = resolveHoldingTradeStatus(holding);
-  if (resolved.stale) {
-    return { ok: false, reason: resolved.note || "交易状态已过期，自动定投已跳过" };
+  // NAV freshness and trading-rule availability are independent. Retain the
+  // last known fund rule across refresh failures; unknown rules still block.
+  const resolved = resolveDcaTradeStatus(holding);
+  if (holding.tradeStatus === "suspended" || holding.tradeStatus === "buy_disabled") {
+    return { ok: false, reason: holding.tradeStatusNote || "当前不可买入" };
   }
   if (resolved.status === "fund_limit") {
-    const limit = parseChineseMoneyLimit(resolved.note ?? "");
-    if (limit != null && amount != null && amount + alreadyReserved <= limit + 1e-8) {
-      return { ok: true, reason: `限购额度内执行（${resolved.note}）` };
+    // Parse the saved rule, never the diagnostic note (which may contain dates).
+    // A refresh failure does not itself revoke a known purchase allowance.
+    const ruleNote = resolved.automatic ? holding.autoTradeStatusNote : holding.tradeStatusNote;
+    const limit = parseChineseMoneyLimit(ruleNote ?? "");
+    if (limit == null || amount == null || amount + alreadyReserved > limit + 1e-8) {
+      return { ok: false, reason: fundLimitReason(ruleNote || resolved.label, amount == null ? amount : amount + alreadyReserved, limit ?? undefined) };
     }
-    return { ok: false, reason: fundLimitReason(resolved.note || resolved.label, amount == null ? amount : amount + alreadyReserved, limit ?? undefined) };
-  }
-  if (resolved.status !== "normal") {
+  } else if (resolved.stale) {
+    return { ok: false, reason: "暂无法确认交易状态，本次未执行" };
+  } else if (resolved.status !== "normal") {
     const structuredDcaAllowed = (holding.market === "FUND" || holding.assetType === "fund")
       && holding.fundDcaStatus === "normal"
       && resolved.status === "buy_disabled";
-    if (!structuredDcaAllowed) return { ok: false, reason: resolved.note || resolved.label };
+    if (!structuredDcaAllowed) return { ok: false, reason: resolved.status === "unknown" ? "暂无法确认交易状态，本次未执行" : resolved.note || resolved.label };
   }
   if (!requirePrice) return { ok: true };
   if (!Number.isFinite(holding.currentPrice) || holding.currentPrice <= 0) return { ok: false, reason: "暂无有效报价" };
@@ -459,24 +524,6 @@ export function computeFundConfirmationDate(plan: Pick<DCAPlan, "market" | "name
   return addFundSettlementTradingDays(plan, executionDate, fundSettlementDays(plan));
 }
 
-function countFundSettlementTradingDays(
-  plan: Pick<DCAPlan, "market" | "name"> & { assetType?: string; fundBuyConfirmDays?: number },
-  fromDate: string,
-  toDate: string,
-): number {
-  const start = fromYMDLocal(fromDate);
-  const end = fromYMDLocal(toDate);
-  let count = 0;
-  const d = new Date(start);
-  d.setDate(d.getDate() + 1);
-  while (d <= end) {
-    if (isFundSettlementTradingDay(plan, d)) count++;
-    d.setDate(d.getDate() + 1);
-    if (count > 30) break;
-  }
-  return count;
-}
-
 function dcaScheduleDate(plan: DCAPlan, now: Date): Date {
   return isFundHolding(undefined, plan)
     ? marketDate("FUND", now)
@@ -500,7 +547,8 @@ function settlePendingFundExecutions(
     if (!execution) continue;
     if (execution.status !== "pending") continue;
 
-    const plan = planMap.get(execution.planId);
+    const currentPlan = planMap.get(execution.planId);
+    const plan = currentPlan ? dcaPlanAtDate(currentPlan, execution.actualDate) : undefined;
     const holdingIndex = nextHoldings.findIndex((holding) => holding.id === execution.holdingId);
     const holding = holdingIndex >= 0 ? nextHoldings[holdingIndex] : holdingMap.get(execution.holdingId);
     if (!holding || holdingIndex < 0) {
@@ -629,62 +677,76 @@ export function backfillMissingPendingFundExecutions(
   executions: DCAExecution[],
   executionKeys: Set<string>,
   now: Date,
+  externalFundOrders: FundOrder[] = [],
 ) {
   const holdingMap = new Map(holdings.map((holding) => [holding.id, holding]));
   const nextExecutions = [...executions];
   let changed = false;
 
   for (const plan of plans) {
-    if (!plan.enabled || !isFundHolding(undefined, plan)) continue;
-    const holding = holdingMap.get(plan.holdingId);
-    if (!holding) continue;
-
-    const planMarket = effectiveDcaMarket(plan.market as MarketType, plan.name);
+    if (!plan.enabled || plan.archived || !isFundHolding(undefined, plan)) continue;
     const planTodayDate = dcaScheduleDate(plan, now);
     const planToday = todayYMD(planTodayDate);
-    const settlementToday = todayYMD(marketDate("A", now));
-    const requiredSettlementDays = fundSettlementDays(plan);
     const cursor = new Date(planTodayDate);
-    const scanLimit = plan.frequency === "daily" ? 14 : 45;
+    const cutoff = recentDcaCutoff(planTodayDate);
+    const scanLimit = 32;
 
     for (let scanned = 0; scanned < scanLimit; scanned++) {
       const actualDate = todayYMD(cursor);
-      if (actualDate < plan.startDate) break;
-      if (actualDate >= planToday) {
+      if (actualDate < cutoff || (plan.catchUpFromDate && actualDate < plan.catchUpFromDate)) break;
+      const periodPlan = dcaPlanAtDate(plan, actualDate);
+      const holding = holdingMap.get(periodPlan.holdingId);
+      if (actualDate < periodPlan.startDate || !holding) {
         cursor.setDate(cursor.getDate() - 1);
         continue;
       }
+      const planMarket = effectiveDcaMarket(periodPlan.market as MarketType, periodPlan.name);
 
       if (isTradingDay(planMarket, cursor)) {
-        const scheduledDate = originalScheduledDate(plan, actualDate);
-        const expectedActualDate = computeNextExec(plan, marketNoonFromYMD(scheduledDate), true);
+        const scheduledDate = originalScheduledDate(periodPlan, actualDate);
+        const expectedActualDate = computeNextExec(periodPlan, marketNoonFromYMD(scheduledDate), true);
         if (expectedActualDate !== actualDate) {
           cursor.setDate(cursor.getDate() - 1);
           continue;
         }
 
-        const elapsed = countFundSettlementTradingDays(plan, actualDate, settlementToday);
-        const staleThreshold = requiredSettlementDays + 5;
-        if (elapsed > staleThreshold) {
-          cursor.setDate(cursor.getDate() - 1);
-          continue;
-        }
-
         const executionKey = `${plan.id}:${actualDate}`;
-        if (!executionKeys.has(executionKey)) {
-          nextExecutions.unshift({
-            id: `dca_exec_${safeUUID()}`,
+        const existingIndex = nextExecutions.findIndex((item) => item.planId === plan.id && item.actualDate === actualDate);
+        const existing = nextExecutions[existingIndex];
+        const evaluationKey = dcaEvaluationKey(holding, periodPlan);
+        const transient = /应用未运行|当日未运行|刷新失败|状态已过期|暂无法确认交易状态/.test(existing?.reason ?? "");
+        const ruleFailure = Boolean(existing?.evaluationKey) || /限购|定投起点|不可定投|不可买|暂停|停牌/.test(existing?.reason ?? "");
+        const retryable = existing?.status === "skipped" && (transient || (actualDate === planToday && ruleFailure && existing.evaluationKey !== evaluationKey));
+        if ((!executionKeys.has(executionKey) && actualDate < planToday) || retryable) {
+          const amount = actualDate === planToday ? periodPlan.amount : existing?.amount ?? periodPlan.amount;
+          const reserved = reservedDcaAmount(holding, actualDate, holdings, nextExecutions, externalFundOrders);
+          const evaluation = evaluateHoldingBuyStatus(holding, amount, reserved, { requirePrice: false });
+          // Leave transient failures retryable when the next refresh succeeds.
+          if (existing && !evaluation.ok) {
+            if (existing.reason !== evaluation.reason || existing.evaluationKey !== evaluationKey || existing.amount !== amount) {
+              nextExecutions[existingIndex] = { ...existing, amount, reason: evaluation.reason, evaluationKey };
+              changed = true;
+            }
+            cursor.setDate(cursor.getDate() - 1);
+            continue;
+          }
+          const recovered: DCAExecution = {
+            ...existing,
+            id: existing?.id ?? `dca_exec_${safeUUID()}`,
             planId: plan.id,
-            holdingId: plan.holdingId,
+            holdingId: periodPlan.holdingId,
             scheduledDate,
             actualDate,
-            amount: plan.amount,
+            amount,
             adjusted: scheduledDate !== actualDate,
-            status: "pending",
-            expectedConfirmDate: computeFundConfirmationDate(plan, actualDate),
-            transactionCostProfile: normalizeTransactionCostProfile(holding.transactionCostProfile) ?? null,
-            reason: "补录待确认定投，等待正式净值确认后入账",
-          });
+            status: evaluation.ok ? "pending" : "skipped",
+            expectedConfirmDate: computeFundConfirmationDate(periodPlan, actualDate),
+            evaluationKey,
+            transactionCostProfile: existing?.transactionCostProfile !== undefined ? existing.transactionCostProfile : normalizeTransactionCostProfile(holding.transactionCostProfile) ?? null,
+            reason: evaluation.ok ? "等待正式净值确认后入账" : evaluation.reason,
+          };
+          if (existingIndex >= 0) nextExecutions[existingIndex] = recovered;
+          else nextExecutions.unshift(recovered);
           executionKeys.add(executionKey);
           changed = true;
         }
@@ -743,6 +805,11 @@ export function settleDueDCAPlans(
   }
 
   const todayForPendingSettlement = todayYMD(marketDate("A", now));
+  const backfilled = backfillMissingPendingFundExecutions(nextPlans, nextHoldings, nextExecutions, executionKeys, now, externalFundOrders);
+  if (backfilled.changed) {
+    nextExecutions.splice(0, nextExecutions.length, ...backfilled.executions);
+    changed = true;
+  }
   const pendingState = settlePendingFundExecutions(nextHoldings, nextPlans, nextExecutions, todayForPendingSettlement);
   if (pendingState.changed) {
     nextHoldings.splice(0, nextHoldings.length, ...pendingState.holdings);
@@ -751,8 +818,9 @@ export function settleDueDCAPlans(
   }
 
   for (let i = 0; i < nextPlans.length; i++) {
-    const plan = nextPlans[i];
-    if (!plan) continue;
+    const currentPlan = nextPlans[i];
+    if (!currentPlan) continue;
+    const plan = dcaPlanAtDate(currentPlan, currentPlan.nextExecDate);
     const planMarket = effectiveDcaMarket(plan.market as MarketType, plan.name);
     const planMarketDate = dcaScheduleDate(plan, now);
     const today = todayYMD(planMarketDate);
@@ -773,16 +841,16 @@ export function settleDueDCAPlans(
     const scheduledDate = originalScheduledDate(plan, actualDate);
     const adjusted = scheduledDate !== actualDate;
     if (executionKeys.has(executionKey)) {
-      const nextDate = computeNextExec(plan, nextSearchDate, false);
+      const nextDate = computeNextExec(currentPlan, nextSearchDate, false);
       if (nextDate !== plan.nextExecDate) {
-        nextPlans[i] = { ...plan, nextExecDate: nextDate };
+        nextPlans[i] = { ...currentPlan, nextExecDate: nextDate };
         changed = true;
         continuePlanIfStillDue(actualDate);
       }
       continue;
     }
 
-    if (actualDate < today) {
+    if (actualDate < today && !isFundHolding(holdingMap.get(plan.holdingId), plan)) {
       nextExecutions.unshift({
         id: `dca_exec_${safeUUID()}`,
         planId: plan.id,
@@ -795,7 +863,7 @@ export function settleDueDCAPlans(
         reason: "应用未运行，历史计划未自动补单",
       });
       executionKeys.add(executionKey);
-      nextPlans[i] = { ...plan, nextExecDate: computeNextExec(plan, marketNoonFromYMD(today), true) };
+      nextPlans[i] = { ...currentPlan, nextExecDate: computeNextExec(currentPlan, marketNoonFromYMD(today), true) };
       changed = true;
       continuePlanIfStillDue(actualDate);
       continue;
@@ -803,18 +871,9 @@ export function settleDueDCAPlans(
 
     const holdingIndex = nextHoldings.findIndex((item) => item.id === plan.holdingId);
     const holding = holdingIndex >= 0 ? nextHoldings[holdingIndex] : undefined;
-    const reservedByFundOrders = holding
-      ? fundOrderReservedBuyAmount(externalFundOrders, holding, actualDate)
-      : 0;
-    const mirroredExecutionIds = new Set(externalFundOrders.filter((order) => order.source === "dca").map((order) => order.id));
-    const reservedByDcaExecutions = holding
-      ? nextExecutions.reduce((total, execution) => {
-        if (mirroredExecutionIds.has(execution.id) || execution.actualDate !== actualDate || execution.status === "skipped" || execution.status === "cancelled") return total;
-        const executionHolding = nextHoldings.find((item) => item.id === execution.holdingId);
-        return executionHolding?.symbol === holding.symbol ? total + execution.amount : total;
-      }, 0)
-      : 0;
-    const evaluation = evaluateHoldingBuyStatus(holding, plan.amount, reservedByFundOrders + reservedByDcaExecutions);
+    const reserved = holding ? reservedDcaAmount(holding, actualDate, nextHoldings, nextExecutions, externalFundOrders) : 0;
+    const evaluation = evaluateHoldingBuyStatus(holding, plan.amount, reserved,
+      { requirePrice: !isFundHolding(holding, plan) });
 
     if (!evaluation.ok || !holding) {
       nextExecutions.unshift({
@@ -827,9 +886,10 @@ export function settleDueDCAPlans(
         adjusted,
         status: "skipped",
         reason: evaluation.reason,
+        evaluationKey: holding ? dcaEvaluationKey(holding, plan) : undefined,
       });
       executionKeys.add(executionKey);
-      nextPlans[i] = { ...plan, nextExecDate: computeNextExec(plan, nextSearchDate, false) };
+      nextPlans[i] = { ...currentPlan, nextExecDate: computeNextExec(currentPlan, nextSearchDate, false) };
       changed = true;
       continuePlanIfStillDue(actualDate);
       continue;
@@ -850,7 +910,7 @@ export function settleDueDCAPlans(
         reason: "等待正式净值确认后入账",
       });
       executionKeys.add(executionKey);
-      nextPlans[i] = { ...plan, nextExecDate: computeNextExec(plan, nextSearchDate, false) };
+      nextPlans[i] = { ...currentPlan, nextExecDate: computeNextExec(currentPlan, nextSearchDate, false) };
       changed = true;
       continuePlanIfStillDue(actualDate);
       continue;
@@ -873,7 +933,7 @@ export function settleDueDCAPlans(
         reason: "买入份额计算失败",
       });
       executionKeys.add(executionKey);
-      nextPlans[i] = { ...plan, nextExecDate: computeNextExec(plan, nextSearchDate, false) };
+      nextPlans[i] = { ...currentPlan, nextExecDate: computeNextExec(currentPlan, nextSearchDate, false) };
       changed = true;
       continuePlanIfStillDue(actualDate);
       continue;
@@ -897,7 +957,7 @@ export function settleDueDCAPlans(
         reason: "持仓自动入账失败",
       });
       executionKeys.add(executionKey);
-      nextPlans[i] = { ...plan, nextExecDate: computeNextExec(plan, nextSearchDate, false) };
+      nextPlans[i] = { ...currentPlan, nextExecDate: computeNextExec(currentPlan, nextSearchDate, false) };
       changed = true;
       continuePlanIfStillDue(actualDate);
       continue;
@@ -905,8 +965,8 @@ export function settleDueDCAPlans(
 
     nextHoldings[holdingIndex] = adjustedHolding;
     nextPlans[i] = {
-      ...plan,
-      nextExecDate: computeNextExec(plan, nextSearchDate, false),
+      ...currentPlan,
+      nextExecDate: computeNextExec(currentPlan, nextSearchDate, false),
     };
     nextExecutions.unshift({
       id: `dca_exec_${safeUUID()}`,

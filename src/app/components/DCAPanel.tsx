@@ -12,9 +12,9 @@ import {
   DCAFrequency, MarketType,
 } from "../services/tradingCalendar";
 import { formatFixedNumber } from "../utils/numberFormat";
-import { resolveHoldingTradeStatus, cleanTradeSource, cleanTradeNote } from "../utils/tradeStatus";
+import { resolveDcaTradeStatus as resolveHoldingTradeStatus, cleanTradeSource, conciseDcaReason } from "../utils/tradeStatus";
 import { getMarketBadge } from "../utils/marketBadge";
-import { computeFundConfirmationDate, fundSettlementDays, parseChineseMoneyLimit } from "../utils/dcaEngine";
+import { computeFundConfirmationDate, fundSettlementDays, parseChineseMoneyLimit, recentDcaExecutions } from "../utils/dcaEngine";
 import type { Language } from "../context/AppContext";
 import {
   dcaMarketForLabel,
@@ -41,11 +41,13 @@ function dateLabel(d: string, language: Language): string {
 function planStatusMeta(holding: Holding | undefined, language: Language) {
   const text = t(language).dca;
   if (!holding) return { label: text.missingHolding, color: "#F24E4E" };
+  if (holding.tradeStatus === "suspended") return { label: text.suspended, color: "#F24E4E" };
+  if (holding.tradeStatus === "buy_disabled") return { label: text.notBuyable, color: "#94A3B8" };
   if ((holding.market === "FUND" || holding.assetType === "fund") && holding.fundDcaStatus === "buy_disabled") {
     return { label: text.notBuyable, color: "#94A3B8", source: holding.fundDcaStatusNote ?? "" };
   }
   const resolved = resolveHoldingTradeStatus(holding);
-  if (resolved.stale) return { label: language === "en" ? "Status stale" : "状态已过期", color: "#94A3B8", source: resolved.source };
+  if (resolved.stale && resolved.status !== "fund_limit") return { label: language === "en" ? "Awaiting update" : "待更新", color: "#94A3B8", source: resolved.source };
   if (resolved.status === "suspended") return { label: text.suspended, color: "#F24E4E", source: resolved.source };
   if (resolved.status === "fund_limit") return { label: text.limited, color: "#F59E0B", source: resolved.source };
   if (resolved.status === "buy_disabled") return { label: text.notBuyable, color: "#94A3B8", source: resolved.source };
@@ -55,6 +57,7 @@ function planStatusMeta(holding: Holding | undefined, language: Language) {
 
 function dcaBlockedStatus(holding: Holding | undefined, amountText: string, language: Language) {
   if (!holding) return null;
+  if (holding.tradeStatus === "suspended" || holding.tradeStatus === "buy_disabled") return planStatusMeta(holding, language);
   const amount = Number(amountText);
   const dcaMinimum = holding.fundMinDcaAmount ?? holding.fundMinPurchaseAmount;
   if ((holding.market === "FUND" || holding.assetType === "fund") && Number.isFinite(amount) && dcaMinimum != null && amount + 1e-8 < dcaMinimum) {
@@ -69,7 +72,7 @@ function dcaBlockedStatus(holding: Holding | undefined, amountText: string, lang
   const resolved = resolveHoldingTradeStatus(holding);
   if (resolved.status === "normal") return null;
   if (resolved.status === "fund_limit") {
-    const limit = parseChineseMoneyLimit(resolved.note ?? "");
+    const limit = parseChineseMoneyLimit((resolved.automatic ? holding.autoTradeStatusNote : holding.tradeStatusNote) ?? "");
     if (Number.isFinite(amount) && limit != null && amount <= limit + 1e-8) return null;
   }
   return planStatusMeta(holding, language);
@@ -91,8 +94,9 @@ function executionStatusMeta(execution: DCAExecution, language: Language) {
 
 function skippedSummary(reason: string | undefined, language: Language) {
   const text = t(language).dca;
-  const raw = reason ?? "";
+  const raw = conciseDcaReason(reason ?? "");
   const prefix = text.skippedStatus;
+  if (/暂无法确认交易状态/.test(raw)) return `${prefix} · ${language === "en" ? "Status unavailable" : "状态待确认"}`;
   if (/限购|limited/i.test(raw)) return `${prefix} · ${text.limited}`;
   if (/暂停申购|不可买|不支持|buy|disabled/i.test(raw)) return `${prefix} · ${text.notBuyable}`;
   if (/停牌|suspended/i.test(raw)) return `${prefix} · ${text.suspended}`;
@@ -312,7 +316,6 @@ function ExecutionHistory({
   language: Language;
 }) {
   const text = t(language).dca;
-  const currentStatus = holding ? resolveHoldingTradeStatus(holding) : null;
   const settlementPlan = planForSettlement
     ? {
         ...planForSettlement,
@@ -324,50 +327,16 @@ function ExecutionHistory({
       assetType: holding.assetType,
       fundBuyConfirmDays: holding.fundBuyConfirmDays,
     } : undefined;
-  const sortedExecutions = useMemo(() => (
-    [...executions].sort((a, b) => {
-      const bd = b.actualDate ?? b.confirmedDate ?? b.scheduledDate;
-      const ad = a.actualDate ?? a.confirmedDate ?? a.scheduledDate;
-      return bd.localeCompare(ad);
-    })
-  ), [executions]);
-  const visibleExecutions = sortedExecutions.slice(0, 8);
-  const hiddenCount = Math.max(0, sortedExecutions.length - visibleExecutions.length);
+  const visibleExecutions = recentDcaExecutions(executions, marketDate("A", new Date()));
 
   return (
     <div className="rounded-xl p-3" style={{ background: "rgba(79,156,249,0.06)", border: "1px solid rgba(79,156,249,0.12)" }}>
       <div className="flex items-center gap-1.5 mb-2">
         <CalendarClock size={12} color="#4F9CF9" />
-        <span style={{ color: "#4F9CF9", fontSize: 11, fontWeight: 600 }}>{title}</span>
+        <span style={{ color: "#4F9CF9", fontSize: 11, fontWeight: 600 }}>{title} · {language === "en" ? "Past month" : "近一个月"}</span>
       </div>
 
-      {currentStatus && currentStatus.status !== "normal" && (
-        <div
-          className="rounded-lg px-2.5 py-2 mb-2"
-          style={{
-            background: "rgba(245,158,11,0.08)",
-            border: "1px solid rgba(245,158,11,0.18)",
-          }}
-        >
-          {(() => {
-            const src = translateTradeText(cleanTradeSource(currentStatus.source), language);
-            const label = translateTradeText(currentStatus.label, language);
-            const note = translateTradeText(cleanTradeNote(currentStatus.note, currentStatus.label), language);
-            return (
-              <>
-                <p style={{ color: "#F59E0B", fontSize: 10, fontWeight: 600 }}>
-                  {src ? `${src} · ` : ""}{label}{note ? `, ${note}` : ""}
-                </p>
-              </>
-            );
-          })()}
-          <p style={{ color: tc.textMuted, fontSize: 10, marginTop: 2 }}>
-            {text.blockedNote}
-          </p>
-        </div>
-      )}
-
-      {executions.length === 0 ? (
+      {visibleExecutions.length === 0 ? (
         <p style={{ color: tc.textMuted, fontSize: 11 }}>{text.noExecutions}</p>
       ) : (
         <div className="flex flex-col gap-1.5">
@@ -428,18 +397,13 @@ function ExecutionHistory({
                   </p>
                 ) : (
                   <p style={{ color: "#F59E0B", fontSize: 10, marginTop: 4 }}>
-                    {text.paymentDate} {item.actualDate} · {text.skipReason}: {translateDcaReason(item.reason ?? "已跳过", language)}
+                    {translateDcaReason(item.reason ?? "已跳过", language)}
                     {item.adjusted ? ` · ${text.original} ${item.scheduledDate}` : ""}
                   </p>
                 )}
               </div>
             );
           })}
-          {hiddenCount > 0 && (
-            <p style={{ color: tc.textMicro, fontSize: 10, textAlign: "center", marginTop: 2 }}>
-              {text.hiddenExecutions(hiddenCount)}
-            </p>
-          )}
         </div>
       )}
     </div>

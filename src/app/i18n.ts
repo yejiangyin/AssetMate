@@ -1,4 +1,5 @@
 import type { Language } from "./context/AppContext";
+import { conciseDcaReason } from "./utils/tradeStatus";
 import type { DCAFrequency, MarketType } from "./services/tradingCalendar";
 
 export const appText = {
@@ -939,8 +940,11 @@ export function translateTradeText(text: string | undefined | null, language: La
 }
 
 export function translateDcaReason(reason: string | undefined | null, language: Language) {
+  reason = conciseDcaReason(reason ?? "");
   if (language === "zh" || !reason) return reason ?? "";
   return reason
+    .replaceAll("暂无法确认交易状态，本次未执行", "Trading status unavailable; skipped")
+    .replaceAll("当日未运行，已跳过", "App was not running; skipped")
     .replaceAll("正式净值已就绪，等待渠道成交确认", "Official NAV is ready; waiting for channel fill confirmation")
     .replaceAll("等待渠道成交确认", "Waiting for channel fill confirmation")
     .replaceAll("渠道确认交易失败，未入账", "Channel confirmed the trade failed; not posted")

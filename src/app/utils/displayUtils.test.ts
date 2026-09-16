@@ -2,7 +2,15 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { getMarketBadge, getMarketBadgeWithBg } from "./marketBadge";
 import { currencySymbol, formatExactMoney, formatExactNumber, formatFixedNumber, formatPercent, formatSignedExactMoney } from "./numberFormat";
-import { cleanTradeNote, cleanTradeSource, mergeAutomaticTradeStatus, resolveHoldingTradeStatus, TRADE_STATUS_FRESHNESS_MS, tradeStatusLabel, tradeStatusSourceLabel } from "./tradeStatus";
+import { cleanTradeNote, cleanTradeSource, conciseDcaReason, mergeAutomaticTradeStatus, resolveHoldingTradeStatus, TRADE_STATUS_FRESHNESS_MS, tradeStatusLabel, tradeStatusSourceLabel } from "./tradeStatus";
+
+test("hides refresh diagnostics without hiding purchase limits or rewriting records", () => {
+  const stored = "基金限购，5元；基金交易规则刷新失败，未将净值更新视为正常可买证明；上次成功更新 2026-09-14 01:13";
+  assert.equal(cleanTradeNote(stored, "基金限购"), "5元");
+  assert.equal(conciseDcaReason(stored), "暂无法确认交易状态，本次未执行");
+  assert.equal(conciseDcaReason("应用未运行，历史计划未自动补单"), "当日未运行，已跳过");
+  assert.equal(conciseDcaReason("计划金额 6 元，限购 5 元，自动定投已跳过"), "计划金额 6 元，限购 5 元，自动定投已跳过");
+});
 
 describe("marketBadge", () => {
   test("falls back for unknown markets and computes alpha backgrounds", () => {

@@ -107,13 +107,31 @@ export function cleanTradeSource(source: string) {
 }
 
 export function cleanTradeNote(note: string | undefined, label: string) {
-  const text = (note ?? "").trim();
+  const text = (note ?? "").split(/[；;]/)
+    .filter((part) => !/刷新失败|未将.*视为|上次成功更新|状态已过期|未取得可靠|未提供交易状态|交易状态暂未更新/.test(part))
+    .join("；").trim();
   if (!text || text === label) return "";
   for (const sep of ["，", ",", "、", " "]) {
     const prefix = `${label}${sep}`;
     if (text.startsWith(prefix)) return text.slice(prefix.length).trim();
   }
   return text;
+}
+
+/** Keep stored diagnostics intact while making old and new records readable. */
+export function conciseDcaReason(reason: string) {
+  if (/刷新失败|状态已过期|未将.*视为|暂无法确认交易状态/.test(reason)) {
+    return "暂无法确认交易状态，本次未执行";
+  }
+  if (/应用未运行，历史计划未自动补单/.test(reason)) return "当日未运行，已跳过";
+  return reason;
+}
+
+export function resolveDcaTradeStatus(item: TradeStatusCarrier & { market?: string; assetType?: string }) {
+  const isFund = item.market === "FUND" || item.assetType === "fund";
+  return resolveHoldingTradeStatus(isFund && item.autoTradeStatus && item.autoTradeStatus !== "unknown"
+    ? { ...item, autoTradeStatusStale: false, autoTradeStatusUpdatedAt: undefined }
+    : item);
 }
 
 export function resolveHoldingTradeStatus(item: TradeStatusCarrier) {
