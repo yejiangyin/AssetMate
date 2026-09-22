@@ -2,7 +2,8 @@
  * Batch live-price refresher for portfolio holdings.
  */
 
-import { fetchCnFundEstimate, fetchCnFundOfficialHistory, fetchCnFundOfficialNav, fetchCnFundTradeStatus, resolveYahooUsPrice, Market } from "./securitiesApi";
+import { fetchCnFundEstimate, fetchCnFundOfficialHistory, fetchCnFundOfficialNav, fetchCnFundTradeStatus, resolveYahooUsPrice, Market, type FundDailyPurchaseStatus } from "./securitiesApi";
+import { fetchCnFundLimitNotices, type FundLimitNotice } from "./fundLimitNotices";
 import { fetchEastMoneyQuoteBySymbol, fetchEastMoneyQuotesBySymbols, fetchEastMoneyTradeStatusesBySymbols } from "./eastMoneyApi";
 import { fetchNasdaqQuote } from "./nasdaqApi";
 import { fetchTencentQuote, fetchTencentQuoteFromYahooSymbol, fetchTencentTradeStatus } from "./tencentQuote";
@@ -39,7 +40,7 @@ export interface LivePrice {
   fetchedAt:     number;
   source:        "yahoo" | "coingecko" | "eastmoney" | "tencent" | "nasdaq" | "binance" | "okx";
   priceDate?:     string;
-  fundNavHistory?:        Array<{ date: string; nav: number }>;
+  fundNavHistory?:        Array<{ date: string; nav: number; purchaseStatus?: FundDailyPurchaseStatus }>;
   estimatedNav?:           number;
   estimatedChangePercent?: number;
   estimatedNavAt?:         string;
@@ -74,6 +75,7 @@ export interface HoldingLiveUpdate {
   fundDcaCancellationAllowed?: boolean | null;
   fundCancellationRuleSource?: string | null;
   fundTradeRulesUpdatedAt?: string;
+  fundLimitNotices?: FundLimitNotice[];
 }
 
 export function resolveFundEstimateUpdate(
@@ -328,7 +330,8 @@ export async function eastMoneyFundLive(code: string, now: Date = new Date()): P
   try {
     const [estimate, history] = await Promise.all([
       fetchCnFundEstimate(code),
-      fetchCnFundOfficialHistory(code, 10),
+      // Cover the DCA backfill window (about one month of trading days).
+      fetchCnFundOfficialHistory(code, 30),
     ]);
     const officialNav = await fetchCnFundOfficialNav(code, { estimate, history });
     const sortedHistory = [...history].sort((a, b) => b.date.localeCompare(a.date));
@@ -398,7 +401,7 @@ export async function eastMoneyFundLive(code: string, now: Date = new Date()): P
       fetchedAt: Date.now(), source: "eastmoney",
       priceDate,
       fundNavHistory: officialHistory
-        .map((row) => ({ date: row.date, nav: row.nav })),
+        .map((row) => ({ date: row.date, nav: row.nav, ...("purchaseStatus" in row && row.purchaseStatus ? { purchaseStatus: row.purchaseStatus } : {}) })),
       estimatedNav: gsz > 0 ? gsz : undefined,
       estimatedChangePercent: gsz > 0 && !isNaN(gszPct) ? gszPct / 100 : undefined,
       estimatedNavAt: gsz > 0 ? (estimate?.estimateTime ?? todayShanghai) : undefined,
@@ -705,9 +708,10 @@ async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSi
         price = await raceWithSignal(fetchCrypto(h.symbol));
         if (price) update = normalTradeStatusFromSource(price.source);
       } else if (h.market === "FUND") {
-        const [fundPrice, fundStatus] = await Promise.all([
+        const [fundPrice, fundStatus, fundLimitNotices] = await Promise.all([
           raceWithSignal(eastMoneyFundLive(h.symbol)),
           raceWithSignal(fetchCnFundTradeStatus(h.symbol)).catch(() => null),
+          raceWithSignal(fetchCnFundLimitNotices(h.symbol)).catch(() => null),
         ]);
         price = fundPrice;
         if (!price) price = await raceWithSignal(fetchStockLike(h.symbol, h.market)).catch(() => null);
@@ -739,6 +743,7 @@ async function refreshPricesForTargets(targets: RefreshTarget[], signal: AbortSi
             fundDcaCancellationAllowed: fundStatus.dcaCancellationAllowed ?? null,
             fundCancellationRuleSource: fundStatus.cancellationRuleSource ?? null,
             fundTradeRulesUpdatedAt: new Date().toISOString(),
+            ...(fundLimitNotices ? { fundLimitNotices } : {}),
           };
         } else {
           update = failedTradeStatusFromSource("eastmoney", "交易状态暂未更新");

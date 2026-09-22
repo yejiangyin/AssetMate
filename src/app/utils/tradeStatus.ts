@@ -127,6 +127,12 @@ export function conciseDcaReason(reason: string) {
   return reason;
 }
 
+/** A DCA order rejected by the trading rules seen on its DCA day (limit, minimum, not buyable, no quote). */
+export function isDcaRuleFailure(item: { status: string; reason?: string }) {
+  return (item.status === "skipped" || item.status === "rejected")
+    && /限购|定投起点|不可定投|不可买|不支持|暂停|停牌|暂无法确认交易状态|刷新失败|状态已过期|无有效报价|报价未刷新/.test(item.reason ?? "");
+}
+
 export function resolveDcaTradeStatus(item: TradeStatusCarrier & { market?: string; assetType?: string }) {
   const isFund = item.market === "FUND" || item.assetType === "fund";
   return resolveHoldingTradeStatus(isFund && item.autoTradeStatus && item.autoTradeStatus !== "unknown"

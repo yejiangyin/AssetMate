@@ -13,7 +13,7 @@ import { toYahooSymbol } from "../services/quoteApi";
 import { FX } from "../services/priceRefresher";
 import { motion, AnimatePresence, LayoutGroup } from "motion/react";
 import { currencySymbol, formatExactMoney, formatExactNumber, formatPercent } from "../utils/numberFormat";
-import { resolveHoldingTradeStatus, tradeStatusLabel, cleanTradeNote } from "../utils/tradeStatus";
+import { resolveHoldingTradeStatus, tradeStatusLabel, cleanTradeNote, isDcaRuleFailure } from "../utils/tradeStatus";
 import { getMarketBadgeWithBg } from "../utils/marketBadge";
 import { normalizeHoldingSymbol, normalizeHoldingType } from "../utils/holdingHelpers";
 import { canSaveHoldingForm } from "../utils/holdingForm";
@@ -2055,6 +2055,7 @@ function transactionStatusMeta(record: TransactionRecord, language: Language, no
   if (record.status === "recorded") return { label: language === "en" ? "Filled record" : "已成交补录", color: "#31D08B" };
   if (record.status === "confirmed") return { label: language === "en" ? "Confirmed" : "已确认", color: "#31D08B" };
   if (record.status === "cancelled") return { label: language === "en" ? "Cancelled" : "已撤销", color: "var(--text-muted)" };
+  if (record.status === "rejected" && record.source === "dca" && isDcaRuleFailure(record)) return { label: t(language).dca.failedStatus, color: "#F24E4E" };
   if (record.status === "rejected") return { label: language === "en" ? "Not posted" : "未入账", color: "#F24E4E" };
   if (confirmationReady) return { label: language === "en" ? "Pending · auto-posting" : "待确认 · 即将自动入账", color: "#F59E0B" };
   const cancellationState = record.order ? fundOrderCancellationState(record.order, now) : "closed";

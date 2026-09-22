@@ -34,6 +34,9 @@ function canConfigureDividendReinvest(market: string, assetType: string) {
   return market === "FUND" && assetType === "fund";
 }
 
+/** Enough official NAV rows to confirm and judge DCA days across the backfill window. */
+export const FUND_NAV_HISTORY_KEEP = 60;
+
 export function normalizeHolding(h: Holding): Holding {
   const normalizedType = normalizeHoldingType(h.symbol, h.name, h.market, h.assetType);
   const normalizedSymbol = normalizeHoldingSymbol(h.symbol, normalizedType.market);
@@ -45,7 +48,7 @@ export function normalizeHolding(h: Holding): Holding {
     ? h.fundNavHistory
       .filter((row) => row.date && Number.isFinite(row.nav) && row.nav > 0)
       .sort((a, b) => b.date.localeCompare(a.date))
-      .slice(0, 20)
+      .slice(0, FUND_NAV_HISTORY_KEEP)
     : undefined;
   const rawCorporateActions = Array.isArray(h.corporateActions)
     ? h.corporateActions.filter((action) => (

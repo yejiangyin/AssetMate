@@ -40,11 +40,15 @@ export interface FundEstimateSnapshot {
   estimateTime?: string;
 }
 
+export type FundDailyPurchaseStatus = "open" | "limited" | "suspended";
+
 export interface FundOfficialHistoryItem {
   date: string;
   nav: number;
   totalNav?: number;
   changePercent: number;
+  /** 申购状态 published with that day's NAV (SGZT). */
+  purchaseStatus?: FundDailyPurchaseStatus;
 }
 
 type OfficialFundHistoryRow = {
@@ -52,7 +56,16 @@ type OfficialFundHistoryRow = {
   DWJZ?: unknown;
   LJJZ?: unknown;
   JZZZL?: unknown;
+  SGZT?: unknown;
 };
+
+export function parseFundDailyPurchaseStatus(value: unknown): FundDailyPurchaseStatus | undefined {
+  const text = String(value ?? "");
+  if (/暂停申购|封闭期|认购期|停止申购/.test(text)) return "suspended";
+  if (/限制|限大额|大额/.test(text)) return "limited";
+  if (/开放申购|场内买入/.test(text)) return "open";
+  return undefined;
+}
 
 function parseOfficialFundHistoryRows(rows: OfficialFundHistoryRow[]) {
   return rows
@@ -63,6 +76,7 @@ function parseOfficialFundHistoryRows(rows: OfficialFundHistoryRow[]) {
         nav: parseFloat(String(row?.DWJZ ?? "")),
         totalNav: Number.isFinite(totalNav) && totalNav > 0 ? totalNav : undefined,
         changePercent: parseFloat(String(row?.JZZZL ?? "")),
+        purchaseStatus: parseFundDailyPurchaseStatus(row?.SGZT),
       };
     })
     .filter((row) => row.date && Number.isFinite(row.nav) && row.nav > 0)
@@ -908,27 +922,37 @@ export async function fetchCnFundOfficialNav(
   return null;
 }
 
+const LSJZ_MAX_PAGE_SIZE = 20;
+// Larger windows (charts, dividend scans) keep the single request and trend-data fallback.
+const LSJZ_PAGINATE_UP_TO = 60;
+
 export async function fetchCnFundOfficialHistory(code: string, pageSize = 60): Promise<FundOfficialHistoryItem[]> {
   const timeoutMs = pageSize >= 1000 ? 20000 : 10000;
   const [signal, clear] = mkAbort(timeoutMs);
   let officialRows: FundOfficialHistoryItem[] = [];
   try {
-    const url =
-      `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${encodeURIComponent(code)}` +
-      `&pageIndex=1&pageSize=${pageSize}&startDate=&endDate=&_=${Date.now()}`;
-    const res = await fetch(url, {
-      signal,
-      cache: "no-store",
-      headers: {
-        Accept: "application/json, text/plain, */*",
-        Referer: "https://fundf10.eastmoney.com/",
-      },
-    });
+    // The endpoint serves at most 20 rows per page, so short windows are paged.
+    const perPage = pageSize <= LSJZ_PAGINATE_UP_TO ? Math.min(pageSize, LSJZ_MAX_PAGE_SIZE) : pageSize;
+    const rows: OfficialFundHistoryRow[] = [];
+    for (let pageIndex = 1; rows.length < pageSize; pageIndex++) {
+      const url =
+        `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${encodeURIComponent(code)}` +
+        `&pageIndex=${pageIndex}&pageSize=${perPage}&startDate=&endDate=&_=${Date.now()}`;
+      const res = await fetch(url, {
+        signal,
+        cache: "no-store",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          Referer: "https://fundf10.eastmoney.com/",
+        },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const page: OfficialFundHistoryRow[] = json?.Data?.LSJZList ?? [];
+      rows.push(...page);
+      if (page.length < perPage || rows.length >= Number(json?.TotalCount ?? Infinity)) break;
+    }
     clear();
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-    const json = await res.json();
-    const rows: OfficialFundHistoryRow[] = json?.Data?.LSJZList ?? [];
     officialRows = parseOfficialFundHistoryRows(rows);
     if (officialRows.length >= pageSize) return officialRows.slice(0, pageSize);
   } catch {
@@ -947,7 +971,11 @@ export async function fetchCnFundOfficialHistory(code: string, pageSize = 60): P
 
     const text = await res.text();
     const trendRows = parseFundTrendHistory(text, pageSize);
-    if (trendRows.length) return trendRows;
+    if (trendRows.length) {
+      // Keep the daily purchase status from whatever official rows did arrive.
+      const statusByDate = new Map(officialRows.map((row) => [row.date, row.purchaseStatus]));
+      return trendRows.map((row) => statusByDate.get(row.date) ? { ...row, purchaseStatus: statusByDate.get(row.date) } : row);
+    }
   } catch {
     fallbackClear();
   }

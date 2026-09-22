@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+  mergeFundNavHistory,
   applyAutomaticCorporateActions,
   buildClosedHolding,
   computeStats,
@@ -526,5 +527,20 @@ describe("computeStats", () => {
       realizedCostBasis: 1000,
     });
     assert.equal(stats.realizedTradingPnl, 300);
+  });
+});
+
+describe("mergeFundNavHistory", () => {
+  test("keeps older rows and their purchase status while newer fetches win", () => {
+    const merged = mergeFundNavHistory(
+      [{ date: "2026-06-10", nav: 1, purchaseStatus: "suspended" }, { date: "2026-06-11", nav: 1.1 }],
+      [{ date: "2026-06-11", nav: 1.2, purchaseStatus: "limited" }, { date: "2026-06-12", nav: 1.3, purchaseStatus: "open" }],
+    );
+    assert.deepEqual(merged, [
+      { date: "2026-06-12", nav: 1.3, purchaseStatus: "open" },
+      { date: "2026-06-11", nav: 1.2, purchaseStatus: "limited" },
+      { date: "2026-06-10", nav: 1, purchaseStatus: "suspended" },
+    ]);
+    assert.equal(mergeFundNavHistory(merged, undefined), merged);
   });
 });

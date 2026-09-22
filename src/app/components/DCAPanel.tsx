@@ -12,7 +12,7 @@ import {
   DCAFrequency, MarketType,
 } from "../services/tradingCalendar";
 import { formatFixedNumber } from "../utils/numberFormat";
-import { resolveDcaTradeStatus as resolveHoldingTradeStatus, cleanTradeSource, conciseDcaReason } from "../utils/tradeStatus";
+import { resolveDcaTradeStatus as resolveHoldingTradeStatus, cleanTradeSource, conciseDcaReason, isDcaRuleFailure } from "../utils/tradeStatus";
 import { getMarketBadge } from "../utils/marketBadge";
 import { computeFundConfirmationDate, fundSettlementDays, parseChineseMoneyLimit, recentDcaExecutions } from "../utils/dcaEngine";
 import type { Language } from "../context/AppContext";
@@ -89,13 +89,16 @@ function executionStatusMeta(execution: DCAExecution, language: Language) {
   if (execution.status === "cancelled") {
     return { label: language === "en" ? "Cancelled" : "已撤销", color: "#94A3B8", bg: "rgba(148,163,184,0.12)" };
   }
+  if (isDcaRuleFailure(execution)) {
+    return { label: text.failedStatus, color: "#F24E4E", bg: "rgba(242,78,78,0.12)" };
+  }
   return { label: text.skippedStatus, color: "#F59E0B", bg: "rgba(245,158,11,0.12)" };
 }
 
 function skippedSummary(reason: string | undefined, language: Language) {
   const text = t(language).dca;
   const raw = conciseDcaReason(reason ?? "");
-  const prefix = text.skippedStatus;
+  const prefix = isDcaRuleFailure({ status: "skipped", reason }) ? text.failedStatus : text.skippedStatus;
   if (/暂无法确认交易状态/.test(raw)) return `${prefix} · ${language === "en" ? "Status unavailable" : "状态待确认"}`;
   if (/限购|limited/i.test(raw)) return `${prefix} · ${text.limited}`;
   if (/暂停申购|不可买|不支持|buy|disabled/i.test(raw)) return `${prefix} · ${text.notBuyable}`;
@@ -206,7 +209,7 @@ function PlanCard({
             <p
               className="truncate"
               title={latestExecution?.reason ? translateDcaReason(latestExecution.reason, language) : undefined}
-              style={{ color: latestExecution?.status === "skipped" || latestExecution?.status === "cancelled" ? "#F59E0B" : "#4F9CF9", fontSize: 11, fontWeight: 600, maxWidth: 150 }}
+              style={{ color: latestExecution && isDcaRuleFailure(latestExecution) ? "#F24E4E" : latestExecution?.status === "skipped" || latestExecution?.status === "cancelled" ? "#F59E0B" : "#4F9CF9", fontSize: 11, fontWeight: 600, maxWidth: 150 }}
             >
               {latestText}
             </p>
@@ -387,6 +390,7 @@ function ExecutionHistory({
                     {item.navDate ? ` · ${text.navDate} ${item.navDate}` : ""}
                     {item.confirmedDate ? ` · ${text.confirmedDate} ${item.confirmedDate}` : ""}
                     {item.adjusted ? ` · ${text.original} ${item.scheduledDate}` : ""}
+                    {item.ruleBasis && item.ruleBasis !== "day_of" ? ` · ${text.ruleBasis[item.ruleBasis]}` : ""}
                   </p>
                 ) : item.status === "pending" ? (
                   <p style={{ color: "#4F9CF9", fontSize: 10, marginTop: 4 }}>
@@ -394,9 +398,10 @@ function ExecutionHistory({
                     {settlementPlan ? ` · ${text.estimatedConfirm} ${computeFundConfirmationDate(settlementPlan, item.actualDate)} (T+${fundSettlementDays(settlementPlan)})` : ""}
                     {` · ${translateDcaReason(item.reason ?? "等待正式净值确认后入账", language)}`}
                     {item.adjusted ? ` · ${text.original} ${item.scheduledDate}` : ""}
+                    {item.ruleBasis && item.ruleBasis !== "day_of" ? ` · ${text.ruleBasis[item.ruleBasis]}` : ""}
                   </p>
                 ) : (
-                  <p style={{ color: "#F59E0B", fontSize: 10, marginTop: 4 }}>
+                  <p style={{ color: isDcaRuleFailure(item) ? "#F24E4E" : "#F59E0B", fontSize: 10, marginTop: 4 }}>
                     {translateDcaReason(item.reason ?? "已跳过", language)}
                     {item.adjusted ? ` · ${text.original} ${item.scheduledDate}` : ""}
                   </p>
