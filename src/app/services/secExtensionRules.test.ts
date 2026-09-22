@@ -38,6 +38,6 @@ describe("SEC extension request identity", () => {
     const [rule] = JSON.parse(readFileSync(`public/${resource.path}`, "utf8"));
     assert.equal(rule.condition.urlFilter, "||api.fund.eastmoney.com/f10/");
     assert.deepEqual(rule.action.requestHeaders, [{ header: "Referer", operation: "set", value: "https://fundf10.eastmoney.com/" }]);
-    assert.equal(manifest.host_permissions.includes("https://np-cnotice-fund.eastmoney.com/api/content/*"), true);
+    assert.equal(manifest.host_permissions.includes("https://np-cnotice-stock.eastmoney.com/api/content/*"), true);
   });
 });

@@ -156,7 +156,7 @@ async function fetchNoticeText(id: string): Promise<string | null> {
   const cached = readPersistentEntry<string>(CONTENT_STORAGE_KEY, id);
   if (cached) return cached.data;
   const json = await fetchJson(
-    `https://np-cnotice-fund.eastmoney.com/api/content/ann?art_code=${encodeURIComponent(id)}&client_source=web_fund&page_index=1`,
+    `https://np-cnotice-stock.eastmoney.com/api/content/ann?art_code=${encodeURIComponent(id)}&client_source=web&page_index=1`,
     10000,
   );
   const text = String(json?.data?.notice_content ?? "");

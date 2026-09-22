@@ -64,7 +64,7 @@
     "https://fundsuggest.eastmoney.com/FundSearch/*",
     "https://fundf10.eastmoney.com/*",
     "https://api.fund.eastmoney.com/f10/*",
-    "https://np-cnotice-fund.eastmoney.com/api/content/*",
+    "https://np-cnotice-stock.eastmoney.com/api/content/*",
     "https://fund.eastmoney.com/pingzhongdata/*",
     "https://fundcomapi.tiantianfunds.com/mm/newCore/*",
     "https://fundcomapi.eastmoney.com/mm/newCore/*",
