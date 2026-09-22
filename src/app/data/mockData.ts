@@ -1,3 +1,5 @@
+import type { FundDailyPurchaseStatus } from "../services/securitiesApi";
+import type { FundLimitNotice } from "../services/fundLimitNotices";
 /* ─── shared types ────────────────────────────────────── */
 export type Group = {
   id:      string;
@@ -84,7 +86,9 @@ export type Holding = {
   fundCancellationRuleSource?: string;
   fundTradeRulesUpdatedAt?: string;
   priceDate?:    string;
-  fundNavHistory?:        Array<{ date: string; nav: number }>;
+  fundNavHistory?:        Array<{ date: string; nav: number; purchaseStatus?: FundDailyPurchaseStatus }>;
+  /** Parsed purchase-limit announcements, used to judge DCA days the app never saw. */
+  fundLimitNotices?:       FundLimitNotice[];
   estimatedNav?:           number;
   estimatedChangePercent?: number;
   estimatedNavAt?:         string;

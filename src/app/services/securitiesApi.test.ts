@@ -612,3 +612,32 @@ describe("crypto price fallbacks", () => {
     });
   });
 });
+
+describe("fetchCnFundOfficialHistory daily purchase status", () => {
+  const day = (i: number) => `2026-08-${String(31 - i).padStart(2, "0")}`;
+  const lsjzRow = (i: number) => ({ FSRQ: day(i), DWJZ: "1.1", JZZZL: "0.1", SGZT: i === 0 ? "暂停申购" : "限制大额申购" });
+
+  test("pages through the 20-row cap and keeps each day's purchase status", async () => {
+    const pages: string[] = [];
+    const rows = await withMockFetch((async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const page = Number(new URL(url).searchParams.get("pageIndex"));
+      pages.push(`${page}:${new URL(url).searchParams.get("pageSize")}`);
+      const list = Array.from({ length: 20 }, (_, i) => lsjzRow((page - 1) * 20 + i)).filter((row) => row.FSRQ >= "2026-08-01");
+      return { ok: true, json: async () => ({ Data: { LSJZList: list }, TotalCount: 31 }) } as Response;
+    }) as typeof fetch, () => fetchCnFundOfficialHistory("006479", 30));
+    assert.deepEqual(pages, ["1:20", "2:20"]);
+    assert.equal(rows.length, 30);
+    assert.deepEqual([rows[0]?.purchaseStatus, rows[29]?.purchaseStatus], ["suspended", "limited"]);
+  });
+
+  test("keeps purchase status from partial official rows when falling back to trend data", async () => {
+    const rows = await withMockFetch((async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/f10/lsjz")) return { ok: true, json: async () => ({ Data: { LSJZList: [lsjzRow(0)] }, TotalCount: 1 }) } as Response;
+      const trend = [0, 1].map((i) => ({ x: Date.parse(`${day(i)}T00:00:00+08:00`), y: 1.1, equityReturn: 0.1 }));
+      return { ok: true, text: async () => `var Data_netWorthTrend = ${JSON.stringify(trend)};` } as Response;
+    }) as typeof fetch, () => fetchCnFundOfficialHistory("006479", 2));
+    assert.equal(rows.find((row) => row.date === day(0))?.purchaseStatus, "suspended");
+  });
+});

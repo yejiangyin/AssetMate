@@ -20,7 +20,7 @@ import {
   normalizePortfolioEventBaseline,
   ymdFromEventValue,
 } from "../services/portfolioEvents";
-import { normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction, recomputeHoldingMetrics, reverseCorporateAction } from "../utils/holdingHelpers";
+import { FUND_NAV_HISTORY_KEEP, normalizeHolding, buildHolding, applyHoldingAdjustment, applyCorporateAction as applyHoldingCorporateAction, recomputeHoldingMetrics, reverseCorporateAction } from "../utils/holdingHelpers";
 import { dedupeDCAExecutions, hydratePlans, repairDCAData, settleDueDCAPlans, syncPlanWithHolding, computeNextExec, recordDcaPlanChange } from "../utils/dcaEngine";
 import { safeUUID } from "../utils/safeId";
 import { acknowledgeSnapshotDueDates, DEFAULT_OPEN_MODE, getConfiguredExtensionOpenMode, getSnapshotDueDates, normalizeOpenMode, syncExtensionOpenMode, type ExtensionOpenMode } from "../utils/extensionOpenMode";
@@ -260,6 +260,14 @@ export interface DCAExecution {
   price?:        number;
   reason?:       string;
   evaluationKey?: string;
+  /**
+   * What decided whether the order was accepted: rules seen on the DCA day,
+   * that day's published purchase status, the announced limit in force that
+   * day, or (when neither is available) the latest rules as an inference.
+   */
+  ruleBasis?:    "day_of" | "history" | "announcement" | "inferred";
+  /** Missed day whose purchase status is not published yet; checked when its NAV arrives. */
+  awaitingRuleCheck?: boolean;
   navDate?:      string;
   expectedConfirmDate?: string;
   channelConfirmedAt?: string;
@@ -420,8 +428,17 @@ export function preserveHoldingLedgerFields(previous: Holding, next: Holding): H
     cashDividendTotal: previous.cashDividendTotal ?? 0,
     corporateActions: previous.corporateActions ?? [],
     fundNavHistory: previous.fundNavHistory,
+    fundLimitNotices: previous.fundLimitNotices,
     priceDate: previous.priceDate,
   };
+}
+
+/** Keep rows older than the latest fetch so past DCA days can still be judged and confirmed. */
+export function mergeFundNavHistory(current: Holding["fundNavHistory"], incoming: Holding["fundNavHistory"]) {
+  if (!incoming) return current;
+  const byDate = new Map((current ?? []).map((row) => [row.date, row]));
+  for (const row of incoming) byDate.set(row.date, { ...byDate.get(row.date), ...row });
+  return [...byDate.values()].sort((a, b) => b.date.localeCompare(a.date)).slice(0, FUND_NAV_HISTORY_KEEP);
 }
 
 /* ─── AppState ───────────────────────────────────────── */
@@ -929,11 +946,6 @@ function syncDCAFundOrders(
     const executionCostProfile = execution.transactionCostProfile === undefined
       ? holding.transactionCostProfile
       : execution.transactionCostProfile ?? undefined;
-    const rule = {
-      ...(existing?.rule ?? fundOrderRuleForHolding(holding, "buy", requestedAt, executionCostProfile, "dca")),
-      cancellationPolicy: "not_cancellable" as const,
-      cancellationPolicySource: "自动定投触发单不可手工撤销",
-    };
     const status: FundOrder["status"] = execution.status === "executed"
       ? "confirmed"
       : execution.status === "cancelled"
@@ -941,6 +953,15 @@ function syncDCAFundOrders(
       : execution.status === "skipped"
         ? "rejected"
         : "pending";
+    // A same-day re-check that flips accept/reject re-snapshots the rules it used.
+    const flippedOnRuleCheck = Boolean(existing) && status !== existing!.status
+      && (status === "pending" || status === "rejected")
+      && (existing!.status === "pending" || existing!.status === "rejected");
+    const rule = {
+      ...(existing?.rule && !flippedOnRuleCheck ? existing.rule : fundOrderRuleForHolding(holding, "buy", requestedAt, executionCostProfile, "dca")),
+      cancellationPolicy: "not_cancellable" as const,
+      cancellationPolicySource: "自动定投触发单不可手工撤销",
+    };
     byId.set(execution.id, {
       id: execution.id,
       holdingId: execution.holdingId,
@@ -1852,7 +1873,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const existingDates = stateRef.current.assetSnapshots.map((snapshot) => snapshot.date);
       const afterHoldings = currentHoldings.map((h) => {
         const lp = priceMap[h.id]?.price;
-        return lp ? { ...h, fundNavHistory: lp.fundNavHistory ?? h.fundNavHistory } : h;
+        return lp ? { ...h, fundNavHistory: mergeFundNavHistory(h.fundNavHistory, lp.fundNavHistory) } : h;
       });
       const staleDates = collectStaleSnapshotDates(
         currentHoldings,
@@ -1891,6 +1912,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             fundDcaCancellationAllowed: refreshedFundRule(liveUpdate.fundDcaCancellationAllowed, h.fundDcaCancellationAllowed),
             fundCancellationRuleSource: refreshedFundRule(liveUpdate.fundCancellationRuleSource, h.fundCancellationRuleSource),
             fundTradeRulesUpdatedAt: liveUpdate.fundTradeRulesUpdatedAt ?? h.fundTradeRulesUpdatedAt,
+            fundLimitNotices: liveUpdate.fundLimitNotices ?? h.fundLimitNotices,
             priceDate: h.priceDate ?? "",
             fundNavHistory: h.fundNavHistory,
           };
@@ -1933,8 +1955,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             fundDcaCancellationAllowed: refreshedFundRule(liveUpdate.fundDcaCancellationAllowed, h.fundDcaCancellationAllowed),
             fundCancellationRuleSource: refreshedFundRule(liveUpdate.fundCancellationRuleSource, h.fundCancellationRuleSource),
             fundTradeRulesUpdatedAt: liveUpdate.fundTradeRulesUpdatedAt ?? h.fundTradeRulesUpdatedAt,
+            fundLimitNotices: liveUpdate.fundLimitNotices ?? h.fundLimitNotices,
             priceDate: lp.priceDate ?? h.priceDate ?? "",
-            fundNavHistory: lp.fundNavHistory ?? h.fundNavHistory,
+            fundNavHistory: mergeFundNavHistory(h.fundNavHistory, lp.fundNavHistory),
             ...fundEstimate,
             cashDividendTotal: h.cashDividendTotal ?? 0,
             dividendReinvest: h.dividendReinvest ?? null,
@@ -2450,6 +2473,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           fundTradeRulesUpdatedAt: previous.fundTradeRulesUpdatedAt,
           priceDate: previous.priceDate ?? "",
           fundNavHistory: previous.fundNavHistory,
+          fundLimitNotices: previous.fundLimitNotices,
           estimatedNav: previous.estimatedNav,
           estimatedChangePercent: previous.estimatedChangePercent,
           cashDividendTotal: previous.cashDividendTotal ?? 0,

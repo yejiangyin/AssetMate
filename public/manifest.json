@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "资产助手",
-  "version": "2.0.6",
-  "version_name": "2.0.6",
+  "version": "2.0.7",
+  "version_name": "2.0.7",
   "description": "个人资产、多市场行情、AI 投研与策略回测插件。",
   "permissions": [
     "sidePanel",
@@ -38,6 +38,11 @@
         "id": "sec_request_identity",
         "enabled": true,
         "path": "rules/sec-request-identity.json"
+      },
+      {
+        "id": "eastmoney_fund_referer",
+        "enabled": true,
+        "path": "rules/eastmoney-fund-referer.json"
       }
     ]
   },
@@ -59,6 +64,7 @@
     "https://fundsuggest.eastmoney.com/FundSearch/*",
     "https://fundf10.eastmoney.com/*",
     "https://api.fund.eastmoney.com/f10/*",
+    "https://np-cnotice-fund.eastmoney.com/api/content/*",
     "https://fund.eastmoney.com/pingzhongdata/*",
     "https://fundcomapi.tiantianfunds.com/mm/newCore/*",
     "https://fundcomapi.eastmoney.com/mm/newCore/*",

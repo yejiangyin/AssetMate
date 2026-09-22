@@ -3,6 +3,7 @@ import { describe, test } from "node:test";
 import type { DCAExecution, DCAPlan } from "../context/AppContext";
 import type { Holding } from "../data/mockData";
 import type { FundOrder } from "./fundOrders";
+import { isDcaRuleFailure } from "./tradeStatus";
 import {
   computeFundConfirmationDate,
   computeNextExec,
@@ -163,6 +164,35 @@ describe("DCA rule changes and retries", () => {
     assert.equal(tomorrow.executions.find((x) => x.actualDate === "2026-06-17")?.status, "skipped");
   });
 
+  test("re-checks today's accepted order against newer same-day rules, then freezes the decision", () => {
+    const first = settleDueDCAPlans([fund()], [todayPlan()], [], now);
+    assert.equal(first.executions[0]?.status, "pending");
+    assert.ok(first.executions[0]?.evaluationKey);
+    // A same-day refresh that does not tighten the limit keeps the order (it is not counted against itself).
+    const sameLimit = settleDueDCAPlans([{ ...fund(), autoTradeStatusNote: "基金限购，单日5元" }], first.plans, first.executions, now);
+    assert.equal(sameLimit.executions[0]?.status, "pending");
+    const tightened = { ...fund(), autoTradeStatusNote: "基金限购，2元" };
+    const rejected = settleDueDCAPlans([tightened], first.plans, first.executions, now);
+    assert.equal(rejected.executions.length, 1);
+    assert.equal(rejected.executions[0]?.status, "skipped");
+    assert.equal(rejected.executions[0]?.reason, "基金限购，2元，计划金额 3 元，限购 2 元，自动定投已跳过");
+    assert.equal(isDcaRuleFailure(rejected.executions[0]!), true);
+    // After the DCA day, later rule changes never revisit the decision in either direction.
+    const tomorrow = new Date("2026-06-18T12:00:00+08:00");
+    assert.equal(settleDueDCAPlans([tightened], first.plans, first.executions, tomorrow)
+      .executions.find((x) => x.actualDate === "2026-06-17")?.status, "pending");
+    assert.equal(settleDueDCAPlans([fund()], rejected.plans, rejected.executions, tomorrow)
+      .executions.find((x) => x.actualDate === "2026-06-17")?.status, "skipped");
+  });
+
+  test("does not revoke today's accepted order when the trading status becomes unavailable", () => {
+    const first = settleDueDCAPlans([fund()], [todayPlan()], [], now);
+    const unavailable = holding({ market: "FUND", assetType: "fund", symbol: "006479", name: "测试基金",
+      autoTradeStatus: "unknown", autoTradeStatusNote: "基金交易规则刷新失败" });
+    const result = settleDueDCAPlans([unavailable], first.plans, first.executions, now);
+    assert.equal(result.executions[0]?.status, "pending");
+  });
+
   test("uses an edited amount for today's rejected order but preserves accepted amounts", () => {
     const h = fund();
     const p = { ...todayPlan(), amount: 6 };
@@ -175,6 +205,67 @@ describe("DCA rule changes and retries", () => {
     const accepted = settleDueDCAPlans([h], [editedAgain], retried.executions, now);
     assert.equal(accepted.executions[0]?.amount, 2);
     assert.equal(accepted.executions.length, 1);
+  });
+});
+
+describe("missed DCA days are judged by that day's rules", () => {
+  const now = new Date("2026-06-17T12:00:00+08:00");
+  const missed = "2026-06-15";
+  const fund = (patch: Partial<Holding> = {}) => holding({ market: "FUND", assetType: "fund", symbol: "006479", name: "测试基金",
+    currency: "CNY", currentPrice: 2, fundBuyConfirmDays: 1, autoTradeStatus: "fund_limit", autoTradeStatusNote: "基金限购，5元", ...patch });
+  const missedPlan = () => plan({ name: "测试基金", amount: 3, startDate: missed, nextExecDate: missed, fundBuyConfirmDays: 1 });
+  const onMissedDay = (h: Holding) => settleDueDCAPlans([h], [missedPlan()], [], now).executions.find((x) => x.actualDate === missed);
+  const row = (purchaseStatus?: "open" | "limited" | "suspended") => ({ fundNavHistory: [{ date: missed, nav: 2, purchaseStatus }] });
+
+  test("an open day is accepted even if the current limit would reject it", () => {
+    const result = onMissedDay(fund({ ...row("open"), autoTradeStatusNote: "基金限购，1元" }));
+    assert.deepEqual([result?.status, result?.ruleBasis], ["executed", "history"]);
+  });
+
+  test("a suspended day fails with the usual DCA failure message", () => {
+    const result = onMissedDay(fund(row("suspended")));
+    assert.deepEqual([result?.status, result?.reason, result?.ruleBasis], ["skipped", "当日基金暂停申购，自动定投已跳过", "history"]);
+    assert.equal(isDcaRuleFailure(result!), true);
+    assert.equal(isDcaRuleFailure({ status: "skipped", reason: "定投状态：不支持" }), true);
+    assert.equal(isDcaRuleFailure({ status: "skipped", reason: "应用未运行，历史计划未自动补单" }), false);
+  });
+
+  test("a limited day uses the announced limit in force that day", () => {
+    const notices = [
+      { id: "old", title: "", publishDate: "2026-05-01", effectiveDate: "2026-05-02", kind: "limit" as const, limit: 100 },
+      { id: "new", title: "", publishDate: "2026-06-01", effectiveDate: "2026-06-02", kind: "limit" as const, limit: 2 },
+      { id: "later", title: "", publishDate: "2026-06-16", effectiveDate: "2026-06-17", kind: "limit" as const, limit: 50 },
+    ];
+    const result = onMissedDay(fund({ ...row("limited"), fundLimitNotices: notices }));
+    assert.equal(result?.status, "skipped");
+    assert.equal(result?.ruleBasis, "announcement");
+    assert.equal(result?.reason, "基金限购（2026-06-02 起公告限额），计划金额 3 元，限购 2 元，自动定投已跳过");
+  });
+
+  test("a limited day without an announcement falls back to current rules, marked as inferred", () => {
+    assert.deepEqual([onMissedDay(fund(row("limited")))?.status, onMissedDay(fund(row("limited")))?.ruleBasis], ["executed", "inferred"]);
+    const rejected = onMissedDay(fund({ ...row("limited"), autoTradeStatusNote: "基金限购，1元" }));
+    assert.equal(rejected?.status, "skipped");
+    assert.match(rejected?.reason ?? "", /限购 1 元.*依据当前数据推断/);
+  });
+
+  test("waits for the day's status to be published, then judges it before posting", () => {
+    const early = fund({ fundNavHistory: [{ date: "2026-06-12", nav: 2, purchaseStatus: "open" }], autoTradeStatusNote: "基金限购，100元" });
+    const first = settleDueDCAPlans([early], [missedPlan()], [], now);
+    const waiting = first.executions.find((x) => x.actualDate === missed);
+    assert.deepEqual([waiting?.status, waiting?.awaitingRuleCheck, waiting?.reason], ["pending", true, "等待当日申购状态和正式净值，确认后判断是否入账"]);
+    const limitedDay = { ...early, fundNavHistory: [{ date: missed, nav: 2, purchaseStatus: "limited" as const }],
+      fundLimitNotices: [{ id: "n", title: "", publishDate: "2026-06-01", effectiveDate: "2026-06-02", kind: "limit" as const, limit: 2 }] };
+    const judged = settleDueDCAPlans([limitedDay], first.plans, first.executions, now).executions.find((x) => x.actualDate === missed);
+    assert.deepEqual([judged?.status, judged?.ruleBasis, judged?.awaitingRuleCheck], ["skipped", "announcement", undefined]);
+    const openDay = { ...early, fundNavHistory: [{ date: missed, nav: 2, purchaseStatus: "open" as const }] };
+    const posted = settleDueDCAPlans([openDay], first.plans, first.executions, now).executions.find((x) => x.actualDate === missed);
+    assert.deepEqual([posted?.status, posted?.ruleBasis, posted?.price], ["executed", "history", 2]);
+  });
+
+  test("today is still judged by the rules seen today", () => {
+    const today = settleDueDCAPlans([fund(row("open"))], [missedPlan()], [], now).executions.find((x) => x.actualDate === "2026-06-17");
+    assert.deepEqual([today?.status, today?.ruleBasis], ["pending", "day_of"]);
   });
 });
 

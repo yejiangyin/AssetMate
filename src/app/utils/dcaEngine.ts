@@ -12,6 +12,7 @@ import { normalizeHoldingType, normalizeHoldingSymbol, applyHoldingAdjustment, r
 import { safeUUID } from "./safeId";
 import { affordableBuyAmount, normalizeTransactionCostProfile } from "./transactionCosts";
 import { fundOrderReservedBuyAmount, parseChineseMoneyLimit, type FundOrder } from "./fundOrders";
+import { fundLimitOnDate } from "../services/fundLimitNotices";
 
 export { parseChineseMoneyLimit } from "./fundOrders";
 
@@ -352,12 +353,13 @@ function dcaEvaluationKey(holding: Holding, plan: DCAPlan) {
     holding.fundMinDcaAmount ?? holding.fundMinPurchaseAmount]);
 }
 
-function reservedDcaAmount(holding: Holding, date: string, holdings: Holding[], executions: DCAExecution[], orders: FundOrder[]) {
-  const mirrored = new Set(orders.filter((order) => order.source === "dca"
+function reservedDcaAmount(holding: Holding, date: string, holdings: Holding[], executions: DCAExecution[], orders: FundOrder[], excludeId?: string) {
+  const otherOrders = excludeId ? orders.filter((order) => order.id !== excludeId) : orders;
+  const mirrored = new Set(otherOrders.filter((order) => order.source === "dca"
     && (order.status === "pending" || order.status === "confirmed")).map((order) => order.id));
   const byId = new Map(holdings.map((item) => [item.id, item]));
-  return fundOrderReservedBuyAmount(orders, holding, date) + executions.reduce((total, item) =>
-    item.actualDate === date && (item.status === "pending" || item.status === "executed")
+  return fundOrderReservedBuyAmount(otherOrders, holding, date) + executions.reduce((total, item) =>
+    item.actualDate === date && item.id !== excludeId && (item.status === "pending" || item.status === "executed")
       && !mirrored.has(item.id) && byId.get(item.holdingId)?.symbol === holding.symbol
       ? total + item.amount : total, 0);
 }
@@ -407,6 +409,44 @@ function evaluateHoldingBuyStatus(
     return { ok: false, reason: "报价未刷新，跳过自动定投" };
   }
   return { ok: true };
+}
+
+const INFERRED_RULE_NOTE = "；当日限购信息缺失，依据当前数据推断";
+export const AWAITING_RULE_CHECK_REASON = "等待当日申购状态和正式净值，确认后判断是否入账";
+
+type HistoricalEvaluation =
+  | { ok: boolean; reason?: string; basis: NonNullable<DCAExecution["ruleBasis"]>; awaiting?: false }
+  | { ok: false; reason: string; basis?: undefined; awaiting: true };
+
+/**
+ * Judge a DCA day the app did not see by the rules in force that day: the
+ * purchase status published with that day's NAV, plus the announced limit.
+ * Falls back to the latest rules (marked as inferred) when neither exists.
+ */
+function evaluateHistoricalFundBuy(holding: Holding, amount: number, alreadyReserved: number, date: string): HistoricalEvaluation {
+  const rows = holding.fundNavHistory ?? [];
+  const row = rows.find((item) => item.date === date);
+  const latest = rows.reduce((max, item) => item.date > max ? item.date : max, "");
+  if (!row && (!latest || date > latest)) return { ok: false, awaiting: true, reason: AWAITING_RULE_CHECK_REASON };
+  const inferred = (): HistoricalEvaluation => {
+    const current = evaluateHoldingBuyStatus(holding, amount, alreadyReserved, { requirePrice: false });
+    return current.ok
+      ? { ok: true, basis: "inferred" }
+      : { ok: false, reason: `${current.reason}${INFERRED_RULE_NOTE}`, basis: "inferred" };
+  };
+  if (!row?.purchaseStatus) return inferred();
+  const dcaMinimum = holding.fundMinDcaAmount ?? holding.fundMinPurchaseAmount;
+  if (dcaMinimum != null && amount + 1e-8 < dcaMinimum) {
+    return { ok: false, reason: `计划金额 ${amount} 元低于定投起点 ${dcaMinimum} 元，自动定投已跳过`, basis: "history" };
+  }
+  if (row.purchaseStatus === "suspended") return { ok: false, reason: "当日基金暂停申购，自动定投已跳过", basis: "history" };
+  if (row.purchaseStatus === "open") return { ok: true, basis: "history" };
+  const announced = fundLimitOnDate(holding.fundLimitNotices, date);
+  if (announced?.limit == null) return inferred();
+  if (amount + alreadyReserved > announced.limit + 1e-8) {
+    return { ok: false, reason: fundLimitReason(`基金限购（${announced.notice.effectiveDate} 起公告限额）`, amount + alreadyReserved, announced.limit), basis: "announcement" };
+  }
+  return { ok: true, basis: "announcement" };
 }
 
 function isFundHolding(holding: Holding | undefined, plan?: DCAPlan) {
@@ -535,6 +575,7 @@ function settlePendingFundExecutions(
   plans: DCAPlan[],
   executions: DCAExecution[],
   asOfDate: string,
+  externalFundOrders: FundOrder[] = [],
 ) {
   const holdingMap = new Map(holdings.map((holding) => [holding.id, holding]));
   const planMap = new Map(plans.map((plan) => [plan.id, plan]));
@@ -607,6 +648,19 @@ function settlePendingFundExecutions(
 
     // Trade rules are evaluated and snapshotted when an order is submitted.
     // A later limit/status change must not retroactively reject an accepted order.
+    // A missed day whose status was unpublished is judged now, by that day's rules.
+    let ruleBasis = execution.ruleBasis;
+    if (execution.awaitingRuleCheck) {
+      const reserved = reservedDcaAmount(holding, execution.actualDate, nextHoldings, nextExecutions, externalFundOrders, execution.id);
+      const evaluation = evaluateHistoricalFundBuy(holding, execution.amount, reserved, execution.actualDate);
+      if (evaluation.awaiting) continue;
+      ruleBasis = evaluation.basis;
+      if (!evaluation.ok) {
+        nextExecutions[i] = { ...execution, status: "skipped", reason: evaluation.reason, ruleBasis, awaitingRuleCheck: undefined };
+        changed = true;
+        continue;
+      }
+    }
 
     const transactionCostProfile = execution.transactionCostProfile === undefined
       ? holding.transactionCostProfile
@@ -636,6 +690,8 @@ function settlePendingFundExecutions(
       navDate: confirmed.navDate,
       confirmedDate: confirmed.confirmedDate,
       reason: undefined,
+      ruleBasis,
+      awaitingRuleCheck: undefined,
     };
     changed = true;
   }
@@ -714,17 +770,35 @@ export function backfillMissingPendingFundExecutions(
         const existingIndex = nextExecutions.findIndex((item) => item.planId === plan.id && item.actualDate === actualDate);
         const existing = nextExecutions[existingIndex];
         const evaluationKey = dcaEvaluationKey(holding, periodPlan);
+        // The trading rules seen on the DCA day decide the order. While that day
+        // lasts, newer same-day rules re-check an accepted order; afterwards the
+        // decision is frozen and never re-checked against later rules.
+        if (existing?.status === "pending" && actualDate === planToday && existing.evaluationKey !== evaluationKey) {
+          const reserved = reservedDcaAmount(holding, actualDate, holdings, nextExecutions, externalFundOrders, existing.id);
+          const evaluation = evaluateHoldingBuyStatus(holding, existing.amount, reserved, { requirePrice: false });
+          // Missing status data never revokes an order accepted on known rules.
+          const rejected = !evaluation.ok && !/暂无法确认交易状态/.test(evaluation.reason ?? "");
+          nextExecutions[existingIndex] = rejected
+            ? { ...existing, status: "skipped", reason: evaluation.reason, evaluationKey, ruleBasis: "day_of" }
+            : { ...existing, evaluationKey, ruleBasis: "day_of" };
+          changed = true;
+          cursor.setDate(cursor.getDate() - 1);
+          continue;
+        }
         const transient = /应用未运行|当日未运行|刷新失败|状态已过期|暂无法确认交易状态/.test(existing?.reason ?? "");
         const ruleFailure = Boolean(existing?.evaluationKey) || /限购|定投起点|不可定投|不可买|暂停|停牌/.test(existing?.reason ?? "");
         const retryable = existing?.status === "skipped" && (transient || (actualDate === planToday && ruleFailure && existing.evaluationKey !== evaluationKey));
         if ((!executionKeys.has(executionKey) && actualDate < planToday) || retryable) {
           const amount = actualDate === planToday ? periodPlan.amount : existing?.amount ?? periodPlan.amount;
-          const reserved = reservedDcaAmount(holding, actualDate, holdings, nextExecutions, externalFundOrders);
-          const evaluation = evaluateHoldingBuyStatus(holding, amount, reserved, { requirePrice: false });
+          const reserved = reservedDcaAmount(holding, actualDate, holdings, nextExecutions, externalFundOrders, existing?.id);
+          // Today is judged by the rules seen now; a missed past day by the rules in force that day.
+          const evaluation: { ok: boolean; reason?: string; basis?: DCAExecution["ruleBasis"]; awaiting?: boolean } = actualDate < planToday
+            ? evaluateHistoricalFundBuy(holding, amount, reserved, actualDate)
+            : { ...evaluateHoldingBuyStatus(holding, amount, reserved, { requirePrice: false }), basis: "day_of" };
           // Leave transient failures retryable when the next refresh succeeds.
-          if (existing && !evaluation.ok) {
-            if (existing.reason !== evaluation.reason || existing.evaluationKey !== evaluationKey || existing.amount !== amount) {
-              nextExecutions[existingIndex] = { ...existing, amount, reason: evaluation.reason, evaluationKey };
+          if (existing && !evaluation.ok && !evaluation.awaiting) {
+            if (existing.reason !== evaluation.reason || existing.evaluationKey !== evaluationKey || existing.amount !== amount || existing.ruleBasis !== evaluation.basis) {
+              nextExecutions[existingIndex] = { ...existing, amount, reason: evaluation.reason, evaluationKey, ruleBasis: evaluation.basis };
               changed = true;
             }
             cursor.setDate(cursor.getDate() - 1);
@@ -739,9 +813,11 @@ export function backfillMissingPendingFundExecutions(
             actualDate,
             amount,
             adjusted: scheduledDate !== actualDate,
-            status: evaluation.ok ? "pending" : "skipped",
+            status: evaluation.ok || evaluation.awaiting ? "pending" : "skipped",
             expectedConfirmDate: computeFundConfirmationDate(periodPlan, actualDate),
             evaluationKey,
+            ruleBasis: evaluation.basis,
+            awaitingRuleCheck: evaluation.awaiting || undefined,
             transactionCostProfile: existing?.transactionCostProfile !== undefined ? existing.transactionCostProfile : normalizeTransactionCostProfile(holding.transactionCostProfile) ?? null,
             reason: evaluation.ok ? "等待正式净值确认后入账" : evaluation.reason,
           };
@@ -810,7 +886,7 @@ export function settleDueDCAPlans(
     nextExecutions.splice(0, nextExecutions.length, ...backfilled.executions);
     changed = true;
   }
-  const pendingState = settlePendingFundExecutions(nextHoldings, nextPlans, nextExecutions, todayForPendingSettlement);
+  const pendingState = settlePendingFundExecutions(nextHoldings, nextPlans, nextExecutions, todayForPendingSettlement, externalFundOrders);
   if (pendingState.changed) {
     nextHoldings.splice(0, nextHoldings.length, ...pendingState.holdings);
     nextExecutions.splice(0, nextExecutions.length, ...pendingState.executions);
@@ -872,10 +948,13 @@ export function settleDueDCAPlans(
     const holdingIndex = nextHoldings.findIndex((item) => item.id === plan.holdingId);
     const holding = holdingIndex >= 0 ? nextHoldings[holdingIndex] : undefined;
     const reserved = holding ? reservedDcaAmount(holding, actualDate, nextHoldings, nextExecutions, externalFundOrders) : 0;
-    const evaluation = evaluateHoldingBuyStatus(holding, plan.amount, reserved,
-      { requirePrice: !isFundHolding(holding, plan) });
+    const historical = holding && isFundHolding(holding, plan) && actualDate < today
+      ? evaluateHistoricalFundBuy(holding, plan.amount, reserved, actualDate)
+      : null;
+    const evaluation: { ok: boolean; reason?: string; basis?: DCAExecution["ruleBasis"] } = historical
+      ?? { ...evaluateHoldingBuyStatus(holding, plan.amount, reserved, { requirePrice: !isFundHolding(holding, plan) }), basis: "day_of" };
 
-    if (!evaluation.ok || !holding) {
+    if ((!evaluation.ok && !historical?.awaiting) || !holding) {
       nextExecutions.unshift({
         id: `dca_exec_${safeUUID()}`,
         planId: plan.id,
@@ -887,6 +966,7 @@ export function settleDueDCAPlans(
         status: "skipped",
         reason: evaluation.reason,
         evaluationKey: holding ? dcaEvaluationKey(holding, plan) : undefined,
+        ruleBasis: holding ? evaluation.basis : undefined,
       });
       executionKeys.add(executionKey);
       nextPlans[i] = { ...currentPlan, nextExecDate: computeNextExec(currentPlan, nextSearchDate, false) };
@@ -906,8 +986,11 @@ export function settleDueDCAPlans(
         adjusted,
         status: "pending",
         expectedConfirmDate: computeFundConfirmationDate(plan, actualDate),
+        evaluationKey: dcaEvaluationKey(holding, plan),
+        ruleBasis: evaluation.basis,
+        awaitingRuleCheck: historical?.awaiting || undefined,
         transactionCostProfile: normalizeTransactionCostProfile(holding.transactionCostProfile) ?? null,
-        reason: "等待正式净值确认后入账",
+        reason: historical?.awaiting ? AWAITING_RULE_CHECK_REASON : "等待正式净值确认后入账",
       });
       executionKeys.add(executionKey);
       nextPlans[i] = { ...currentPlan, nextExecDate: computeNextExec(currentPlan, nextSearchDate, false) };
@@ -988,7 +1071,7 @@ export function settleDueDCAPlans(
     continuePlanIfStillDue(actualDate);
   }
 
-  const finalPendingState = settlePendingFundExecutions(nextHoldings, nextPlans, nextExecutions, todayForPendingSettlement);
+  const finalPendingState = settlePendingFundExecutions(nextHoldings, nextPlans, nextExecutions, todayForPendingSettlement, externalFundOrders);
   if (finalPendingState.changed) {
     nextHoldings.splice(0, nextHoldings.length, ...finalPendingState.holdings);
     nextExecutions.splice(0, nextExecutions.length, ...finalPendingState.executions);

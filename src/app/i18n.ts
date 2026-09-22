@@ -300,6 +300,8 @@ export const appText = {
       posted: "已入账",
       pendingStatus: "待入账",
       skippedStatus: "未入账",
+      failedStatus: "定投失败",
+      ruleBasis: { history: "依据当日申购状态", announcement: "依据公告限额", inferred: "限购依据当前数据推断" },
       amountPosted: "入账金额",
       status: "入账状态",
       futurePreview: "未来 5 次执行预览",
@@ -710,6 +712,8 @@ export const appText = {
       posted: "Posted",
       pendingStatus: "Pending",
       skippedStatus: "Skipped",
+      failedStatus: "DCA failed",
+      ruleBasis: { history: "By that day's purchase status", announcement: "By announced limit", inferred: "Limit inferred from current data" },
       amountPosted: "Posted Amount",
       status: "Status",
       futurePreview: "Next 5 Executions",
@@ -943,6 +947,10 @@ export function translateDcaReason(reason: string | undefined | null, language: 
   reason = conciseDcaReason(reason ?? "");
   if (language === "zh" || !reason) return reason ?? "";
   return reason
+    .replaceAll("等待当日申购状态和正式净值，确认后判断是否入账", "Waiting for that day's purchase status and official NAV before deciding")
+    .replaceAll("当日基金暂停申购，自动定投已跳过", "Subscription was suspended that day; DCA skipped")
+    .replaceAll("；当日限购信息缺失，依据当前数据推断", "; that day's limit is unavailable, inferred from current data")
+    .replace(/（(\d{4}-\d{2}-\d{2}) 起公告限额）/g, " (announced limit from $1)")
     .replaceAll("暂无法确认交易状态，本次未执行", "Trading status unavailable; skipped")
     .replaceAll("当日未运行，已跳过", "App was not running; skipped")
     .replaceAll("正式净值已就绪，等待渠道成交确认", "Official NAV is ready; waiting for channel fill confirmation")
