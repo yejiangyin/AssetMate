@@ -24,6 +24,7 @@ import {
   thesisDriftPrompt,
   portfolioReviewPrompt,
   industryResearchPrompt,
+  eraAlphaPrompt,
   industryFunnelPrompt,
   qualityScreenPrompt,
   bottleneckHunterPrompt,
@@ -46,7 +47,7 @@ import {
 
 export { workflowAgentIds } from "./registry";
 
-export const RESEARCH_WORKFLOW_VERSION = "2026.07.20-ai-berkshire-53d8b76-model-roles";
+export const RESEARCH_WORKFLOW_VERSION = "2026.09.24-ai-berkshire-era-alpha-valuation-audit";
 
 const AGENT_TITLES: Record<ResearchAgentId, string> = {
   "quick-check": "投资快速检查",
@@ -64,6 +65,7 @@ const AGENT_TITLES: Record<ResearchAgentId, string> = {
   "thesis-drift": "论文漂移检测",
   "dyp-ask": "段永平问答",
   "industry-panorama": "产业链全景",
+  "era-alpha-researcher": "时代 α 捕手",
   "industry-funnel": "漏斗筛选",
   "quality-screener": "去劣筛选",
   "bottleneck-hunter": "瓶颈猎手",
@@ -102,6 +104,7 @@ const AGENT_TITLES_EN: Record<ResearchAgentId, string> = {
   "thesis-drift": "Thesis Drift Detection",
   "dyp-ask": "Duan Yongping Q&A",
   "industry-panorama": "Industry Panorama",
+  "era-alpha-researcher": "Era Alpha Research",
   "industry-funnel": "Industry Funnel",
   "quality-screener": "Quality Screen",
   "bottleneck-hunter": "Bottleneck Hunter",
@@ -287,12 +290,14 @@ function investmentResearchPrompt(context: string) {
 
 ## 七、估值与安全边际
 当前估值与历史/同业对比；用乐观、中性、悲观三情景给出假设、内在价值区间和预期回报，不得只给一个目标价。
+历史估值分位只在取得可验证的同口径时间序列后给出，注明观察窗口与亏损年份处理方式；否则明确写“历史分位无法计算”。
+若报告使用十年 IRR 或终值 PE，附“长期估值参数”两列表，逐行给出现金流币种、折现率币种、折现率 r、永续增速 g、稳态增量 ROIC、终值 PE、折现率敏感性（至少两个不同 r 值及其结果）。终值 PE 按 (1-g/ROIC)/(r-g) 计算；输入不足时不输出数值。说明离散风险在情景中的处理，不能用一个未解释的折现率掩盖风险。
 
 ## 八、综合决策备忘录
 输出核心论点、最强反论点、关键假设、红线、催化剂、观察清单和明确结论：通过 / 有条件通过 / 灰色地带 / 不通过。
 
 ## 数据抽检、来源与研究局限
-列出需要二次核验的数据和计算；结尾必须注明不构成投资建议。
+列出关键主张的数值、统计期、可点击来源、反证或口径差异、置信度，以及需要二次核验的数据和计算。观察清单里的触发条件应注明当前基准、指标来源和检查频率；缺少可靠数据时标记“待建立”。结尾必须注明不构成投资建议。
 
 ${context}`;
 }
@@ -503,6 +508,7 @@ export function buildAgentRequest(input: {
   else if (agentId === "thesis-drift") prompt = thesisDriftPrompt(context, thesisDriftContextBlock(input.thesisDriftContext));
   else if (agentId === "portfolio-reviewer") prompt = portfolioReviewPrompt(context, portfolioContextBlock(input.portfolioContext));
   else if (agentId === "industry-panorama") prompt = industryResearchPrompt(context);
+  else if (agentId === "era-alpha-researcher") prompt = eraAlphaPrompt(context, topic);
   else if (agentId === "industry-funnel") prompt = industryFunnelPrompt(context);
   else if (agentId === "quality-screener") prompt = qualityScreenPrompt(context);
   else if (agentId === "bottleneck-hunter") prompt = bottleneckHunterPrompt(context);

@@ -316,6 +316,92 @@ interface ExtractedMetric {
   raw: string;
 }
 
+function longTermValuationRows(markdown: string) {
+  const rows = new Map<string, string>();
+  for (const line of markdown.split(/\r?\n/)) {
+    const cells = line.trim().split("|").slice(1, -1).map((cell) => cell.trim());
+    if (cells.length === 2 && cells[0] && cells[1]) rows.set(cells[0], cells[1]);
+  }
+  return rows;
+}
+
+function valuationRow(rows: Map<string, string>, pattern: RegExp) {
+  return [...rows].find(([label]) => pattern.test(label))?.[1];
+}
+
+function valuationRatio(raw: string | undefined) {
+  if (!raw) return null;
+  const match = raw.match(/^\s*([+-]?\d+(?:\.\d+)?)\s*(%)?\s*$/);
+  if (!match) return null;
+  const value = new Decimal(match[1]!);
+  return match[2] ? value.div(100) : value;
+}
+
+function valuationCurrency(raw: string | undefined) {
+  const value = raw?.trim().toUpperCase();
+  if (!value) return null;
+  if (value === "人民币" || value === "RMB") return "CNY";
+  if (value === "美元") return "USD";
+  if (value === "港元" || value === "港币") return "HKD";
+  return /^[A-Z]{3}$/.test(value) ? value : null;
+}
+
+/** Checks the assumptions the report actually states; no fixed market rates are imposed. */
+export function verifyLongTermValuation(markdown: string): ResearchAuditCheck[] {
+  if (!/(长期估值参数|十年.{0,16}(?:IRR|终值).{0,16}\d|10[ -]?year.{0,16}(?:IRR|terminal).{0,16}\d|终值\s*PE\s*[:：|]\s*\d|terminal\s*P\/?E\s*[:：|]\s*\d)/i.test(markdown)) return [];
+  const rows = longTermValuationRows(markdown);
+  const cashCurrency = valuationCurrency(valuationRow(rows, /^(现金流币种|cash.?flow currency)$/i));
+  const discountCurrency = valuationCurrency(valuationRow(rows, /^(折现率币种|discount.?rate currency)$/i));
+  const r = valuationRatio(valuationRow(rows, /^(折现率\s*r|discount rate\s*r)$/i));
+  const g = valuationRatio(valuationRow(rows, /^(永续增速\s*g|perpetual growth\s*g)$/i));
+  const roic = valuationRatio(valuationRow(rows, /^(稳态增量\s*ROIC|incremental\s*ROIC)$/i));
+  const peText = valuationRow(rows, /^(终值\s*PE|terminal\s*P\/?E)$/i);
+  const reportedPe = peText?.match(/^\s*(\d+(?:\.\d+)?)\s*(?:x|×|倍)?\s*$/i);
+  const sensitivityText = valuationRow(rows, /^(折现率敏感性|discount rate sensitivity)$/i) ?? "";
+  const sensitivityRates = [...sensitivityText.matchAll(/(?:^|[；;,，])\s*(\d+(?:\.\d+)?\s*%)\s*[:：]/g)].map((match) => match[1]!.replace(/\s/g, ""));
+  const checks: ResearchAuditCheck[] = [];
+  if (!cashCurrency || !discountCurrency || !r || !g || !roic || !reportedPe) {
+    checks.push({ id: "terminal-assumptions-coverage", label: "长期估值参数覆盖", status: "warning", detail: "十年估值需在两列表中列出现金流币种、折现率币种、r、g、增量 ROIC 和终值 PE；缺项或格式无法核验" });
+    return checks;
+  }
+  checks.push({
+    id: "terminal-currency",
+    label: "长期估值币种口径",
+    status: cashCurrency === discountCurrency ? "pass" : "fail",
+    detail: cashCurrency === discountCurrency
+      ? `现金流与折现率同为 ${cashCurrency}`
+      : `现金流为 ${cashCurrency}，折现率为 ${discountCurrency}，币种口径不一致`,
+  });
+  const valid = r.gt(0) && r.lt(1) && g.gt(-1) && g.lt(r) && roic.gt(0) && roic.lt(1) && g.lt(roic);
+  if (!valid) {
+    checks.push({ id: "terminal-assumptions", label: "长期估值参数有效性", status: "fail", detail: "要求 0 < r < 100%、-100% < g < r、0 < 增量 ROIC < 100%，且 g < ROIC" });
+    return checks;
+  }
+  const spread = r.minus(g);
+  checks.push({
+    id: "terminal-assumptions",
+    label: "长期估值参数有效性",
+    status: spread.lt(0.05) ? "warning" : "pass",
+    detail: `r−g 为 ${spread.times(100).toDecimalPlaces(2).toString()} 个百分点${spread.lt(0.05) ? "；结果对永续增速敏感，应作为情景展示" : ""}`,
+  });
+  const calculatedPe = new Decimal(1).minus(g.div(roic)).div(spread);
+  const statedPe = new Decimal(reportedPe[1]!);
+  const deviation = calculatedPe.minus(statedPe).abs().div(calculatedPe).times(100);
+  checks.push({
+    id: "terminal-pe-consistency",
+    label: "终值 PE 复算",
+    status: deviation.lte(1) ? "pass" : deviation.lte(5) ? "warning" : "fail",
+    detail: `按 (1−g/ROIC)/(r−g) 计算为 ${calculatedPe.toDecimalPlaces(2).toString()} 倍；报告为 ${statedPe.toString()} 倍，偏差 ${deviation.toDecimalPlaces(2).toString()}%`,
+  });
+  checks.push({
+    id: "terminal-sensitivity",
+    label: "折现率敏感性",
+    status: new Set(sensitivityRates).size >= 2 ? "pass" : "warning",
+    detail: new Set(sensitivityRates).size >= 2 ? "已列出至少两个不同折现率情景" : "请列出至少两个不同折现率及相应结果",
+  });
+  return checks;
+}
+
 function extractMetric(markdown: string, patterns: RegExp[]): ExtractedMetric[] {
   const results: ExtractedMetric[] = [];
   for (const pattern of patterns) {
@@ -339,7 +425,7 @@ export function verifyReportCalculations(
   markdown: string,
   contextPrice?: number,
 ): ResearchAuditCheck[] {
-  const checks: ResearchAuditCheck[] = [];
+  const checks: ResearchAuditCheck[] = verifyLongTermValuation(markdown);
 
   const priceMetrics = extractMetric(markdown, [
     /(?:当前股价|股价|现价|当前价格|current price|price)\s*[:：]?\s*[$￥港元]*\s*([\d,]+\.?\d*\s*(?:万亿|亿|万)?)\s*(?:港元|美元|港币|人民币|元|USD|HKD|CNY|\$|￥)?/gi,

@@ -9,6 +9,7 @@ import {
   verifyTargetedReportCalculations,
   verifyReportCalculations,
   verifyMarketCap,
+  verifyLongTermValuation,
 } from "./financialRigor";
 
 describe("financial rigor", () => {
@@ -44,6 +45,39 @@ describe("financial rigor", () => {
     assert.equal(result.scenarios[0]?.targetPrice, "60");
     assert.equal(result.scenarios[1]?.targetPrice, "121");
     assert.equal(result.weightedTargetPrice, "105.75");
+  });
+
+  test("checks stated terminal assumptions without imposing fixed market rates", () => {
+    const report = [
+      "## 长期估值参数",
+      "| 参数 | 数值 |",
+      "| --- | --- |",
+      "| 现金流币种 | CNY |",
+      "| 折现率币种 | CNY |",
+      "| 折现率 r | 8% |",
+      "| 永续增速 g | 2% |",
+      "| 稳态增量 ROIC | 20% |",
+      "| 终值 PE | 15 倍 |",
+      "| 折现率敏感性 | 7%：18 倍；9%：12.86 倍 |",
+    ].join("\n");
+    const checks = verifyLongTermValuation(report);
+    assert.equal(checks.find((check) => check.id === "terminal-currency")?.status, "pass");
+    assert.equal(checks.find((check) => check.id === "terminal-pe-consistency")?.status, "pass");
+    assert.equal(checks.find((check) => check.id === "terminal-sensitivity")?.status, "pass");
+    assert.equal(checks.find((check) => check.id === "terminal-assumptions")?.status, "pass");
+    assert.equal(verifyLongTermValuation("报告未使用长期终值估值").length, 0);
+  });
+
+  test("flags mismatched currencies, implausible assumptions and wrong terminal math", () => {
+    const base = "## 长期估值参数\n| 现金流币种 | CNY |\n| 折现率币种 | USD |\n| 折现率 r | 8% |\n| 永续增速 g | 4% |\n| 稳态增量 ROIC | 20% |\n| 终值 PE | 10 倍 |\n| 折现率敏感性 | 8%：10 倍 |";
+    const checks = verifyReportCalculations(base);
+    assert.equal(checks.find((check) => check.id === "terminal-currency")?.status, "fail");
+    assert.equal(checks.find((check) => check.id === "terminal-assumptions")?.status, "warning");
+    assert.equal(checks.find((check) => check.id === "terminal-pe-consistency")?.status, "fail");
+    assert.equal(checks.find((check) => check.id === "terminal-sensitivity")?.status, "warning");
+    const invalid = verifyLongTermValuation(base.replace("8%", "3%"));
+    assert.equal(invalid.find((check) => check.id === "terminal-assumptions")?.status, "fail");
+    assert.equal(verifyLongTermValuation("十年 IRR 为 8%，但暂无参数表")[0]?.status, "warning");
   });
 
   test("requires two sources and flags divergent values", () => {
