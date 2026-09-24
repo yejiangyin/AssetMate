@@ -997,6 +997,8 @@ export function AIResearchPanel({
               onChange={(event) => setTopic(event.target.value)}
               placeholder={workflowId === "deep_company_series"
                 ? (isEn ? "e.g. 5 articles, from business model and moat to valuation and risks…" : "例如：5 篇，从商业模式、护城河写到财务、估值与风险…")
+                : workflowId === "era_alpha"
+                ? (isEn ? "e.g. AI compute infrastructure, next-generation batteries…" : "例如：AI 算力基础设施、新一代电池产业链…")
                 : workflowId === "quality_screen"
                 ? (isEn ? "e.g. Hang Seng Index, global cloud computing, China high dividend…" : "例如：恒生指数、全球云计算、中国高股息主题…")
                 : (isEn ? "Enter a topic, question, or industry name…" : "输入主题、问题或行业方向…")}

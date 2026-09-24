@@ -11,7 +11,7 @@ AssetMate, also known as 资产助手, is a browser extension for personal portf
 - Market quote pages for multiple asset types, including stocks, funds, crypto, FX, and common indexes.
 - Recurring investment plan tracking with execution preview, settlement status, and historical records.
 - A unified Research Center combining AI research, strategy backtests, and saved-result comparison.
-- AI Berkshire-aligned 20-skill catalog grouped into Deep Research, Earnings Analysis, Industry Screening, Portfolio Management, and Thinking Tools, plus local backtest interpretation.
+- AI Berkshire-aligned 21-skill catalog grouped into Deep Research, Earnings Analysis, Industry Screening, Portfolio Management, and Thinking Tools, including Era Alpha growth research, plus local backtest interpretation.
 - Per-connection model roles for research, fast tasks, synthesis, and optional independent report audit, with role-aware connection testing and deterministic local checks.
 - Direct browser access to OpenAI Chat Completions, Responses, Anthropic Messages, Gemini native GenerateContent, and Ollama APIs with multiple bring-your-own-key connection profiles.
 - Resumable research jobs, a local report library, Markdown export, source extraction, and report audit labels.
@@ -38,8 +38,8 @@ AssetMate, also known as 资产助手, is a browser extension for personal portf
 The original Backtest navigation item is now the Research Center. Its three views share one workflow:
 
 1. Start from a holding, market-detail page, or custom symbol.
-2. Choose a research workflow. Income Investment adds decision role, target yield, tax residence, and holding-horizon context; WeChat Article executes content research, drafting, editor/reader review, and a final rewrite.
-3. Review the generated report, detected links, cutoff date, and local audit status.
+2. Choose a research workflow. Era Alpha starts from an industry topic and records growth evidence, valuation assumptions, contradictory signals, and observable inflection points. Income Investment adds decision role, target yield, tax residence, and holding-horizon context; WeChat Article executes content research, drafting, editor/reader review, and a final rewrite.
+3. Review the generated report, detected links, cutoff date, and local audit status. When a report states a long-term terminal valuation, local checks compare its cash-flow and discount-rate currencies, validate the assumptions, recalculate terminal PE, and look for discount-rate sensitivity.
 4. Send the same target to the local backtest engine, save scenarios for comparison, and ask AI to interpret a completed backtest.
 
 Research execution runs entirely in the extension UI. Long-running tasks are persisted in IndexedDB and interrupted tasks can resume from completed analyst steps. Reports are also kept in IndexedDB, while small provider settings use Chrome extension storage.

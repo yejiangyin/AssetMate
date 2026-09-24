@@ -10,14 +10,34 @@ describe("AI Berkshire workflow alignment", () => {
     { symbol: "MSFT", name: "Microsoft", market: "US", assetType: "stock", currency: "USD" },
   ];
 
-  test("matches the upstream five-category, twenty-skill catalog", () => {
+  test("matches the upstream five-category, twenty-one-skill catalog", () => {
     assert.deepEqual(WORKFLOW_CATEGORY_ORDER.slice(0, 5), ["deep", "earnings", "industry", "portfolio", "tools"]);
     const upstream = Object.values(WORKFLOW_REGISTRY).filter((workflow) => workflow.origin !== "assetmate");
-    assert.equal(upstream.length, 20);
+    assert.equal(upstream.length, 21);
     assert.deepEqual(
       Object.fromEntries(WORKFLOW_CATEGORY_ORDER.slice(0, 5).map((category) => [category, upstream.filter((workflow) => workflow.category === category).length])),
-      { deep: 5, earnings: 2, industry: 5, portfolio: 5, tools: 3 },
+      { deep: 5, earnings: 2, industry: 6, portfolio: 5, tools: 3 },
     );
+  });
+
+  test("runs era-alpha from an industry topic and requires explicit evidence gaps", () => {
+    const config = getWorkflowConfig("era_alpha");
+    assert.equal(config.canonicalSkill, "era-alpha");
+    assert.equal(config.needsTopicInput, true);
+    assert.deepEqual(config.agentIds, ["era-alpha-researcher"]);
+    const request = buildAgentRequest({
+      workflowId: "era_alpha",
+      agentId: "era-alpha-researcher",
+      publicContext: buildPublicResearchContext({ ...targets[0]!, symbol: "TOPIC", name: "AI 算力", market: "TOPIC" }),
+      topic: "AI 算力",
+      webSearchMode: "off",
+      maxOutputTokens: 8000,
+    });
+    const prompt = request.messages[1]?.content ?? "";
+    assert.match(prompt, /AI 算力/);
+    assert.match(prompt, /高频数据/);
+    assert.match(prompt, /历史分位无法计算/);
+    assert.match(prompt, /反证或口径差异/);
   });
 
   test("keeps multi-target research inside investment-checklist", () => {
