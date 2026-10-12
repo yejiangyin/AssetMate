@@ -8,7 +8,7 @@ import {
   formatYahooTimestamp,
   toYahooSymbol,
 } from "./quoteApi";
-import { withMockFetch } from "../testUtils";
+import { createLocalStorageMock, withMockFetch, withMockWindow } from "../testUtils";
 
 function yahooChartResponse() {
   return {
@@ -368,6 +368,92 @@ describe("Yahoo chart fetchers", () => {
       assert.equal(chart.quote.price, 350);
       assert.deepEqual(chart.points.map((point) => point.close), [345, 350]);
     });
+  });
+
+  test("A-share intraday uses Tencent when EastMoney trends fail, without falling back to Yahoo history", async () => {
+    const requested: string[] = [];
+    await withMockFetch((async (input: string | URL | Request) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.includes("/ulist.np/get")) {
+        return okJson({ data: { diff: [{ f2: 70.86, f3: 0.43, f4: 0.3, f12: "000858", f13: 0, f14: "五粮液", f18: 70.56 }] } });
+      }
+      if (url.includes("/minute/query")) {
+        return { ok: true, text: async () => JSON.stringify({ data: {
+          sz000858: { data: { date: "20261012", data: ["0930 70.57 1352", "1046 70.86 79537"] } },
+        } }) } as Response;
+      }
+      return { ok: false, status: 503, json: async () => ({}), text: async () => "" } as Response;
+    }) as typeof fetch, async () => {
+      const chart = await fetchDetailChart("000858", "A", "fs", true);
+      assert.equal(chart.quote.name, "五粮液");
+      assert.equal(chart.quote.price, 70.86);
+      assert.deepEqual(chart.points.map((point) => point.price), [70.57, 70.86]);
+      assert.equal(chart.points.at(-1)?.timestamp, Date.parse("2026-10-12T10:46:00+08:00"));
+      assert.ok(!requested.some((url) => url.includes("finance.yahoo.com")));
+    });
+  });
+
+  test("intraday persistent caches older than two minutes cannot suppress fresh network data", async () => {
+    const stale = { quote: { price: 69 }, points: [{ time: "15:00", price: 69, timestamp: Date.parse("2026-10-09T15:00:00+08:00") }] };
+    const now = Date.now();
+    const storage = createLocalStorageMock({
+      "asset-helper:chart-cache:v6": JSON.stringify({ version: 1, entries: [
+        { key: "detail-chart::A::000856::fs", savedAt: now - 180000, lastFullRefreshAt: now, data: stale },
+        { key: "yahoo::FSCACHE::fs", savedAt: now - 180000, lastFullRefreshAt: now, data: stale },
+      ] }),
+    });
+    const requested: string[] = [];
+    await withMockWindow({
+      localStorage: storage.localStorage as Storage,
+      location: { protocol: "chrome-extension:", hostname: "test" } as Location,
+    }, async () => {
+      await withMockFetch((async (input: string | URL | Request) => {
+        const url = String(input);
+        requested.push(url);
+        if (url.includes("/trends2/get")) return okJson({ data: { trends: ["2026-10-12 09:30,70,70,70,70,100", "2026-10-12 09:31,71,71,71,71,200"] } });
+        if (url.includes("finance.yahoo.com")) return okJson(yahooChartResponse());
+        return okJson({ data: { diff: [] } });
+      }) as typeof fetch, async () => {
+        const detail = await fetchDetailChart("000856", "A", "fs");
+        const yahoo = await fetchChart("FSCACHE", "fs");
+        assert.deepEqual(detail.points.map((point) => point.price), [70, 71]);
+        assert.deepEqual(yahoo.points.map((point) => point.price), [11, 12]);
+        assert.ok(requested.some((url) => url.includes("/trends2/get")));
+        assert.ok(requested.some((url) => url.includes("finance.yahoo.com")));
+      });
+    });
+  });
+
+  test("A-share index fallback never combines Shanghai index quotes with Shenzhen stock points", async () => {
+    for (const [symbol, code, secid, expectedPrice] of [
+      ["000001", "sh000001", "1.000001", 3812],
+      ["000001.SS", "sh000001", "1.000001", 3812],
+      ["000001.SZ", "sz000001", "0.000001", 11.75],
+      ["000300", "sh000300", "1.000300", 4410],
+    ] as const) {
+      const requested: string[] = [];
+      await withMockFetch((async (input: string | URL | Request) => {
+        const url = String(input);
+        requested.push(url);
+        if (url.includes("/ulist.np/get")) {
+          assert.equal(new URL(url).searchParams.get("secids"), secid);
+          return okJson({ data: { diff: [{ f2: expectedPrice, f12: symbol.slice(0, 6), f13: Number(secid[0]), f14: code, f18: expectedPrice - 1 }] } });
+        }
+        if (url.includes("/minute/query")) {
+          assert.equal(new URL(url).searchParams.get("code"), code);
+          return { ok: true, text: async () => JSON.stringify({ data: {
+            [code]: { data: { date: "20261012", data: [`0930 ${expectedPrice - 1} 100`, `1034 ${expectedPrice} 200`] } },
+          } }) } as Response;
+        }
+        return { ok: false, status: 503, json: async () => ({}), text: async () => "" } as Response;
+      }) as typeof fetch, async () => {
+        const chart = await fetchDetailChart(symbol, "A", "fs", true);
+        assert.equal(chart.quote.price, expectedPrice);
+        assert.equal(chart.points.at(-1)?.price, expectedPrice);
+        assert.ok(requested.some((url) => url.includes(`code=${code}`)));
+      });
+    }
   });
 
   test("fetchChart rejects when all Yahoo chart hosts fail", async () => {

@@ -58,6 +58,8 @@ function toTencentSymbol(symbol: string, market: "A" | "HK"): string {
   }
 
   const raw = symbol.replace(/\.(SS|SZ)$/i, "");
+  if (/\.SS$/i.test(symbol)) return `sh${raw}`;
+  if (/\.SZ$/i.test(symbol)) return `sz${raw}`;
   const isShanghai = /^(5|6)/.test(raw) || /^(11|13)/.test(raw);
   return `${isShanghai ? "sh" : "sz"}${raw}`;
 }
@@ -188,7 +190,7 @@ export async function fetchTencentQuoteFromYahooSymbol(yahooSymbol: string): Pro
     return fetchTencentQuote(yahooSymbol.replace(/\.HK$/i, ""), "HK");
   }
   if (/\.(SS|SZ)$/i.test(yahooSymbol)) {
-    return fetchTencentQuote(yahooSymbol.replace(/\.(SS|SZ)$/i, ""), "A");
+    return fetchTencentQuote(yahooSymbol, "A");
   }
   return null;
 }
@@ -281,7 +283,7 @@ function parseTencentKlineRows(rows: any[], range: string): Array<TencentKlinePo
     .filter((point) => point.rawDate && point.price > 0);
 }
 
-function parseTencentIntradayRows(rows: any[]): TencentIntradayPoint[] {
+function parseTencentIntradayRows(rows: any[], sourceDate?: string): TencentIntradayPoint[] {
   const now = new Date();
   const shanghaiDateParts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Shanghai",
@@ -290,8 +292,12 @@ function parseTencentIntradayRows(rows: any[]): TencentIntradayPoint[] {
     day: "2-digit",
   }).formatToParts(now);
   const getPart = (type: string) => shanghaiDateParts.find((part) => part.type === type)?.value ?? "";
-  const datePrefix = `${getPart("year")}-${getPart("month")}-${getPart("day")}`;
-  const todayLabel = now.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric", timeZone: "Asia/Shanghai" });
+  const datePrefix = sourceDate && /^\d{8}$/.test(sourceDate)
+    ? `${sourceDate.slice(0, 4)}-${sourceDate.slice(4, 6)}-${sourceDate.slice(6, 8)}`
+    : `${getPart("year")}-${getPart("month")}-${getPart("day")}`;
+  const dateLabel = new Date(`${datePrefix}T00:00:00+08:00`).toLocaleDateString("zh-CN", {
+    month: "numeric", day: "numeric", timeZone: "Asia/Shanghai",
+  });
   const points = rows
     .map((row) => {
       const parts = String(row ?? "").trim().split(/\s+/);
@@ -302,8 +308,8 @@ function parseTencentIntradayRows(rows: any[]): TencentIntradayPoint[] {
       const time = `${rawTime.slice(0, 2)}:${rawTime.slice(2)}`;
       return {
         time,
-        timestamp: Date.parse(`${datePrefix}T${time}:00`),
-        dateLabel: todayLabel,
+        timestamp: Date.parse(`${datePrefix}T${time}:00+08:00`),
+        dateLabel,
         price,
         volume,
         open: price,
@@ -376,8 +382,9 @@ export async function fetchTencentIntraday(symbol: string, market: string): Prom
     const text = await fetchTencentTextWithTimeout(url);
     if (!text) return null;
     const json = parseTencentKlineJson(text);
-    const rows: any[] = json?.data?.[qs]?.data?.data ?? [];
-    const points = parseTencentIntradayRows(rows);
+    const data = json?.data?.[qs]?.data;
+    const rows: any[] = data?.data ?? [];
+    const points = parseTencentIntradayRows(rows, data?.date);
     return points.length > 1 ? points : null;
   } catch {
     return null;

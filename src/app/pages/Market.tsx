@@ -250,7 +250,7 @@ type MarketPageCache = {
 
 let marketPageCache: MarketPageCache | null = null;
 
-const MARKET_PAGE_CACHE_KEY = "asset-helper:market-page-cache:v6";
+const MARKET_PAGE_CACHE_KEY = "asset-helper:market-page-cache:v7";
 const FALLBACK_MARKET_PAGE_CACHE_TTL = 5 * 60 * 1000;
 const CLEAR_RUNTIME_CACHES_EVENT = "asset-helper:clear-runtime-caches";
 
@@ -629,8 +629,8 @@ export function Market() {
   }, [doRefresh, globalIsRefreshing, refreshInterval]);
 
   // Follow the global holdings refresh cycle so settings-based auto refresh
-  // also keeps the market page in sync. Uses cache (force=false) to avoid
-  // redundant network requests if data was recently fetched.
+  // also keeps the market page in sync. Bypass stale caches while retaining
+  // in-flight deduplication across market/detail requests.
   useEffect(() => {
     if (!globalLastRefreshAt) return;
     if (bootstrappedFromFreshCacheRef.current) {
@@ -640,7 +640,7 @@ export function Market() {
     if (lastSyncedRefreshRef.current === globalLastRefreshAt) return;
     lastSyncedRefreshRef.current = globalLastRefreshAt;
     const source = indicesRef.current.length ? indicesRef.current : (readMarketPageCache()?.indices ?? INDICES);
-    void doRefresh(source, false, globalLastRefreshAt, false);
+    void doRefresh(source, true, globalLastRefreshAt, false);
   }, [doRefresh, globalLastRefreshAt]);
 
   useEffect(() => subscribeQuoteSync((payload) => {

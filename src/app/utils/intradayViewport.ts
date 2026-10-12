@@ -1,5 +1,38 @@
 import type { ChartPoint } from "../services/quoteApi";
 
+export function pickBestIntradayPoints(
+  market: string,
+  symbol: string,
+  ...groups: Array<ChartPoint[] | null | undefined>
+) {
+  let best: ChartPoint[] = [];
+  let bestTimestamp = -1;
+  let bestCoverage = 0;
+  for (const group of groups) {
+    const points = filterLatestIntradayDay(
+      (group ?? []).filter((point) => Number.isFinite(point.price) && point.price > 0),
+      market,
+      symbol,
+    );
+    if (!points.length) continue;
+    const latestTimestamp = points.reduce((latest, point) =>
+      typeof point.timestamp === "number" && Number.isFinite(point.timestamp)
+        ? Math.max(latest, point.timestamp)
+        : latest, 0);
+    const minutes = points.map((point) => timeToMinutes(point.time)).filter(Number.isFinite);
+    const span = minutes.length > 1 ? Math.max(...minutes) - Math.min(...minutes) : 0;
+    const coverage = points.length * 10000 + span;
+    // A full previous session must never displace a shorter, newer session.
+    // Coverage only breaks ties between series ending at the same instant.
+    if (latestTimestamp > bestTimestamp || (latestTimestamp === bestTimestamp && coverage > bestCoverage)) {
+      best = points;
+      bestTimestamp = latestTimestamp;
+      bestCoverage = coverage;
+    }
+  }
+  return best;
+}
+
 function timeToMinutes(time: string) {
   const [hour = "0", minute = "0"] = time.split(":");
   return Number(hour ?? "0") * 60 + Number(minute ?? "0");

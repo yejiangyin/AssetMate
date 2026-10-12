@@ -111,7 +111,7 @@ describe("Tencent quote service", () => {
         text: async () => JSON.stringify({
           data: {
             sh600900: {
-              data: { data: ["0930 10 100", "0931 10.5 250"] },
+              data: { date: "20260619", data: ["0930 10 100", "0931 10.5 250"] },
             },
           },
         }),
@@ -122,7 +122,28 @@ describe("Tencent quote service", () => {
 
       assert.deepEqual(kline?.map((point) => point.close), [11, 13]);
       assert.deepEqual(intraday?.map((point) => point.volume), [100, 150]);
+      assert.equal(intraday?.[0]?.timestamp, Date.parse("2026-06-19T09:30:00+08:00"));
+      assert.equal(intraday?.[0]?.dateLabel, "6/19");
       assert.equal(signalRequests.length, 2);
+    });
+  });
+
+  test("preserves Shanghai/ Shenzhen suffixes for colliding stock and index codes", async () => {
+    const requested: string[] = [];
+    await withMockFetch((async (input: string | URL | Request) => {
+      const url = String(input);
+      requested.push(url);
+      const code = new URL(url).searchParams.get("code") ?? "sh000001";
+      return { ok: true, text: async () => JSON.stringify({ data: {
+        [code]: { data: { date: "20261012", data: ["0930 3810 100", "0931 3812 200"] } },
+      } }) } as Response;
+    }) as typeof fetch, async () => {
+      await fetchTencentIntraday("000001.SS", "A");
+      await fetchTencentIntraday("000001.SZ", "A");
+      await fetchTencentIntraday("000300.SS", "A");
+      assert.ok(requested[0]?.includes("code=sh000001"));
+      assert.ok(requested[1]?.includes("code=sz000001"));
+      assert.ok(requested[2]?.includes("code=sh000300"));
     });
   });
 

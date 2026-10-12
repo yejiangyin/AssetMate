@@ -36,6 +36,8 @@ describe("toEastMoneySecid", () => {
     assert.equal(toEastMoneySecid("000002.SZ", "A"), "0.000002");
     assert.equal(toEastMoneySecid("00700", "HK"), "116.00700");
     assert.equal(toEastMoneySecid("000001", "A"), "1.000001");
+    assert.equal(toEastMoneySecid("000001.SS", "A"), "1.000001");
+    assert.equal(toEastMoneySecid("000001.SZ", "A"), "0.000001");
     assert.equal(toEastMoneySecid("HSTECH", "HK"), "124.HSTECH");
     assert.equal(toEastMoneySecid("^N225", "INDEX"), "100.N225");
     assert.equal(toEastMoneySecid("JPYCNY=X", "FX"), "120.JPYCNYC");

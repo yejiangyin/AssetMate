@@ -456,6 +456,7 @@ function detailYahooSymbol(symbol: string, market: string) {
   }
   const aRaw = symbol.replace(/\.(SS|SZ)$/i, "");
   if (market === "A" || (market === "INDEX" && A_INDEX_SYMBOLS.has(aRaw))) {
+    if (/\.(SS|SZ)$/i.test(symbol)) return symbol;
     return A_INDEX_YAHOO_SYMBOL[aRaw] ?? toYahooSymbol(aRaw, market);
   }
   return symbol;
@@ -895,7 +896,7 @@ async function fetchEastMoneyGlobalFallback(symbol: string, market: string, rang
 ══════════════════════════════════════════════════════════ */
 const CACHE_TTL = 2 * 60 * 1000;
 const CACHE_MAX_ITEMS = 80;
-const PERSISTENT_CHART_STORAGE_KEY = "asset-helper:chart-cache:v5";
+const PERSISTENT_CHART_STORAGE_KEY = "asset-helper:chart-cache:v6";
 const PERSISTENT_FUND_HISTORY_STORAGE_KEY = "asset-helper:fund-history-cache:v1";
 const PERSISTENT_CHART_MAX_ITEMS = 36;
 const PERSISTENT_FUND_HISTORY_MAX_ITEMS = 60;
@@ -1064,7 +1065,7 @@ export async function fetchChart(yahooSymbol: string, range: TimeRange, force = 
   if (!force) {
     const hit = getCached(key);
     if (hit) return hit;
-    const persisted = getPersistentChart(`yahoo::${key}`);
+    const persisted = getPersistentChart(`yahoo::${key}`, range === "fs" ? CACHE_TTL : PERSISTENT_CHART_TTL);
     if (persisted) {
       setCached(key, persisted);
       return persisted;
@@ -1397,7 +1398,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
       const hit = getCached(detailChartKey);
       // Detail charts should not be blocked by a stale quote-only cache entry.
       if (hit && hasRealChartPoints(hit.points)) return hit;
-      const persisted = getPersistentChart(detailChartKey);
+      const persisted = getPersistentChart(detailChartKey, range === "fs" ? CACHE_TTL : PERSISTENT_CHART_TTL);
       if (persisted) {
         setCached(detailChartKey, persisted);
         return persisted;
@@ -1411,14 +1412,15 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     const rawSymbol = market === "HK"
       ? symbol.replace(/^\^/, "").replace(/\.HK$/i, "")
       : symbol.replace(/\.(SS|SZ)$/i, "");
+    const sourceSymbol = market === "A" ? detailYahooSymbol(symbol, market) : rawSymbol;
     let preloadedEastMoneyQuote: Awaited<ReturnType<typeof fetchEastMoneyQuoteBySymbol>> | null | undefined;
 
     if (market === "HK" && range === "fs") {
       // EastMoney HK trend can report a non-zero total with an empty trends array.
       // In extensions Yahoo can also be rate-limited, so prefer Tencent's direct intraday feed.
       const [tencentIntradayResult, eastMoneyQuoteResult] = await Promise.allSettled([
-        fetchTencentIntraday(rawSymbol, market),
-        fetchEastMoneyQuoteBySymbol(rawSymbol, market),
+        fetchTencentIntraday(sourceSymbol, market),
+        fetchEastMoneyQuoteBySymbol(sourceSymbol, market),
       ]);
       const tencentPoints = tencentIntradayResult.status === "fulfilled" ? tencentIntradayResult.value : null;
       const emQuote = eastMoneyQuoteResult.status === "fulfilled" ? eastMoneyQuoteResult.value : null;
@@ -1449,7 +1451,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
 
       const isHkIndex = HK_INDEX_SYMBOLS.has(rawSymbol.toUpperCase());
       const [eastMoneyResult, yahooData] = await Promise.all([
-        fetchEastMoneyChart(rawSymbol, market, toEastMoneyChartRange(range), { preloadedQuote: emQuote }).catch(() => null),
+        fetchEastMoneyChart(sourceSymbol, market, toEastMoneyChartRange(range), { preloadedQuote: emQuote }).catch(() => null),
         fetchChart(detailYahooSymbol(symbol, market), range, force).catch(() => null),
       ]);
 
@@ -1471,8 +1473,8 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     if (market === "HK" && range !== "fs") {
       const [yahooResult, eastMoneyQuoteResult, tencentKlineResult] = await Promise.allSettled([
         fetchChart(detailYahooSymbol(symbol, market), range, force),
-        fetchEastMoneyQuoteBySymbol(rawSymbol, market),
-        fetchTencentKline(rawSymbol, market, range),
+        fetchEastMoneyQuoteBySymbol(sourceSymbol, market),
+        fetchTencentKline(sourceSymbol, market, range),
       ]);
       const yahooData = yahooResult.status === "fulfilled" ? yahooResult.value : null;
       const emQuote = eastMoneyQuoteResult.status === "fulfilled" ? eastMoneyQuoteResult.value : null;
@@ -1501,7 +1503,7 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     }
 
     try {
-      const result = await fetchEastMoneyChart(rawSymbol, market, toEastMoneyChartRange(range), {
+      const result = await fetchEastMoneyChart(sourceSymbol, market, toEastMoneyChartRange(range), {
         preloadedQuote: preloadedEastMoneyQuote,
       });
       const data = {
@@ -1526,8 +1528,18 @@ export async function fetchDetailChart(symbol: string, market: string, range: Ti
     } catch {
       const eastMoneyQuote = preloadedEastMoneyQuote !== undefined
         ? preloadedEastMoneyQuote
-        : await fetchEastMoneyQuoteBySymbol(rawSymbol, market).catch(() => null);
-      const tencent = await fetchTencentQuote(rawSymbol, market).catch(() => null);
+        : await fetchEastMoneyQuoteBySymbol(sourceSymbol, market).catch(() => null);
+      const tencent = await fetchTencentQuote(sourceSymbol, market).catch(() => null);
+      if (market === "A" && range === "fs") {
+        const tencentPoints = await fetchTencentIntraday(sourceSymbol, market).catch(() => null);
+        if (tencentPoints?.length) {
+          const liveQuote: QuoteInfo | null = eastMoneyQuote?.price && eastMoneyQuote.price > 0
+            ? { ...eastMoneyQuote, isLive: true }
+            : quoteFromTencent(rawSymbol, tencent)?.quote ?? null;
+          const data = chartDataFromPoints(rawSymbol, liveQuote?.name ?? rawSymbol, tencentPoints, liveQuote);
+          if (data) return storeDetailChart(data);
+        }
+      }
       const cachedDetail = getCached(detailChartKey);
       let yahooData: ChartData | null = null;
       try {

@@ -15,7 +15,7 @@ import {
   RANGE_TABS, FUND_RANGE_TABS, TimeRange, ChartData, ChartPoint,
 } from "../services/quoteApi";
 import { emitQuoteSync, getLatestSyncedQuote, isSameQuoteTarget, subscribeQuoteSync } from "../services/quoteSync";
-import { buildIntradayViewportPoints, US_SESSION_LABELS, usSessionHasData, pickDefaultUsSession, type UsSessionType } from "../utils/intradayViewport";
+import { buildIntradayViewportPoints, pickBestIntradayPoints, US_SESSION_LABELS, usSessionHasData, pickDefaultUsSession, type UsSessionType } from "../utils/intradayViewport";
 import { currencySymbol, formatExactMoney, formatExactNumber, formatFixedNumber, formatPercent } from "../utils/numberFormat";
 import { getMarketBadgeWithBg } from "../utils/marketBadge";
 import type { Language } from "../context/AppContext";
@@ -544,31 +544,6 @@ function formatChartAxisTime(value: unknown, range: TimeRange, isFund: boolean) 
 function timeToMinutes(time: string) {
   const [hour = "0", minute = "0"] = time.split(":");
   return Number(hour) * 60 + Number(minute);
-}
-
-function intradayPointCoverageScore(points: ChartPoint[]) {
-  const valid = points.filter((point) => point.price > 0);
-  if (!valid.length) return 0;
-  const minutes = valid
-    .map((point) => timeToMinutes(point.time))
-    .filter((value) => Number.isFinite(value))
-    .sort((a, b) => a - b);
-  const span = minutes.length > 1 ? Math.max(0, minutes[minutes.length - 1]! - minutes[0]!) : 0;
-  return valid.length * 10000 + span;
-}
-
-function pickBestIntradayPoints(...groups: Array<ChartPoint[] | null | undefined>) {
-  let best: ChartPoint[] = [];
-  let bestScore = 0;
-  for (const group of groups) {
-    if (!group?.length) continue;
-    const score = intradayPointCoverageScore(group);
-    if (score > bestScore) {
-      best = group;
-      bestScore = score;
-    }
-  }
-  return best;
 }
 
 function hasMeaningfulQuoteDelta(quote: ChartData["quote"] | null | undefined) {
@@ -1404,6 +1379,7 @@ export function StockDetail() {
         detailTarget.market === "FUND" ? detailTarget.displaySymbol : detailTarget.yahooSymbol,
         detailTarget.market,
         r,
+        false,
         force,
       );
       const fallback = fallbackQuoteData(detailTarget, language);
@@ -1443,6 +1419,8 @@ export function StockDetail() {
       const fallbackFsPoints = detailTarget.fallbackQuote?.points?.filter((point) => point.price > 0) ?? [];
       const preferredFsPoints = r === "fs"
         ? pickBestIntradayPoints(
+          detailTarget.market,
+          detailTarget.yahooSymbol,
           result.points,
           currentHasRealPoints && existingData ? existingData.points : [],
           syncedFsPoints,
@@ -1484,6 +1462,8 @@ export function StockDetail() {
       const fallbackFsPoints = detailTarget.fallbackQuote?.points?.filter((point) => point.price > 0) ?? [];
       const preferredFsPoints = r === "fs"
         ? pickBestIntradayPoints(
+          detailTarget.market,
+          detailTarget.yahooSymbol,
           currentHasRealPoints && existingData ? existingData.points : [],
           syncedFsPoints,
           fallbackFsPoints,
@@ -1611,7 +1591,7 @@ export function StockDetail() {
     if (!detailTarget || !lastRefreshAt) return;
     if (lastSyncedRefreshRef.current === lastRefreshAt) return;
     lastSyncedRefreshRef.current = lastRefreshAt;
-    void load(range);
+    void load(range, { force: true });
   }, [lastRefreshAt, detailTarget, range, load]);
 
   useEffect(() => subscribeQuoteSync((payload) => {
@@ -1627,7 +1607,7 @@ export function StockDetail() {
         if (range === "fs" && payload.range === "fs") {
           return {
             quote: payload.quote,
-            points: payload.points ?? [],
+            points: pickBestIntradayPoints(detailTarget.market, detailTarget.yahooSymbol, payload.points),
           };
         }
         return current;
@@ -1635,7 +1615,7 @@ export function StockDetail() {
       return {
         quote: payload.quote,
         points: range === "fs" && payload.range === "fs" && payload.points?.length
-          ? payload.points
+          ? pickBestIntradayPoints(detailTarget.market, detailTarget.yahooSymbol, payload.points, current.points)
           : current.points,
       };
     });
