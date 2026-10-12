@@ -273,15 +273,15 @@ function normalizeSearchItem(raw: any): EastMoneySecurity | null {
 }
 
 export function toEastMoneySecid(symbol: string, market: string) {
+  const raw = symbol.replace(/\.(SS|SZ|HK)$/gi, "");
+  // The same six-digit code can identify a Shanghai index and a Shenzhen stock.
+  if (market === "A" && /\.SS$/i.test(symbol)) return `1.${raw}`;
+  if (market === "A" && /\.SZ$/i.test(symbol)) return `0.${raw}`;
   const directIndexMatch = EASTMONEY_INDEX_SECID[`${market}:${symbol.toUpperCase()}`];
   if (directIndexMatch) return directIndexMatch;
-  const raw = symbol.replace(/\.(SS|SZ|HK)$/gi, "");
   const rawDirectMatch = EASTMONEY_INDEX_SECID[`${market}:${raw.toUpperCase()}`];
   if (rawDirectMatch) return rawDirectMatch;
   if (market === "A") {
-    const withSuffix = symbol.toUpperCase();
-    if (withSuffix.endsWith(".SS")) return `1.${raw}`;
-    if (withSuffix.endsWith(".SZ")) return `0.${raw}`;
     const isShanghai = /^(5|6|9)/.test(raw) || /^(11|13)/.test(raw);
     return `${isShanghai ? 1 : 0}.${raw}`;
   }

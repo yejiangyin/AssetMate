@@ -3,9 +3,42 @@ import { describe, test } from "node:test";
 import {
   buildIntradayViewportPoints,
   filterLatestIntradayDay,
+  pickBestIntradayPoints,
   pickDefaultUsSession,
   usSessionHasData,
 } from "./intradayViewport";
+
+describe("pickBestIntradayPoints", () => {
+  const point = (date: string, time: string, price: number) => ({
+    time, price, timestamp: Date.parse(`${date}T${time}:00+08:00`),
+  });
+
+  test("prefers today's shorter series over a full previous trading day", () => {
+    const historical = Array.from({ length: 241 }, (_, index) => point("2026-10-09", "15:00", 69 + index / 1000));
+    const fresh = [point("2026-10-12", "09:30", 70.57), point("2026-10-12", "10:46", 70.86)];
+    assert.deepEqual(pickBestIntradayPoints("A", "000858", fresh, historical, historical), fresh);
+  });
+
+  test("prefers a later update even when an earlier series has more points", () => {
+    const old = [point("2026-10-12", "09:30", 70), point("2026-10-12", "09:31", 71), point("2026-10-12", "09:32", 72)];
+    const fresh = [point("2026-10-12", "09:30", 70), point("2026-10-12", "09:33", 73)];
+    assert.deepEqual(pickBestIntradayPoints("A", "000858", old, fresh), fresh);
+  });
+
+  test("compares latest-day coverage rather than a multi-day source's total length", () => {
+    const first = point("2026-10-12", "09:30", 70);
+    const middle = point("2026-10-12", "09:31", 71);
+    const last = point("2026-10-12", "09:32", 72);
+    const historical = Array.from({ length: 241 }, () => point("2026-10-09", "15:00", 69));
+    assert.deepEqual(pickBestIntradayPoints("A", "000858", [...historical, first, last], [first, middle, last]), [first, middle, last]);
+  });
+
+  test("keeps the complete US session across midnight and retains fallbacks on failure", () => {
+    const fresh = [point("2026-10-12", "21:30", 100), point("2026-10-13", "04:00", 101)];
+    assert.deepEqual(pickBestIntradayPoints("US", "AAPL", [], null, fresh), fresh);
+    assert.deepEqual(pickBestIntradayPoints("A", "000858", [], [{ time: "09:30", price: 70 }]), [{ time: "09:30", price: 70 }]);
+  });
+});
 
 describe("buildIntradayViewportPoints", () => {
   test("uses zero-padded trading-day keys when selecting latest US session", () => {
