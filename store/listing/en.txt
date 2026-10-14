@@ -1,0 +1,9 @@
+AssetMate helps you record your holdings and review changes in their value and returns from your browser. Price charts provide context for the performance of your holdings.
+
+You can organize your holdings, review portfolio summaries and historical returns, record recurring investment plans, and open charts for a selected asset.
+
+The Research Center supports historical strategy backtesting and research report management. Optional AI research requires you to configure a model service. Research requests are sent directly to the service you select.
+
+Portfolio records are stored in your browser. Market queries and research features connect to external services. Network availability and the services' update frequency can affect the information displayed.
+
+This extension is for personal record keeping and research reference. It does not provide investment advice or execute trades.
