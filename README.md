@@ -126,6 +126,14 @@ pnpm run build:store
 
 The generated extension files are written to `dist/`.
 
+## Chrome Web Store Listing
+
+Use [the Chinese listing](store/listing/zh-CN.txt) and [the English listing](store/listing/en.txt) as the complete localized detailed descriptions in the Chrome Web Store Developer Dashboard. Replace the previous descriptions rather than appending these paragraphs. The dashboard manages listing text separately from the uploaded extension ZIP.
+
+The Chinese short description matches `public/manifest.json`: “记录持仓与收益，查看行情变化，辅助个人资产管理。” For the English short description, use “Track your holdings and returns, and review market changes in your browser.”
+
+These descriptions explain the user's workflow without listing markets, regions, asset categories or model-provider brands as keywords. Google identifies excessive or irrelevant metadata as [keyword stuffing, notification ID Yellow Argon](https://developer.chrome.com/docs/webstore/troubleshooting#keyword-stuffing). Check every listing language when resubmitting; editing the extension manifest does not replace the dashboard's detailed descriptions.
+
 ## Load In Chrome
 
 1. Run `pnpm run build:extension`.
