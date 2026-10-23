@@ -143,39 +143,42 @@ export function AISettings() {
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-app-bg">
-      <header className="flex h-[50px] shrink-0 items-center gap-2 border-b border-app-border bg-app-bg px-3">
-        <button type="button" onClick={() => navigate("/settings")} className="flex h-8 w-8 items-center justify-center rounded-lg bg-app-card text-tm" aria-label={isEn ? "Back to settings" : "返回设置"}>
-          <ArrowLeft size={15} />
-        </button>
-        <div className="min-w-0 flex-1">
-          <p className="truncate text-[14px] font-semibold text-tp">{isEn ? "AI research connections" : "AI 投研连接"}</p>
-          <p className="truncate text-[12px] text-tmi">{isEn ? "Models, web search and professional data stay under your control" : "统一管理模型、联网搜索与专业数据"}</p>
-        </div>
-        <div className="flex items-center gap-1 rounded-full bg-[rgba(49,208,139,0.1)] px-2 py-1 text-[12px] font-medium text-[#31D08B]">
-          <ShieldCheck size={11} />{isEn ? "Local" : "本地直连"}
-        </div>
-      </header>
-
+      {/* A picker/editor pins its own header as the top bar, so only one back button shows. */}
       {view === "list" && (
-        <div className="shrink-0 px-3 pb-1 pt-3">
-          <div className="grid grid-cols-3 gap-1 rounded-xl border border-app-border bg-app-card p-1" role="tablist" aria-label={isEn ? "AI connection sections" : "AI 连接设置页签"}>
-            {TABS.map(({ id, icon: Icon, zh, en }) => {
-              const active = tab === id;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  role="tab"
-                  aria-selected={active}
-                  onClick={() => selectTab(id)}
-                  className={`flex h-9 items-center justify-center gap-1.5 rounded-lg text-[12px] font-semibold transition-colors ${active ? "bg-[rgba(79,156,249,0.13)] text-app-accent" : "text-tm"}`}
-                >
-                  <Icon size={13} />{isEn ? en : zh}
-                </button>
-              );
-            })}
+        <>
+          <header className="flex h-[50px] shrink-0 items-center gap-2 border-b border-app-border bg-app-bg px-3">
+            <button type="button" onClick={() => navigate("/settings")} className="flex h-8 w-8 items-center justify-center rounded-lg bg-app-card text-tm" aria-label={isEn ? "Back to settings" : "返回设置"}>
+              <ArrowLeft size={15} />
+            </button>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-[14px] font-semibold text-tp">{isEn ? "AI research connections" : "AI 投研连接"}</p>
+              <p className="truncate text-[12px] text-tmi">{isEn ? "Models, web search and professional data stay under your control" : "统一管理模型、联网搜索与专业数据"}</p>
+            </div>
+            <div className="flex items-center gap-1 rounded-full bg-[rgba(49,208,139,0.1)] px-2 py-1 text-[12px] font-medium text-[#31D08B]">
+              <ShieldCheck size={11} />{isEn ? "Local" : "本地直连"}
+            </div>
+          </header>
+
+          <div className="shrink-0 px-3 pb-1 pt-3">
+            <div className="grid grid-cols-3 gap-1 rounded-xl border border-app-border bg-app-card p-1" role="tablist" aria-label={isEn ? "AI connection sections" : "AI 连接设置页签"}>
+              {TABS.map(({ id, icon: Icon, zh, en }) => {
+                const active = tab === id;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    onClick={() => selectTab(id)}
+                    className={`flex h-9 items-center justify-center gap-1.5 rounded-lg text-[12px] font-semibold transition-colors ${active ? "bg-[rgba(79,156,249,0.13)] text-app-accent" : "text-tm"}`}
+                  >
+                    <Icon size={13} />{isEn ? en : zh}
+                  </button>
+                );
+              })}
+            </div>
           </div>
-        </div>
+        </>
       )}
 
       <main ref={mainRef} className="min-h-0 flex-1 overflow-y-auto px-3 pb-3 pt-2" style={{ scrollbarWidth: "none" }}>

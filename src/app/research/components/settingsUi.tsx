@@ -180,14 +180,16 @@ export function EditorHeader({
   subtitle?: string;
   actions?: ReactNode;
 }) {
+  // Replaces the page header while a picker/editor is open (AISettings hides its own), so it
+  // bleeds over the pane's px-3/pt-2 padding and stays pinned like a top bar.
   return (
-    <div className="mb-2.5 flex items-center gap-2">
-      <button type="button" onClick={onBack} aria-label={backLabel} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-app-border bg-app-card text-tm">
-        <ArrowLeft size={14} />
+    <div className="sticky -top-2 z-20 -mx-3 -mt-2 mb-2.5 flex h-[50px] items-center gap-2 border-b border-app-border bg-app-bg px-3">
+      <button type="button" onClick={onBack} aria-label={backLabel} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-app-card text-tm">
+        <ArrowLeft size={15} />
       </button>
       <div className="min-w-0 flex-1">
-        <p className="truncate text-[13px] font-semibold leading-4 text-tp">{title}</p>
-        {subtitle && <p className="mt-0.5 truncate text-[11px] leading-4 text-tmi">{subtitle}</p>}
+        <p className="truncate text-[14px] font-semibold text-tp">{title}</p>
+        {subtitle && <p className="truncate text-[12px] text-tmi">{subtitle}</p>}
       </div>
       {actions && <div className="flex shrink-0 items-center gap-1.5">{actions}</div>}
     </div>
