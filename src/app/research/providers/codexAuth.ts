@@ -22,6 +22,7 @@ export const CODEX_CALLBACK_MESSAGE = "asset-helper:codex-oauth-callback";
 const PENDING_KEY = "asset-helper:codex-oauth-pending:v1";
 const CALLBACK_KEY = "asset-helper:codex-oauth-callback:v1";
 const REFRESH_MARGIN_MS = 60_000;
+const AUTH_REQUEST_TIMEOUT_MS = 15_000;
 const PENDING_TTL_MS = 15 * 60_000;
 const CLIENT_VERSION_KEY = "asset-helper:codex-client-version:v1";
 const CLIENT_VERSION_TTL_MS = 24 * 3600_000;
@@ -258,25 +259,38 @@ export function importCodexAuthJson(text: string): CodexCredentials {
 }
 
 async function postToken(body: BodyInit, contentType: string) {
-  let response: Response;
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = globalThis.setTimeout(() => {
+      reject(new CodexAuthError("ChatGPT 登录授权或续期超时（15 秒），模型请求尚未完成鉴权；请检查 OpenAI 登录服务连接后重试"));
+      controller.abort();
+    }, AUTH_REQUEST_TIMEOUT_MS);
+  });
   try {
-    response = await fetch(`${CODEX_ISSUER}/oauth/token`, {
-      method: "POST",
-      headers: { "Content-Type": contentType },
-      body,
-    });
-  } catch {
+    return await Promise.race([deadline, (async () => {
+      const response = await fetch(`${CODEX_ISSUER}/oauth/token`, {
+        method: "POST",
+        headers: { "Content-Type": contentType },
+        body,
+        signal: controller.signal,
+      });
+      const payload: unknown = await response.json();
+      if (!response.ok) {
+        const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+        const error = record.error;
+        const detail = stringValue(record.error_description)
+          ?? (typeof error === "string" ? error : error && typeof error === "object" ? stringValue((error as Record<string, unknown>).message) : undefined);
+        throw new CodexAuthError(detail || `OpenAI 登录服务返回 HTTP ${response.status}`);
+      }
+      return payload;
+    })()]);
+  } catch (error) {
+    if (error instanceof CodexAuthError) throw error;
     throw new CodexAuthError("无法连接 OpenAI 登录服务，请检查网络与域名权限 / Cannot reach OpenAI sign-in");
+  } finally {
+    globalThis.clearTimeout(timeout);
   }
-  const payload: unknown = await response.json().catch(() => null);
-  if (!response.ok) {
-    const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-    const error = record.error;
-    const detail = stringValue(record.error_description)
-      ?? (typeof error === "string" ? error : error && typeof error === "object" ? stringValue((error as Record<string, unknown>).message) : undefined);
-    throw new CodexAuthError(detail || `OpenAI 登录服务返回 HTTP ${response.status}`);
-  }
-  return payload;
 }
 
 export async function exchangeCodexAuthorizationCode(code: string, verifier: string) {

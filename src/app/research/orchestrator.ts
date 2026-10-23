@@ -461,6 +461,10 @@ export async function runResearchJob(
       // Reasoning models think for a while before writing; say so once per stretch of thinking.
       let thinking = false;
       for await (const event of provider.run(request, options.signal)) {
+        if (event.type === "response_started") {
+          options.onProgress?.({ job, message: message("模型已连接，等待分析或搜索结果", "Model connected; waiting for analysis or search results") });
+          continue;
+        }
         if (event.type === "reasoning") {
           if (!thinking) options.onProgress?.({ job, message: message(`${researchAgentTitle(agentId)}正在思考`, `${researchAgentTitle(agentId, "en")} is thinking`) });
           thinking = true;
@@ -481,7 +485,7 @@ export async function runResearchJob(
                 ? message("联网请求未取得可验证引用", "Web search returned no verifiable citations")
                 : event.phase === "failed"
                   ? message("联网工具执行失败", "Web search tool failed")
-                  : message("已请求联网搜索", "Web search requested");
+                  : message("已启用联网搜索，正在连接模型", "Web search enabled; connecting to the model");
           options.onProgress?.({ job, message: statusMessage });
         }
       }
@@ -569,6 +573,10 @@ export async function runResearchJob(
         throwIfAborted(options.signal, "synthesis");
         let thinking = false;
         for await (const event of synthesisProvider.run(request, options.signal)) {
+          if (event.type === "response_started") {
+            options.onProgress?.({ job, message: message("模型已连接，等待综合分析结果", "Model connected; waiting for synthesis") });
+            continue;
+          }
           if (event.type === "reasoning") {
             if (!thinking) options.onProgress?.({ job, message: message("综合阶段正在思考", "Synthesis is thinking") });
             thinking = true;

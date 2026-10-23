@@ -209,7 +209,7 @@ function streamFailureMessage(payload: unknown) {
 function emptyResponseMessage(response: Response, payload: unknown, text: string) {
   const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "no content-type";
   const detail = responseErrorMessage(payload, "") || text.replace(/\s+/g, " ").trim().slice(0, 160);
-  return `模型返回了空响应（HTTP ${response.status} · ${contentType}）${detail ? `：${detail}` : ""}`;
+  return `模型返回了空响应（HTTP ${response.status} · ${contentType}${text.length ? "" : " · 响应体 0 字节"}）${detail ? `：${detail}` : ""}`;
 }
 
 function readModels(payload: unknown): ResearchModelDefinition[] {
@@ -431,6 +431,8 @@ function readWebSearchEvents(payload: unknown): ModelStreamEvent[] {
       const action = block.action && typeof block.action === "object" ? block.action as Record<string, unknown> : null;
       addQuery(action?.query);
       (Array.isArray(action?.queries) ? action.queries : []).forEach(addQuery);
+      pushSources(sources, action?.sources, "Web search result", queries[0]);
+      if (block.status === "completed") lifecycleEvents.push({ type: "web_search", phase: "completed" });
       if (action?.type === "open_page") {
         const source = providerSource({ url: action.url }, "Opened page", queries[0]);
         if (source) sources.push(source);
@@ -468,7 +470,7 @@ function readWebSearchEvents(payload: unknown): ModelStreamEvent[] {
   const item = record.item && typeof record.item === "object" ? record.item as Record<string, unknown> : null;
   if (item?.type === "web_search_call" && item.status !== "failed") {
     if (type === "response.output_item.added") lifecycleEvents.push({ type: "web_search", phase: "searching" });
-    if (type === "response.output_item.done") lifecycleEvents.push({ type: "web_search", phase: "completed" });
+    if (type === "response.output_item.done" && item.status !== "completed") lifecycleEvents.push({ type: "web_search", phase: "completed" });
   }
   inspectBlock(record.content_block);
   inspectBlock(record.delta);
@@ -553,6 +555,7 @@ function combineSignal(external: AbortSignal | undefined, timeoutMs: number) {
   const controller = new AbortController();
   const abort = () => controller.abort(external?.reason);
   external?.addEventListener("abort", abort, { once: true });
+  if (external?.aborted) abort();
   const timeout = globalThis.setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
   return {
     signal: controller.signal,
@@ -561,6 +564,26 @@ function combineSignal(external: AbortSignal | undefined, timeoutMs: number) {
       external?.removeEventListener("abort", abort);
     },
   };
+}
+
+// A transport (or a token refresh) may not reject its own promise on abort.
+// Keep the consumer's deadline effective during both connection and body reads.
+function withAbort<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener("abort", abort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve().then(() => {
+      signal.throwIfAborted();
+      return operation();
+    }).then(
+      (value) => { signal.removeEventListener("abort", abort); resolve(value); },
+      (error) => { signal.removeEventListener("abort", abort); reject(error); },
+    );
+  });
 }
 
 function anthropicMessages(messages: ModelMessage[]) {
@@ -643,13 +666,14 @@ function codexBody(model: string, request: ModelRunRequest) {
   const instructions = request.messages.filter((message) => message.role === "system").map((message) => message.content).join("\n\n");
   return {
     model,
+    // Match the CLI's routing-field order; gateways may inspect JSON incrementally.
+    stream: true,
     instructions: instructions || "You are a careful financial research assistant.",
     input: request.messages.filter((message) => message.role !== "system").map((message) => ({
       type: "message",
       role: message.role === "assistant" ? "assistant" : "user",
       content: [{ type: message.role === "assistant" ? "output_text" : "input_text", text: message.content }],
     })),
-    stream: true,
     store: false,
   } as Record<string, unknown>;
 }
@@ -736,6 +760,9 @@ function requestBody(settings: ResearchProviderSettings, request: ModelRunReques
         body.plugins = [{ id: "web" }];
       }
     }
+  }
+  if (webSearchRequested && request.requireWebSearch && settings.protocol === "responses") {
+    body.tool_choice = "required";
   }
   applyThinking(body, settings, model, thinkingLevel);
   return body;
@@ -851,10 +878,12 @@ export class OpenAICompatibleProvider {
     let completed = false;
     for await (const event of this.run({
       model: this.settings.model,
-      messages: [{ role: "user", content: "Use web search to find this provider's official API documentation. Reply with one short sentence and cite the source." }],
+      messages: [{ role: "user", content: "Run the web search tool now to find OpenAI's official API documentation. Do not answer from memory. Reply with one short sentence and the source URL." }],
       maxOutputTokens: 512,
       temperature: 0,
       enableWebSearch: true,
+      requireWebSearch: true,
+      thinkingLevel: "low",
     }, signal)) {
       if (event.type !== "web_search") continue;
       if (event.query && !queries.includes(event.query)) queries.push(event.query);
@@ -866,11 +895,11 @@ export class OpenAICompatibleProvider {
     }
     // The Codex backend runs searches but, like the Codex CLI, returns no structured citations;
     // an executed search is the verifiable signal there.
-    const codexSearchRan = this.isCodex() && completed && queries.length > 0;
+    const codexSearchRan = this.isCodex() && completed;
     if (codexSearchRan && !sources.length) {
       return {
         ok: true,
-        message: `联网已验证 · ${queries.length} 条查询 · ChatGPT 订阅接口不返回结构化引用，来源以正文链接为准`,
+        message: `联网已验证 · ${queries.length ? `${queries.length} 条查询` : "搜索工具已完成"} · 本次未返回结构化引用，来源以正文链接为准`,
         queries,
         sources,
       };
@@ -895,6 +924,7 @@ export class OpenAICompatibleProvider {
   async *run(request: ModelRunRequest, signal?: AbortSignal): AsyncGenerator<ModelStreamEvent> {
     this.validateRequiredSettings();
     const combined = combineSignal(signal, this.settings.requestTimeoutSeconds * 1000);
+    let connectionStage = "等待模型接口响应头";
     try {
       const model = request.model || this.settings.model;
       const endpoint = this.resolvedEndpoint(model, true);
@@ -914,11 +944,11 @@ export class OpenAICompatibleProvider {
       for (let index = 0; index < attempts.length; index += 1) {
         const thinkingLevel = attempts[index];
         const effectiveRequest = webSearchActive ? request : { ...request, enableWebSearch: false };
-        response = await this.authorizedFetch(endpoint, {
+        response = await withAbort(combined.signal, () => this.authorizedFetch(endpoint, {
           method: "POST",
           body: JSON.stringify(requestBody(this.settings, effectiveRequest, true, thinkingLevel)),
           signal: combined.signal,
-        }, true);
+        }, true, (stage) => { connectionStage = stage; }));
         if (response.ok) break;
         const payload = await response.json().catch(() => null);
         const message = responseErrorMessage(payload, "模型请求失败");
@@ -935,49 +965,12 @@ export class OpenAICompatibleProvider {
         throw new ResearchProviderError(mapStatusError(response.status, message, endpoint));
       }
       if (!response?.ok) throw new ResearchProviderError({ code: "invalid_response", message: "思考深度降级后仍被模型服务拒绝", retryable: false });
+      yield { type: "response_started" };
       if (this.settings.protocol === "ollama_chat") {
         yield* this.readNdjson(response);
         return;
       }
-      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-      let sseResponse: Response | null = response.body && contentType.includes("text/event-stream") ? response : null;
-      if (!sseResponse) {
-        const text = await response.text().catch(() => "");
-        // Some gateways stream SSE without the event-stream content type.
-        if (/^\s*(event|data):/.test(text)) {
-          sseResponse = new Response(text);
-        } else {
-          let payload: unknown = null;
-          try {
-            payload = JSON.parse(text);
-          } catch {
-            payload = null;
-          }
-          const webEvents = readWebSearchEvents(payload);
-          let observed = false;
-          for (const event of webEvents) {
-            if (event.type === "web_search") {
-              observed ||= event.phase === "searching" || event.phase === "completed";
-              if (event.phase === "failed" && !request.continueOnWebSearchFailure) {
-                yield event;
-                throw new ResearchProviderError({ code: "network", message: event.error || "联网搜索工具执行失败", retryable: true });
-              }
-            }
-            yield event;
-          }
-          const delta = readDelta(payload);
-          if (!delta) throw new ResearchProviderError({ code: "invalid_response", message: emptyResponseMessage(response, payload, text), retryable: true });
-          yield { type: "delta", text: delta };
-          const usage = readUsage(payload);
-          if (usage) yield { type: "usage", usage };
-          if (webSearchActive && !observed) {
-            yield { type: "web_search", phase: "unverified", error: "服务商未返回可验证的搜索事件或结构化引用" };
-          }
-          yield { type: "done" };
-          return;
-        }
-      }
-      const stream = this.readSse(sseResponse);
+      const stream = this.readResponse(response, combined.signal);
       let observed = false;
       for await (const event of stream) {
         if (event.type === "web_search") {
@@ -993,17 +986,90 @@ export class OpenAICompatibleProvider {
         yield event;
       }
     } catch (error) {
-      throw this.mapThrownError(error);
+      if (!(error instanceof ResearchProviderError) && combined.signal.aborted && combined.signal.reason instanceof DOMException && combined.signal.reason.name === "TimeoutError") {
+        throw new ResearchProviderError({
+          code: "network",
+          message: `模型请求超时（${this.settings.requestTimeoutSeconds} 秒）：${connectionStage}；尚未收到可读取的模型响应，不能据此判断为思考过慢`,
+          retryable: true,
+        });
+      }
+      throw this.mapThrownError(error instanceof ResearchProviderError ? error : combined.signal.aborted ? combined.signal.reason : error);
     } finally {
       combined.dispose();
     }
   }
 
-  private async *readSse(response: Response): AsyncGenerator<ModelStreamEvent> {
-    if (!response.body) throw new ResearchProviderError({ code: "invalid_response", message: "模型返回了空响应", retryable: true });
+  private async *readResponse(response: Response, signal: AbortSignal): AsyncGenerator<ModelStreamEvent> {
+    if (!response.body) throw new ResearchProviderError({ code: "invalid_response", message: emptyResponseMessage(response, null, ""), retryable: true });
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = "";
+    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+    // Only counts and event names: never include prompts, text, headers or tokens.
+    const received = { bytes: 0, events: 0, lastEvent: "" };
+    const read = async () => {
+      const chunk = await withAbort(signal, () => reader.read());
+      received.bytes += chunk.value?.byteLength ?? 0;
+      return chunk;
+    };
+    try {
+      if (contentType.includes("text/event-stream")) {
+        yield* this.readSse(read, decoder, "", received);
+        return;
+      }
+      // Inspect bytes, not just headers. In particular, a headerless SSE stream can
+      // stay open after its terminal event; response.text() would hide all progress.
+      let text = "";
+      while (true) {
+        const { value, done } = await read();
+        text += decoder.decode(value, { stream: !done });
+        if (/^\s*(?::|(?:event|data|id|retry):)/.test(text)) {
+          yield* this.readSse(read, decoder, text.trimStart(), received);
+          return;
+        }
+        if (done) break;
+      }
+      let payload: unknown = null;
+      try { payload = JSON.parse(text); } catch { /* Report the actual response below. */ }
+      yield* readWebSearchEvents(payload);
+      const delta = readDelta(payload);
+      if (!delta) throw new ResearchProviderError({ code: "invalid_response", message: emptyResponseMessage(response, payload, text), retryable: true });
+      yield { type: "delta", text: delta };
+      const usage = readUsage(payload);
+      if (usage) yield { type: "usage", usage };
+      yield { type: "done" };
+    } catch (error) {
+      if (signal.aborted && signal.reason instanceof DOMException && signal.reason.name === "TimeoutError") {
+        const progress = received.bytes === 0
+          ? "已收到响应头，但正文数据为 0 字节；尚无法确认模型开始处理，请先测试职责模型并检查代理是否缓冲流式响应"
+          : `已收到 ${received.bytes} 字节、${received.events} 个事件${received.lastEvent ? `，最后事件 ${received.lastEvent}` : ""}；响应尚未完成`;
+        throw new ResearchProviderError({
+          code: "network",
+          message: `模型响应超时（${this.settings.requestTimeoutSeconds} 秒 · HTTP ${response.status} · ${contentType || "no content-type"}）：${progress}`,
+          retryable: true,
+        });
+      }
+      if (signal.aborted) throw signal.reason;
+      if (error instanceof ResearchProviderError) throw error;
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new ResearchProviderError({
+        code: "network",
+        message: `读取模型响应中断（HTTP ${response.status} · ${contentType || "no content-type"}）：${detail}`,
+        retryable: true,
+      });
+    } finally {
+      // Do not wait for a kept-alive transport's cancellation acknowledgement.
+      void reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+    }
+  }
+
+  private async *readSse(
+    read: () => Promise<ReadableStreamReadResult<Uint8Array>>,
+    decoder: TextDecoder,
+    initialText: string,
+    received: { events: number; lastEvent: string },
+  ): AsyncGenerator<ModelStreamEvent> {
+    let buffer = initialText;
     const parseBlock = (block: string) => block.split(/\r?\n/)
       .filter((line) => line.startsWith("data:"))
       .map((line) => line.slice(5).trim());
@@ -1022,6 +1088,10 @@ export class OpenAICompatibleProvider {
       } catch {
         return; // Ignore malformed or truncated provider events.
       }
+      received.events += 1;
+      const type = payload && typeof payload === "object" ? (payload as Record<string, unknown>).type : undefined;
+      // An event name is useful for diagnosis; arbitrary server content is not.
+      if (typeof type === "string" && /^[a-zA-Z0-9_.-]{1,100}$/.test(type)) received.lastEvent = type;
       const failure = streamFailureMessage(payload);
       if (failure) throw new ResearchProviderError({ code: "invalid_response", message: failure, retryable: true });
       if (isReasoningEvent(payload)) yield { type: "reasoning" };
@@ -1032,24 +1102,23 @@ export class OpenAICompatibleProvider {
       if (usage) yield { type: "usage", usage };
       if (isTerminalStreamEvent(payload)) finished = true;
     };
-    try {
-      while (!finished) {
-        const { value, done } = await reader.read();
-        buffer += decoder.decode(value, { stream: !done });
-        const blocks = buffer.split(/\r?\n\r?\n/);
-        buffer = blocks.pop() ?? "";
-        for (const block of blocks) {
-          for (const data of parseBlock(block)) yield* emit(data);
+    while (!finished) {
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() ?? "";
+      for (const block of blocks) {
+        for (const data of parseBlock(block)) yield* emit(data);
+        if (finished) break;
+      }
+      if (finished) break;
+      const { value, done } = await read();
+      buffer += decoder.decode(value, { stream: !done });
+      if (done) {
+        for (const data of parseBlock(buffer)) {
+          yield* emit(data);
           if (finished) break;
         }
-        if (done) break;
+        break;
       }
-      if (!finished) for (const data of parseBlock(buffer)) yield* emit(data);
-    } finally {
-      // Close a still-open stream (terminal event, error, or the consumer breaking out early),
-      // then release the lock so the body can be GC'd. Cancelling a finished stream is a no-op.
-      await reader.cancel().catch(() => undefined);
-      reader.releaseLock();
     }
     yield { type: "done" };
   }
@@ -1111,26 +1180,36 @@ export class OpenAICompatibleProvider {
   private async testCodexConnection(signal?: AbortSignal, modelOverride?: string) {
     const permission = await ensureModelEndpointPermission(this.settings.endpoint);
     if (!permission) throw new ResearchProviderError({ code: "permission", message: "未授予模型服务域名访问权限", retryable: false });
+    const diagnosticProvider = new OpenAICompatibleProvider({
+      ...this.settings,
+      requestTimeoutSeconds: Math.min(30, this.settings.requestTimeoutSeconds),
+    });
     let text = "";
-    for await (const event of this.run({
+    for await (const event of diagnosticProvider.run({
       model: modelOverride?.trim() || this.settings.model,
       messages: [{ role: "user", content: "Reply with OK only." }],
+      thinkingLevel: "low",
     }, signal)) {
       if (event.type === "delta") text += event.text;
     }
-    return { ok: true, message: text.trim() || "OK" };
+    if (!text.trim()) throw new ResearchProviderError({ code: "invalid_response", message: "模型连接测试未收到回答，不能仅凭 HTTP 200 判定连接成功", retryable: true });
+    return { ok: true, message: text.trim() };
   }
 
   /** Adds auth headers; ChatGPT OAuth tokens are refreshed near expiry and once more after a 401. */
-  private async authorizedFetch(url: string, init: RequestInit, stream: boolean) {
+  private async authorizedFetch(url: string, init: RequestInit, stream: boolean, onStage?: (stage: string) => void) {
     if (!this.isCodex()) return fetch(url, { ...init, headers: this.headers() });
     try {
+      onStage?.("获取 ChatGPT 登录凭据（检查续期及凭据保存）");
       const credentials = await ensureFreshCodexCredentials(this.settings.id, this.settings.apiKey);
       this.settings = { ...this.settings, apiKey: serializeCodexCredentials(credentials) };
+      onStage?.("登录凭据已就绪，等待 Codex /responses 接口返回响应头");
       const response = await fetch(url, { ...init, headers: codexRequestHeaders(credentials, stream) });
       if (response.status !== 401) return response;
+      onStage?.("Codex 接口返回 401，正在刷新 ChatGPT 登录凭据");
       const refreshed = await ensureFreshCodexCredentials(this.settings.id, this.settings.apiKey, true);
       this.settings = { ...this.settings, apiKey: serializeCodexCredentials(refreshed) };
+      onStage?.("登录凭据已刷新，等待 Codex /responses 接口返回响应头");
       return fetch(url, { ...init, headers: codexRequestHeaders(refreshed, stream) });
     } catch (error) {
       if (error instanceof CodexAuthError) throw new ResearchProviderError({ code: "auth", message: error.message, retryable: false });
@@ -1181,8 +1260,11 @@ export class OpenAICompatibleProvider {
 
   private mapThrownError(error: unknown) {
     if (error instanceof ResearchProviderError) return error;
+    if (error instanceof DOMException && error.name === "TimeoutError") {
+      return new ResearchProviderError({ code: "network", message: `模型请求超时（${this.settings.requestTimeoutSeconds} 秒），未能及时完成响应；可重试或降低思考深度`, retryable: true });
+    }
     if (error instanceof DOMException && error.name === "AbortError") {
-      return new ResearchProviderError({ code: "cancelled", message: "研究任务已取消或请求超时", retryable: true });
+      return new ResearchProviderError({ code: "cancelled", message: "研究任务已取消", retryable: true });
     }
     const message = error instanceof Error ? error.message : "模型服务连接失败";
     const cors = /Failed to fetch|NetworkError|CORS/i.test(message);

@@ -760,6 +760,8 @@ export interface ModelRunRequest {
   temperature?: number;
   maxOutputTokens?: number;
   enableWebSearch?: boolean;
+  /** Require a search for capability diagnostics; normal research lets the model choose. */
+  requireWebSearch?: boolean;
   continueOnWebSearchFailure?: boolean;
   /** Override the provider's thinking level for this request (e.g. "off" for
    * structured-output audits that should not burn tokens on reasoning). */
@@ -767,6 +769,7 @@ export interface ModelRunRequest {
 }
 
 export type ModelStreamEvent =
+  | { type: "response_started" }
   | { type: "delta"; text: string }
   | { type: "usage"; usage: ModelUsage }
   | {

@@ -152,6 +152,7 @@ describe("research orchestrator", () => {
         endpoint: "https://model.example/v1",
         webSearchMode: "native",
       }, { onProgress: (event) => progress.push(event.message) });
+      assert.ok(progress.some((item) => item.includes("模型已连接")), progress.join(" | "));
       assert.ok(progress.some((item) => item.includes("正在思考")), progress.join(" | "));
       assert.equal(result.job.agentResults[0]?.webSearch?.phase, "completed");
       // With no structured citations the report stays unverified but keeps the queries that ran.

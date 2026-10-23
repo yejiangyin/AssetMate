@@ -10,6 +10,7 @@ import {
   codexModelsFromPayload,
   createCodexPkce,
   credentialsFromTokenResponse,
+  ensureFreshCodexCredentials,
   importCodexAuthJson,
   newerCodexClientVersion,
   resolveCodexClientVersion,
@@ -80,6 +81,30 @@ describe("ChatGPT (Codex) OAuth", () => {
     assert.equal(credentials.refreshToken, "r2");
     assert.equal(credentials.accountId, "acct-123");
     assert.throws(() => importCodexAuthJson("{\"OPENAI_API_KEY\":\"sk-test\"}"), /tokens/);
+  });
+
+  test("bounds a stalled token refresh and releases its per-profile lock for a retry", async (context) => {
+    const originalFetch = globalThis.fetch;
+    const originalSetTimeout = globalThis.setTimeout;
+    context.mock.method(globalThis, "setTimeout", ((handler: () => void, delay?: number) => originalSetTimeout(handler, delay === 15_000 ? 10 : delay)) as typeof globalThis.setTimeout);
+    let refreshSignal: AbortSignal | undefined;
+    const raw = serializeCodexCredentials({
+      ...credentialsFromTokenResponse({ access_token: accessToken, refresh_token: "r1", id_token: idToken }),
+      expiresAt: Date.now() - 1000,
+    });
+    globalThis.fetch = async (_url, init) => {
+      refreshSignal = init?.signal ?? undefined;
+      return new Promise<Response>(() => {});
+    };
+    try {
+      await assert.rejects(ensureFreshCodexCredentials("refresh-deadline-test", raw), /登录授权或续期超时/);
+      assert.equal(refreshSignal?.aborted, true);
+      globalThis.fetch = async () => new Response(JSON.stringify({ access_token: accessToken, refresh_token: "rotated", expires_in: 3600 }));
+      const result = await ensureFreshCodexCredentials("refresh-deadline-test", raw);
+      assert.equal(result.refreshToken, "rotated");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test("maps the Codex model catalog", () => {
@@ -173,6 +198,8 @@ describe("ChatGPT (Codex) OAuth", () => {
     try {
       const result = await new OpenAICompatibleProvider(codexTestSettings()).testWebSearch();
       assert.deepEqual(body.tools, [{ type: "web_search", external_web_access: true }]);
+      assert.equal(body.tool_choice, "required", "a capability diagnostic must not leave searching optional");
+      assert.deepEqual(body.reasoning, { effort: "low" }, "the diagnostic should not inherit a slow research thinking level");
       assert.deepEqual(result.sources.map((source) => source.url), ["https://platform.openai.com/docs"]);
     } finally {
       globalThis.fetch = originalFetch;
@@ -259,7 +286,7 @@ describe("ChatGPT (Codex) OAuth", () => {
     try {
       const types: string[] = [];
       for await (const event of new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 5 }).run({ messages: [{ role: "user", content: "hi" }] })) types.push(event.type);
-      assert.deepEqual(types, ["reasoning", "reasoning", "delta", "done"]);
+      assert.deepEqual(types, ["response_started", "reasoning", "reasoning", "delta", "done"]);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -276,6 +303,243 @@ describe("ChatGPT (Codex) OAuth", () => {
         new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 5 }).testWebSearch(),
         /Web search is unavailable for this model/,
       );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("reads a kept-alive octet-stream incrementally instead of buffering the entire body", { timeout: 1000 }, async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(openStream([
+      { type: "response.output_item.added", item: { type: "reasoning" } },
+      { type: "response.output_item.done", item: { type: "web_search_call", status: "completed", action: { type: "search", query: "OpenAI docs" } } },
+      { type: "response.output_text.delta", delta: "Found it." },
+      { type: "response.completed", response: {} },
+    ]), { headers: { "content-type": "application/octet-stream" } });
+    try {
+      const types: string[] = [];
+      for await (const event of new OpenAICompatibleProvider(codexTestSettings()).run({ messages: [{ role: "user", content: "research" }], enableWebSearch: true })) types.push(event.type);
+      assert.ok(types.indexOf("reasoning") < types.indexOf("delta"));
+      assert.equal(types.at(-1), "done");
+      assert.equal(types.includes("web_search"), true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("reads a headerless kept-alive SSE body as soon as events arrive", { timeout: 1000 }, async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(openStream([
+      { type: "response.output_item.added", item: { type: "reasoning" } },
+      { type: "response.output_text.delta", delta: "Headerless answer" },
+      { type: "response.completed", response: {} },
+    ]));
+    try {
+      const events = [];
+      for await (const event of new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 0.1 }).run({ messages: [{ role: "user", content: "hi" }] })) events.push(event);
+      assert.ok(events.some((event) => event.type === "reasoning"));
+      assert.equal(events.find((event) => event.type === "delta")?.text, "Headerless answer");
+      assert.equal(events.at(-1)?.type, "done");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("keeps body-read failures instead of converting them to an empty HTTP 200", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) { controller.error(new TypeError("connection reset while reading")); },
+    }));
+    try {
+      await assert.rejects(
+        new OpenAICompatibleProvider(codexTestSettings()).testConnection(),
+        (error: unknown) => error instanceof Error && /connection reset while reading/.test(error.message) && !/空响应/.test(error.message),
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("times out a headerless body that stops delivering data", { timeout: 1000 }, async () => {
+    const originalFetch = globalThis.fetch;
+    let cancelled = false;
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start() {},
+      cancel() { cancelled = true; },
+    }));
+    try {
+      await assert.rejects(
+        new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 0.02 }).testConnection(),
+        /模型响应超时.*HTTP 200.*正文数据为 0 字节/,
+      );
+      assert.equal(cancelled, true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("identifies a request stalled after credentials are ready but before response headers", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Promise<Response>(() => {});
+    try {
+      await assert.rejects(
+        new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 0.02 }).testConnection(),
+        /登录凭据已就绪，等待 Codex \/responses 接口返回响应头/,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("reports received bytes and safe event names when an active response does not finish", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(openStream([
+      { type: "response.created", response: { metadata: { private_context: "PRIVATE_TEST_SENTINEL" } } },
+    ]), { headers: { "content-type": "text/event-stream" } });
+    try {
+      await assert.rejects(
+        new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 0.02 }).testConnection(),
+        (error: unknown) => error instanceof Error
+          && /已收到 \d+ 字节、1 个事件/.test(error.message)
+          && /最后事件 response.created/.test(error.message)
+          && !/PRIVATE_TEST_SENTINEL/.test(error.message),
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("uses a minimal low-effort connection diagnostic without changing research settings", async () => {
+    const originalFetch = globalThis.fetch;
+    const bodies: Record<string, unknown>[] = [];
+    globalThis.fetch = async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(openStream([
+        { type: "response.output_text.delta", delta: "OK" },
+        { type: "response.completed", response: {} },
+      ]), { headers: { "content-type": "text/event-stream" } });
+    };
+    try {
+      const provider = new OpenAICompatibleProvider({ ...codexTestSettings(), thinkingLevel: "high", requestTimeoutSeconds: 180 });
+      assert.equal((await provider.testConnection()).message, "OK");
+      for await (const _event of provider.run({ messages: [{ role: "user", content: "Research" }] })) { /* Consume the stream. */ }
+      assert.deepEqual(bodies.map((body) => body.reasoning), [{ effort: "low" }, { effort: "high" }]);
+      assert.equal(bodies[0]?.tools, undefined);
+      assert.equal(bodies[0]?.tool_choice, undefined);
+      assert.deepEqual(Object.keys(bodies[0]!).slice(0, 2), ["model", "stream"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("does not report a successful connection for a stream that produced no answer", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(openStream([
+      { type: "response.created", response: {} },
+      { type: "response.completed", response: {} },
+    ]), { headers: { "content-type": "text/event-stream" } });
+    try {
+      await assert.rejects(new OpenAICompatibleProvider(codexTestSettings()).testConnection(), /模型连接测试未收到回答/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("still parses JSON when the provider omitted content-type", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(new TextEncoder().encode(JSON.stringify({ output_text: "JSON without headers" })));
+    try {
+      const result = await new OpenAICompatibleProvider(codexTestSettings()).testConnection();
+      assert.equal(result.message, "JSON without headers");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("reports a truly empty headerless body without claiming a timeout or success", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(null);
+    try {
+      await assert.rejects(new OpenAICompatibleProvider(codexTestSettings()).testConnection(), /HTTP 200 · no content-type · 响应体 0 字节/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("finishes at the terminal event even if transport cancellation never acknowledges", { timeout: 1000 }, async () => {
+    const originalFetch = globalThis.fetch;
+    let cancelled = false;
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"type":"response.output_text.delta","delta":"OK"}\n\ndata: {"type":"response.completed","response":{}}\n\n'));
+      },
+      cancel() {
+        cancelled = true;
+        return new Promise(() => {});
+      },
+    }), { headers: { "content-type": "text/event-stream" } });
+    try {
+      const result = await new OpenAICompatibleProvider(codexTestSettings()).testConnection();
+      assert.equal(result.message, "OK");
+      assert.equal(cancelled, true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("recognises searches supplied only in the final response output", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(openStream([
+      { type: "response.output_text.delta", delta: "Found it." },
+      { type: "response.completed", response: { output: [{ type: "web_search_call", status: "completed", action: { type: "search", query: "OpenAI docs" } }] } },
+    ]), { headers: { "content-type": "text/event-stream" } });
+    try {
+      const result = await new OpenAICompatibleProvider(codexTestSettings()).testWebSearch();
+      assert.deepEqual(result.queries, ["OpenAI docs"]);
+      assert.equal(result.ok, true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("accepts an explicit search completion without exposed query text", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(openStream([
+      { type: "response.web_search_call.completed", item_id: "ws1" },
+      { type: "response.output_text.delta", delta: "Found it." },
+      { type: "response.completed", response: {} },
+    ]), { headers: { "content-type": "text/event-stream" } });
+    try {
+      const result = await new OpenAICompatibleProvider(codexTestSettings()).testWebSearch();
+      assert.match(result.message, /搜索工具已完成/);
+      assert.deepEqual(result.queries, []);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("reads sources in the web-search action without relying on text annotations", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      output_text: "Found it.",
+      output: [{ type: "web_search_call", status: "completed", action: { type: "search", query: "OpenAI docs", sources: [{ url: "https://platform.openai.com/docs", title: "OpenAI docs" }] } }],
+    }), { headers: { "content-type": "application/json" } });
+    try {
+      const result = await new OpenAICompatibleProvider(codexTestSettings()).testWebSearch();
+      assert.deepEqual(result.sources.map((source) => source.url), ["https://platform.openai.com/docs"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("does not claim verification when the model only returned an answer", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(openStream([
+      { type: "response.output_text.delta", delta: "Here is a link from memory: https://platform.openai.com/docs" },
+      { type: "response.completed", response: {} },
+    ]), { headers: { "content-type": "text/event-stream" } });
+    try {
+      await assert.rejects(new OpenAICompatibleProvider(codexTestSettings()).testWebSearch(), /未返回可验证/);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -345,6 +609,7 @@ describe("ChatGPT (Codex) OAuth", () => {
       assert.equal(body.instructions, "Be precise.");
       assert.equal(body.stream, true);
       assert.equal(body.store, false);
+      assert.equal("tool_choice" in body, false, "normal research should retain automatic tool selection");
       assert.equal("max_output_tokens" in body, false);
       assert.deepEqual(body.input, [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }]);
       assert.equal(events.filter((event) => event.type === "delta").map((event) => event.type === "delta" ? event.text : "").join(""), "OK");

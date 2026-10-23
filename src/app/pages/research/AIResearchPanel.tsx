@@ -81,6 +81,23 @@ import {
   getWorkflowConfig,
 } from "../../research/workflows/registry";
 
+function ResearchWaitStatus({ startedAt, hasOutput, isEn }: { startedAt: string; hasOutput: boolean; isEn: boolean }) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = globalThis.setInterval(() => setNow(Date.now()), 1000);
+    return () => globalThis.clearInterval(timer);
+  }, []);
+  const elapsed = Math.max(0, Math.floor((now - Date.parse(startedAt)) / 1000));
+  return (
+    <p className="mt-1 text-[11px] leading-4 text-tmi">
+      {isEn ? `Elapsed ${elapsed}s` : `已用时 ${elapsed} 秒`}
+      {!hasOutput && elapsed >= 15 && (isEn
+        ? " · Thinking and web search can take time before the first output. You can stop at any time."
+        : " · 模型思考和联网检索可能需要较长时间才开始输出，可随时中断。")}
+    </p>
+  );
+}
+
 function targetFromInputs(input: { symbol: string; name: string; market: string; assetType: string; currency: string }): ResearchTarget {
   return {
     symbol: input.symbol.trim(),
@@ -1524,6 +1541,7 @@ export function AIResearchPanel({
             <div>
               <p className="text-[13px] font-semibold text-tp">{researchTargetsTitle(activeJob.targets ?? [activeJob.target], isEn)} · {researchWorkflowTitle(activeJob.workflowId, language)}</p>
               <p className="mt-0.5 text-[11px] leading-4 text-tmi" aria-live="polite">{jobStatusLabel(activeJob.status, isEn)} · {message}</p>
+              {running && <ResearchWaitStatus key={activeJob.id} startedAt={activeJob.startedAt ?? activeJob.createdAt} hasOutput={Boolean(streamPreview)} isEn={isEn} />}
             </div>
             {stopping ? (
               <button type="button" disabled className="flex h-8 w-8 items-center justify-center rounded-lg bg-[rgba(242,78,78,0.08)] text-[#F24E4E] opacity-70" aria-label={isEn ? "Stopping research" : "正在中断研究"}><Loader2 size={13} className="animate-spin" /></button>
