@@ -275,7 +275,8 @@ async function postToken(body: BodyInit, contentType: string) {
         body,
         signal: controller.signal,
       });
-      const payload: unknown = await response.json();
+      // A non-JSON body (e.g. an HTML block page) is still a response, not a connection failure.
+      const payload: unknown = await response.json().catch(() => null);
       if (!response.ok) {
         const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
         const error = record.error;
@@ -283,6 +284,7 @@ async function postToken(body: BodyInit, contentType: string) {
           ?? (typeof error === "string" ? error : error && typeof error === "object" ? stringValue((error as Record<string, unknown>).message) : undefined);
         throw new CodexAuthError(detail || `OpenAI 登录服务返回 HTTP ${response.status}`);
       }
+      if (!payload) throw new CodexAuthError(`OpenAI 登录服务返回了无法解析的内容（HTTP ${response.status}）`);
       return payload;
     })()]);
   } catch (error) {

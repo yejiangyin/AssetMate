@@ -422,7 +422,9 @@ describe("ChatGPT (Codex) OAuth", () => {
     try {
       const provider = new OpenAICompatibleProvider({ ...codexTestSettings(), thinkingLevel: "high", requestTimeoutSeconds: 180 });
       assert.equal((await provider.testConnection()).message, "OK");
-      for await (const _event of provider.run({ messages: [{ role: "user", content: "Research" }] })) { /* Consume the stream. */ }
+      const events = [];
+      for await (const event of provider.run({ messages: [{ role: "user", content: "Research" }] })) events.push(event);
+      assert.ok(events.length > 0);
       assert.deepEqual(bodies.map((body) => body.reasoning), [{ effort: "low" }, { effort: "high" }]);
       assert.equal(bodies[0]?.tools, undefined);
       assert.equal(bodies[0]?.tool_choice, undefined);

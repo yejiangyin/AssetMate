@@ -73,3 +73,20 @@
 - https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/endpoint/responses.rs
 - https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/common.rs
 - https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/sse/responses.rs
+
+## 后续：连接诊断（Claude，2026-10-23）
+
+复核 `5cff7ce`：其改动未触及 `/models` 请求（地址、请求头、权限检查与 `a214c1d` 相同）。用户看到的“无法连接模型服务”是 `fetch` 抛出 `TypeError: Failed to fetch` 的通用映射，即请求在收到任何 HTTP 状态之前就在网络层失败；最小 `/responses` 请求在响应头前超时与此一致。两者共同指向 Chrome → chatgpt.com 的网络路径（代理/VPN 规则、连接被重置或拦截），而非解析或提示词。命令行探测可达不代表 Chrome 走同一条代理。
+
+为取得真实证据，Codex 账号面板新增“诊断连接”（`providers/codexDiagnostics.ts`），在用户的扩展内逐步检查并给出可复制报告：
+
+1. 扩展对 chatgpt.com、auth.openai.com 的域名权限；
+2. 未带登录访问 `/backend-api/codex/models`（应快速返回 401，证明网络可达；识别 403、`cf-mitigated`）；
+3. auth.openai.com 可达性；
+4. 登录凭据状态（过期则续期）；
+5. 带登录获取模型；
+6. 最小 `/responses` 请求（`Reply with OK only.`，无搜索）：响应头、首字节、字节数、事件数与最后事件，超时时报告卡在哪一阶段。
+
+网络层失败时跳过 5、6。报告只含状态、耗时、响应头类型与事件名，不含令牌、Cookie 或正文。另修正 `postToken` 把非 JSON 响应误报为“无法连接登录服务”。
+
+下一步：请用户点“诊断连接”，按报告第一个 ✗ 定位后再改代码。

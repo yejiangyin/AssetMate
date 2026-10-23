@@ -1,4 +1,4 @@
-import { ClipboardPaste, FileJson, Loader2, LogIn, LogOut, RefreshCw, X } from "lucide-react";
+import { Check, ClipboardPaste, Copy, FileJson, Loader2, LogIn, LogOut, RefreshCw, Stethoscope, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
   cancelCodexLogin,
@@ -10,6 +10,7 @@ import {
   startCodexBrowserLogin,
   type CodexCredentials,
 } from "../providers/codexAuth";
+import { formatCodexDiagnostics, runCodexDiagnostics, type CodexDiagnosticStep } from "../providers/codexDiagnostics";
 import { CONTROL_CLASS, Feedback, StatusPill } from "./settingsUi";
 
 type Fallback = "none" | "callback" | "authJson";
@@ -19,9 +20,73 @@ function planLabel(plan: string | undefined) {
   return plan.charAt(0).toUpperCase() + plan.slice(1);
 }
 
+const DIAGNOSTIC_TONE: Record<CodexDiagnosticStep["status"], string> = {
+  ok: "text-[#1F9D6A]",
+  warn: "text-[#C27C0E]",
+  fail: "text-[#E04848]",
+  skip: "text-tmi",
+};
+const DIAGNOSTIC_MARK: Record<CodexDiagnosticStep["status"], string> = { ok: "✓", warn: "⚠", fail: "✗", skip: "–" };
+
+/** Checks each hop (permissions, network, sign-in, /models, /responses) and shows a copyable report. */
+function CodexDiagnostics({ profileId, apiKey, endpoint, model, isEn }: { profileId: string; apiKey: string; endpoint: string; model: string; isEn: boolean }) {
+  const [running, setRunning] = useState(false);
+  const [steps, setSteps] = useState<CodexDiagnosticStep[]>([]);
+  const [copied, setCopied] = useState(false);
+  const run = async () => {
+    setRunning(true);
+    setCopied(false);
+    setSteps([]);
+    try {
+      setSteps(await runCodexDiagnostics({ profileId, apiKey, endpoint, model }, setSteps));
+    } finally {
+      setRunning(false);
+    }
+  };
+  const copy = async () => {
+    await navigator.clipboard?.writeText(formatCodexDiagnostics(steps, model)).catch(() => undefined);
+    setCopied(true);
+  };
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <button type="button" onClick={() => void run()} disabled={running} className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg border border-app-border bg-app-surface text-[11px] font-semibold text-ts disabled:opacity-60">
+          {running ? <Loader2 size={12} className="animate-spin" /> : <Stethoscope size={12} />}
+          {running ? (isEn ? "Diagnosing…" : "正在诊断…") : (isEn ? "Diagnose connection" : "诊断连接")}
+        </button>
+        {steps.length > 0 && !running && (
+          <button type="button" onClick={() => void copy()} className="flex h-8 items-center gap-1 rounded-lg border border-app-border bg-app-surface px-2 text-[11px] font-semibold text-tm" aria-label={isEn ? "Copy diagnostics" : "复制诊断结果"}>
+            {copied ? <Check size={12} /> : <Copy size={12} />}{copied ? (isEn ? "Copied" : "已复制") : (isEn ? "Copy" : "复制结果")}
+          </button>
+        )}
+      </div>
+      {steps.length > 0 && (
+        <ol aria-label={isEn ? "Connection diagnostics" : "连接诊断结果"} className="space-y-1 rounded-lg border border-app-border bg-app-surface px-2.5 py-2">
+          {steps.map((step) => (
+            <li key={step.id} className="flex items-start gap-1.5 text-[11px] leading-4">
+              <span className={`mt-px shrink-0 font-bold ${DIAGNOSTIC_TONE[step.status]}`}>{DIAGNOSTIC_MARK[step.status]}</span>
+              <span className="min-w-0 break-words text-tm">
+                <span className="font-semibold text-ts">{step.label}</span>
+                {step.ms !== undefined && <span className="text-tmi"> · {step.ms}ms</span>}
+                <span className="text-tmi"> · {step.detail}</span>
+              </span>
+            </li>
+          ))}
+          {running && <li className="flex items-center gap-1.5 text-[11px] text-tmi"><Loader2 size={11} className="animate-spin" />{isEn ? "Checking the next step…" : "正在检查下一步…"}</li>}
+        </ol>
+      )}
+      {steps.length > 0 && !running && (
+        <p className="px-0.5 text-[11px] leading-4 text-tmi">{isEn ? "The report has statuses and timings only — no token or content. Paste it when asking for help." : "结果只含状态与耗时，不含令牌或内容；反馈问题时可直接粘贴。"}</p>
+      )}
+    </div>
+  );
+}
+
 export function CodexAccountPanel({
   profileId,
   apiKey,
+  endpoint,
+  model,
   isEn,
   onBeforeLogin,
   onSignedIn,
@@ -29,6 +94,8 @@ export function CodexAccountPanel({
 }: {
   profileId: string;
   apiKey: string;
+  endpoint: string;
+  model: string;
   isEn: boolean;
   /** Persists the connection so the login can finish even if the popup closes. */
   onBeforeLogin: () => Promise<void>;
@@ -129,6 +196,7 @@ export function CodexAccountPanel({
           </button>
         </div>
         <Feedback type="error" message={error} />
+        <CodexDiagnostics profileId={profileId} apiKey={apiKey} endpoint={endpoint} model={model} isEn={isEn} />
       </div>
     );
   }
@@ -187,6 +255,7 @@ export function CodexAccountPanel({
         </div>
       )}
       <Feedback type="error" message={error} />
+      <CodexDiagnostics profileId={profileId} apiKey={apiKey} endpoint={endpoint} model={model} isEn={isEn} />
     </div>
   );
 }

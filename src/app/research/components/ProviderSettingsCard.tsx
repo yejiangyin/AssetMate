@@ -885,6 +885,8 @@ export function ProviderSettingsCard({
             <CodexAccountPanel
               profileId={settings.id}
               apiKey={settings.apiKey}
+              endpoint={settings.endpoint}
+              model={settings.model}
               isEn={isEn}
               onBeforeLogin={() => saveCollection()}
               onSignedIn={(credentials) => void applyCodexCredentials(settings.id, credentials)}
