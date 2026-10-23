@@ -405,8 +405,15 @@ function readWebSearchEvents(payload: unknown): ModelStreamEvent[] {
     if (!value || typeof value !== "object") return;
     const block = value as Record<string, unknown>;
     if (block.type === "web_search_call") {
+      // Actions: search { query?, queries? } | open_page { url } | find_in_page { url, pattern }.
       const action = block.action && typeof block.action === "object" ? block.action as Record<string, unknown> : null;
       addQuery(action?.query);
+      (Array.isArray(action?.queries) ? action.queries : []).forEach(addQuery);
+      if (action?.type === "open_page") {
+        const source = providerSource({ url: action.url }, "Opened page", queries[0]);
+        if (source) sources.push(source);
+      }
+      if (block.status === "failed") errors.push("联网搜索工具执行失败");
     }
     if (block.type === "server_tool_use" && block.name === "web_search") {
       const input = block.input && typeof block.input === "object" ? block.input as Record<string, unknown> : null;
@@ -434,6 +441,12 @@ function readWebSearchEvents(payload: unknown): ModelStreamEvent[] {
   if (type.startsWith("response.web_search_call.")) {
     const phase = type.endsWith("completed") ? "completed" : "searching";
     lifecycleEvents.push({ type: "web_search", phase });
+  }
+  // The ChatGPT (Codex) backend reports searches only as web_search_call output items.
+  const item = record.item && typeof record.item === "object" ? record.item as Record<string, unknown> : null;
+  if (item?.type === "web_search_call" && item.status !== "failed") {
+    if (type === "response.output_item.added") lifecycleEvents.push({ type: "web_search", phase: "searching" });
+    if (type === "response.output_item.done") lifecycleEvents.push({ type: "web_search", phase: "completed" });
   }
   inspectBlock(record.content_block);
   inspectBlock(record.delta);
@@ -827,6 +840,17 @@ export class OpenAICompatibleProvider {
       });
       if (event.error) errors.push(event.error);
       if (event.phase === "completed") completed = true;
+    }
+    // The Codex backend runs searches but, like the Codex CLI, returns no structured citations;
+    // an executed search is the verifiable signal there.
+    const codexSearchRan = this.isCodex() && completed && queries.length > 0;
+    if (codexSearchRan && !sources.length) {
+      return {
+        ok: true,
+        message: `联网已验证 · ${queries.length} 条查询 · ChatGPT 订阅接口不返回结构化引用，来源以正文链接为准`,
+        queries,
+        sources,
+      };
     }
     if (!completed || !sources.length) {
       throw new ResearchProviderError({

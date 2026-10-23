@@ -203,6 +203,51 @@ describe("ChatGPT (Codex) OAuth", () => {
     }
   });
 
+  test("recognises Codex web_search_call items without citations", async () => {
+    const codexStream = () => openStream([
+      { type: "response.output_item.added", item: { type: "web_search_call", id: "ws_1", status: "in_progress" } },
+      { type: "response.output_item.done", item: { type: "web_search_call", id: "ws_1", status: "completed", action: { type: "search", queries: ["openai api docs", "responses api"] } } },
+      { type: "response.output_item.added", item: { type: "web_search_call", id: "ws_2", status: "in_progress" } },
+      { type: "response.output_item.done", item: { type: "web_search_call", id: "ws_2", status: "completed", action: { type: "open_page", url: "https://platform.openai.com/docs/api-reference" } } },
+      { type: "response.output_text.delta", delta: "See [the docs](https://platform.openai.com/docs)." },
+      { type: "response.completed", response: {} },
+    ]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(codexStream(), { headers: { "content-type": "text/event-stream" } });
+    try {
+      const provider = new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 5 });
+      const result = await provider.testWebSearch();
+      assert.deepEqual(result.queries, ["openai api docs", "responses api"]);
+      assert.deepEqual(result.sources.map((source) => source.url), ["https://platform.openai.com/docs/api-reference"]);
+
+      const phases: string[] = [];
+      for await (const event of provider.run({ messages: [{ role: "user", content: "research" }], enableWebSearch: true })) {
+        if (event.type === "web_search") phases.push(event.phase);
+      }
+      assert.ok(phases.includes("searching") && phases.includes("completed"));
+      assert.equal(phases.includes("unverified"), false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("verifies a Codex search that returned no pages or citations", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(openStream([
+      { type: "response.output_item.added", item: { type: "web_search_call", id: "ws_1", status: "in_progress" } },
+      { type: "response.output_item.done", item: { type: "web_search_call", id: "ws_1", status: "completed", action: { type: "search", query: "openai api docs" } } },
+      { type: "response.output_text.delta", delta: "Found it." },
+      { type: "response.completed", response: {} },
+    ]), { headers: { "content-type": "text/event-stream" } });
+    try {
+      const result = await new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 5 }).testWebSearch();
+      assert.equal(result.sources.length, 0);
+      assert.match(result.message, /1 条查询/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("surfaces response.failed from a Codex stream", async () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => new Response(openStream([
