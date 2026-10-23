@@ -3,6 +3,7 @@ import { describe, test } from "node:test";
 import {
   CODEX_CLIENT_ID,
   CODEX_CLIENT_VERSION,
+  CODEX_LATEST_RELEASE_URL,
   CODEX_REDIRECT_URI,
   buildCodexAuthorizeUrl,
   codexModelsEndpoint,
@@ -10,6 +11,8 @@ import {
   createCodexPkce,
   credentialsFromTokenResponse,
   importCodexAuthJson,
+  newerCodexClientVersion,
+  resolveCodexClientVersion,
   parseCodexCallbackUrl,
   parseCodexCredentials,
   serializeCodexCredentials,
@@ -95,6 +98,36 @@ describe("ChatGPT (Codex) OAuth", () => {
       { id: "gpt-6", name: "GPT-6" },
       { id: "gpt-5.5", name: "GPT-5.5", reasoning: { supportedEfforts: ["low", "high"], defaultEffort: "medium" } },
     ]);
+  });
+
+  test("picks the newer stable Codex client version", () => {
+    assert.equal(newerCodexClientVersion("0.164.0", "0.170.2"), "0.170.2");
+    assert.equal(newerCodexClientVersion("0.164.0", "0.99.9"), "0.164.0");
+    assert.equal(newerCodexClientVersion("0.164.0", "1.0.0"), "1.0.0");
+    assert.equal(newerCodexClientVersion("0.164.0", "0.171.0-alpha.1"), "0.164.0");
+    assert.equal(newerCodexClientVersion("0.164.0", undefined), "0.164.0");
+  });
+
+  test("follows the latest Codex CLI release and falls back on failure", async () => {
+    const originalFetch = globalThis.fetch;
+    const requested: string[] = [];
+    try {
+      let reply: () => Promise<Response> = async () => new Response(JSON.stringify({ version: "0.170.0" }), { status: 200 });
+      globalThis.fetch = async (input) => {
+        requested.push(String(input));
+        return reply();
+      };
+      assert.equal(await resolveCodexClientVersion(), "0.170.0");
+      reply = async () => new Response(JSON.stringify({ version: "0.100.0" }), { status: 200 });
+      assert.equal(await resolveCodexClientVersion(), CODEX_CLIENT_VERSION);
+      reply = async () => new Response("{}", { status: 503 });
+      assert.equal(await resolveCodexClientVersion(), CODEX_CLIENT_VERSION);
+      reply = async () => { throw new TypeError("network down"); };
+      assert.equal(await resolveCodexClientVersion(), CODEX_CLIENT_VERSION);
+      assert.ok(requested.every((url) => url === CODEX_LATEST_RELEASE_URL));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   test("streams research requests through the Codex backend", async () => {

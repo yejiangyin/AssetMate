@@ -18,6 +18,7 @@ import {
   codexRequestHeaders,
   ensureFreshCodexCredentials,
   parseCodexCredentials,
+  resolveCodexClientVersion,
   serializeCodexCredentials,
 } from "./codexAuth";
 
@@ -686,7 +687,7 @@ export class OpenAICompatibleProvider {
     const combined = combineSignal(signal, Math.min(30, this.settings.requestTimeoutSeconds) * 1000);
     if (this.isCodex()) {
       try {
-        const endpoint = codexModelsEndpoint(this.settings.endpoint);
+        const endpoint = codexModelsEndpoint(this.settings.endpoint, await resolveCodexClientVersion());
         const response = await this.authorizedFetch(endpoint, { method: "GET", cache: "no-store", signal: combined.signal }, false);
         const payload = await response.json().catch(() => null);
         if (!response.ok) throw new ResearchProviderError(mapStatusError(response.status, responseErrorMessage(payload, "获取模型列表失败"), endpoint));

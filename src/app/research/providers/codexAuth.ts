@@ -6,9 +6,10 @@ import { updateResearchProviderApiKey } from "../storage";
 export const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const CODEX_ISSUER = "https://auth.openai.com";
 export const CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
-// The backend only lists models whose minimal_client_version is at or below this, so bump it
-// with each Codex CLI release (npm view @openai/codex version) or newer models stay hidden.
+// The backend only lists models whose minimal_client_version is at or below the version we send.
+// This is the floor; resolveCodexClientVersion() follows newer Codex CLI releases from npm.
 export const CODEX_CLIENT_VERSION = "0.164.0";
+export const CODEX_LATEST_RELEASE_URL = "https://registry.npmjs.org/@openai/codex/latest";
 export const CODEX_PERMISSION_ORIGINS = [
   "https://chatgpt.com/*",
   "https://auth.openai.com/*",
@@ -22,6 +23,9 @@ const PENDING_KEY = "asset-helper:codex-oauth-pending:v1";
 const CALLBACK_KEY = "asset-helper:codex-oauth-callback:v1";
 const REFRESH_MARGIN_MS = 60_000;
 const PENDING_TTL_MS = 15 * 60_000;
+const CLIENT_VERSION_KEY = "asset-helper:codex-client-version:v1";
+const CLIENT_VERSION_TTL_MS = 24 * 3600_000;
+const CLIENT_VERSION_LOOKUP_TIMEOUT_MS = 5_000;
 const AUTH_CLAIM = "https://api.openai.com/auth";
 const PROFILE_CLAIM = "https://api.openai.com/profile";
 
@@ -401,12 +405,54 @@ export function codexRequestHeaders(credentials: CodexCredentials, stream: boole
   };
 }
 
-export function codexModelsEndpoint(endpoint: string) {
+export function codexModelsEndpoint(endpoint: string, clientVersion = CODEX_CLIENT_VERSION) {
   const url = new URL(endpoint.trim());
   url.pathname = `${url.pathname.replace(/\/+$/, "").replace(/\/(responses|models)$/, "")}/models`;
   url.search = "";
-  url.searchParams.set("client_version", CODEX_CLIENT_VERSION);
+  url.searchParams.set("client_version", clientVersion);
   return url.toString();
+}
+
+function stableVersionParts(version: string | undefined) {
+  const match = version ? /^(\d+)\.(\d+)\.(\d+)$/.exec(version) : null;
+  return match ? match.slice(1).map(Number) : null;
+}
+
+/** The higher of two stable x.y.z versions; anything unparsable loses to the built-in floor. */
+export function newerCodexClientVersion(left: string, right: string | undefined) {
+  const a = stableVersionParts(left);
+  const b = stableVersionParts(right);
+  if (!b) return left;
+  if (!a) return right!;
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index]! > b[index]! ? left : right!;
+  }
+  return left;
+}
+
+/**
+ * Follows the latest Codex CLI release so newly gated models are listed without a plugin update.
+ * Cached for a day; any lookup failure falls back to the built-in version.
+ */
+export async function resolveCodexClientVersion() {
+  const cached = await readTransient<{ version: string; checkedAt: number }>(CLIENT_VERSION_KEY);
+  if (cached && Date.now() - cached.checkedAt < CLIENT_VERSION_TTL_MS) {
+    return newerCodexClientVersion(CODEX_CLIENT_VERSION, cached.version);
+  }
+  try {
+    const response = await fetch(CODEX_LATEST_RELEASE_URL, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(CLIENT_VERSION_LOOKUP_TIMEOUT_MS),
+    });
+    if (!response.ok) return CODEX_CLIENT_VERSION;
+    const payload = await response.json() as Record<string, unknown> | null;
+    const version = stringValue(payload?.version);
+    if (!stableVersionParts(version)) return CODEX_CLIENT_VERSION;
+    await writeTransient(CLIENT_VERSION_KEY, { version, checkedAt: Date.now() }).catch(() => undefined);
+    return newerCodexClientVersion(CODEX_CLIENT_VERSION, version);
+  } catch {
+    return CODEX_CLIENT_VERSION;
+  }
 }
 
 const EFFORTS: ResearchThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
