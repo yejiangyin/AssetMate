@@ -157,10 +157,10 @@ export function CodexAccountPanel({
 
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5 text-[11px]">
         <span className="text-tmi">{isEn ? "Didn't return automatically?" : "没有自动返回？"}</span>
-        <button type="button" onClick={() => setFallback(fallback === "callback" ? "none" : "callback")} className="flex items-center gap-1 font-medium text-app-accent">
+        <button type="button" onClick={() => setFallback(fallback === "callback" ? "none" : "callback")} className="flex items-center gap-1 text-[11px] font-medium leading-4 text-app-accent">
           <ClipboardPaste size={11} />{isEn ? "Paste callback URL" : "粘贴回调地址"}
         </button>
-        <button type="button" onClick={() => setFallback(fallback === "authJson" ? "none" : "authJson")} className="flex items-center gap-1 font-medium text-app-accent">
+        <button type="button" onClick={() => setFallback(fallback === "authJson" ? "none" : "authJson")} className="flex items-center gap-1 text-[11px] font-medium leading-4 text-app-accent">
           <FileJson size={11} />{isEn ? "Import Codex CLI auth.json" : "导入 Codex CLI 登录"}
         </button>
       </div>
