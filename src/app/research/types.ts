@@ -781,6 +781,8 @@ export type ModelStreamEvent =
   }
   /** The model is reasoning before it writes; carries no text, only drives progress. */
   | { type: "reasoning" }
+  /** A transport failure is being retried; nothing from the failed attempt's text was emitted. */
+  | { type: "retry"; attempt: number; maxAttempts: number; reason: string }
   | { type: "done" };
 
 export interface ResearchProgressEvent {

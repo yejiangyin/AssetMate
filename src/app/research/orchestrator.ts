@@ -465,6 +465,10 @@ export async function runResearchJob(
           options.onProgress?.({ job, message: message("模型已连接，等待分析或搜索结果", "Model connected; waiting for analysis or search results") });
           continue;
         }
+        if (event.type === "retry") {
+          options.onProgress?.({ job, message: message(`连接中断，正在重试（${event.attempt}/${event.maxAttempts}）`, `Connection dropped; retrying (${event.attempt}/${event.maxAttempts})`) });
+          continue;
+        }
         if (event.type === "reasoning") {
           if (!thinking) options.onProgress?.({ job, message: message(`${researchAgentTitle(agentId)}正在思考`, `${researchAgentTitle(agentId, "en")} is thinking`) });
           thinking = true;
@@ -575,6 +579,10 @@ export async function runResearchJob(
         for await (const event of synthesisProvider.run(request, options.signal)) {
           if (event.type === "response_started") {
             options.onProgress?.({ job, message: message("模型已连接，等待综合分析结果", "Model connected; waiting for synthesis") });
+            continue;
+          }
+          if (event.type === "retry") {
+            options.onProgress?.({ job, message: message(`连接中断，正在重试（${event.attempt}/${event.maxAttempts}）`, `Connection dropped; retrying (${event.attempt}/${event.maxAttempts})`) });
             continue;
           }
           if (event.type === "reasoning") {

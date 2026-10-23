@@ -424,6 +424,93 @@ describe("ChatGPT (Codex) OAuth", () => {
     }
   });
 
+  const doneStream = () => openStream([{ type: "response.output_text.delta", delta: "OK" }, { type: "response.completed", response: {} }]);
+  // Delivers `events`, then fails the read the way a dropped connection does.
+  const droppingStream = (events: unknown[]) => new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const event of events) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+      setTimeout(() => controller.error(new TypeError("network error")), 5);
+    },
+  });
+  const collect = async (provider: OpenAICompatibleProvider) => {
+    const events = [];
+    for await (const event of provider.run({ messages: [{ role: "user", content: "research" }] })) events.push(event);
+    return events;
+  };
+
+  test("retries a request that fails before any HTTP response", { timeout: 5000 }, async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      if (calls <= 2) throw new TypeError("Failed to fetch");
+      return new Response(doneStream(), { headers: { "content-type": "text/event-stream" } });
+    };
+    try {
+      const events = await collect(new OpenAICompatibleProvider(codexTestSettings(), { retryBaseMs: 1 }));
+      assert.equal(calls, 3);
+      assert.deepEqual(events.filter((event) => event.type === "retry").map((event) => event.type === "retry" ? event.attempt : 0), [1, 2]);
+      assert.equal(events.filter((event) => event.type === "delta").map((event) => event.type === "delta" ? event.text : "").join(""), "OK");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("retries a stream that drops before any answer text", { timeout: 5000 }, async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(calls === 1
+        ? droppingStream([{ type: "response.output_item.added", item: { type: "reasoning", id: "rs_1" } }])
+        : doneStream(), { headers: { "content-type": "text/event-stream" } });
+    };
+    try {
+      const events = await collect(new OpenAICompatibleProvider(codexTestSettings(), { retryBaseMs: 1 }));
+      assert.equal(calls, 2);
+      assert.equal(events.at(-1)?.type, "done");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("does not retry once answer text was emitted, so text never repeats", { timeout: 5000 }, async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(droppingStream([{ type: "response.output_text.delta", delta: "Half an answer" }]), { headers: { "content-type": "text/event-stream" } });
+    };
+    try {
+      await assert.rejects(collect(new OpenAICompatibleProvider(codexTestSettings(), { retryBaseMs: 1 })), /读取模型响应中断/);
+      assert.equal(calls, 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("names the stage after retries are exhausted and never retries auth errors", { timeout: 5000 }, async () => {
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      throw new TypeError("Failed to fetch");
+    };
+    try {
+      await assert.rejects(collect(new OpenAICompatibleProvider(codexTestSettings(), { retryBaseMs: 1 })), /无法连接模型服务（Failed to fetch · 登录凭据已就绪，等待 Codex \/responses 接口返回响应头）/);
+      assert.equal(calls, 4);
+      calls = 0;
+      globalThis.fetch = async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ detail: "Forbidden" }), { status: 403, headers: { "content-type": "application/json" } });
+      };
+      await assert.rejects(collect(new OpenAICompatibleProvider(codexTestSettings(), { retryBaseMs: 1 })), /Forbidden/);
+      assert.equal(calls, 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("times out a headerless body that stops delivering data", { timeout: 1000 }, async () => {
     const originalFetch = globalThis.fetch;
     let cancelled = false;

@@ -143,11 +143,14 @@ function mapStatusError(status: number, message: string, endpoint?: string): Res
 
 export class ResearchProviderError extends Error {
   detail: ResearchJobError;
+  /** A network-level failure (no response, or the stream dropped): safe to retry before any text. */
+  transport: boolean;
 
-  constructor(detail: ResearchJobError) {
+  constructor(detail: ResearchJobError, options: { transport?: boolean } = {}) {
     super(detail.message);
     this.name = "ResearchProviderError";
     this.detail = detail;
+    this.transport = options.transport ?? false;
   }
 }
 
@@ -561,6 +564,25 @@ const STREAM_MAX_DURATION = "Stream exceeded max duration";
 const STREAM_IDLE_MIN_MS = 300_000;
 const STREAM_MAX_MS = 30 * 60_000;
 
+// The Codex CLI retries transport failures with exponential backoff (request_max_retries = 4).
+const TRANSPORT_MAX_RETRIES = 3;
+const TRANSPORT_RETRY_BASE_MS = 1_000;
+
+function waitOrAbort(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const timer = globalThis.setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      globalThis.clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function combineSignal(external: AbortSignal | undefined, timeoutMs: number) {
   const controller = new AbortController();
   const abort = () => controller.abort(external?.reason);
@@ -799,8 +821,8 @@ function requestBody(settings: ResearchProviderSettings, request: ModelRunReques
 export class OpenAICompatibleProvider {
   constructor(
     private settings: ResearchProviderSettings,
-    /** Stream deadlines; defaults to the research ones (idle ≥ 5 min, 30 min cap). */
-    private streamTiming: { idleMs?: number; maxMs?: number } = {},
+    /** Stream deadlines and retry backoff; defaults to the research ones (idle ≥ 5 min, 30 min cap). */
+    private streamTiming: { idleMs?: number; maxMs?: number; retryBaseMs?: number } = {},
   ) {}
 
   async listModels(signal?: AbortSignal) {
@@ -953,7 +975,36 @@ export class OpenAICompatibleProvider {
     };
   }
 
+  /**
+   * Streams one model call, retrying transport failures (no response, or a dropped stream) like the
+   * Codex CLI does. A retry only happens before any answer text was emitted, so text never repeats.
+   */
   async *run(request: ModelRunRequest, signal?: AbortSignal): AsyncGenerator<ModelStreamEvent> {
+    for (let attempt = 0; ; attempt += 1) {
+      let wroteText = false;
+      try {
+        for await (const event of this.runAttempt(request, signal)) {
+          if (event.type === "delta") wroteText = true;
+          if (attempt > 0 && event.type === "web_search" && event.phase === "requested") continue;
+          yield event;
+        }
+        return;
+      } catch (error) {
+        const retry = error instanceof ResearchProviderError && error.transport && !wroteText
+          && attempt < TRANSPORT_MAX_RETRIES && !signal?.aborted;
+        if (!retry) throw error;
+        yield { type: "retry", attempt: attempt + 1, maxAttempts: TRANSPORT_MAX_RETRIES, reason: error.message };
+        const jitter = 0.9 + Math.random() * 0.2;
+        try {
+          await waitOrAbort((this.streamTiming.retryBaseMs ?? TRANSPORT_RETRY_BASE_MS) * 2 ** attempt * jitter, signal);
+        } catch (reason) {
+          throw this.mapThrownError(reason);
+        }
+      }
+    }
+  }
+
+  private async *runAttempt(request: ModelRunRequest, signal?: AbortSignal): AsyncGenerator<ModelStreamEvent> {
     this.validateRequiredSettings();
     const combined = combineSignal(signal, this.settings.requestTimeoutSeconds * 1000);
     let connectionStage = "等待模型接口响应头";
@@ -1026,6 +1077,13 @@ export class OpenAICompatibleProvider {
           message: `模型请求超时（${this.settings.requestTimeoutSeconds} 秒）：${connectionStage}；尚未收到可读取的模型响应，不能据此判断为思考过慢`,
           retryable: true,
         });
+      }
+      if (!(error instanceof ResearchProviderError) && !combined.signal.aborted && error instanceof TypeError) {
+        throw new ResearchProviderError({
+          code: "cors",
+          message: `无法连接模型服务（${error.message || "Failed to fetch"} · ${connectionStage}）：浏览器未收到任何 HTTP 响应，多为网络、代理或连接被中断；可点“诊断连接”定位`,
+          retryable: true,
+        }, { transport: true });
       }
       throw this.mapThrownError(error instanceof ResearchProviderError ? error : combined.signal.aborted ? combined.signal.reason : error);
     } finally {
@@ -1100,9 +1158,9 @@ export class OpenAICompatibleProvider {
       const detail = error instanceof Error ? error.message : String(error);
       throw new ResearchProviderError({
         code: "network",
-        message: `读取模型响应中断（HTTP ${response.status} · ${contentType || "no content-type"}）：${detail}`,
+        message: `读取模型响应中断（HTTP ${response.status} · ${contentType || "no content-type"} · 已收到 ${received.bytes} 字节）：${detail}`,
         retryable: true,
-      });
+      }, { transport: true });
     } finally {
       // Do not wait for a kept-alive transport's cancellation acknowledgement.
       void reader.cancel().catch(() => undefined);
@@ -1319,7 +1377,7 @@ export class OpenAICompatibleProvider {
     const cors = /Failed to fetch|NetworkError|CORS/i.test(message);
     return new ResearchProviderError({
       code: cors ? "cors" : "network",
-      message: cors ? "无法连接模型服务；请检查域名权限、CORS 和网络" : message,
+      message: cors ? `无法连接模型服务（${message}）：浏览器未收到任何 HTTP 响应；请检查网络、代理与域名权限，Codex 连接可点“诊断连接”定位` : message,
       retryable: true,
     });
   }
