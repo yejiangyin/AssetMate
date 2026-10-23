@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   CODEX_CLIENT_ID,
+  CODEX_CLIENT_VERSION,
   CODEX_REDIRECT_URI,
   buildCodexAuthorizeUrl,
   codexModelsEndpoint,
@@ -81,14 +82,17 @@ describe("ChatGPT (Codex) OAuth", () => {
   test("maps the Codex model catalog", () => {
     assert.equal(
       codexModelsEndpoint("https://chatgpt.com/backend-api/codex"),
-      "https://chatgpt.com/backend-api/codex/models?client_version=0.153.0",
+      `https://chatgpt.com/backend-api/codex/models?client_version=${CODEX_CLIENT_VERSION}`,
     );
     assert.deepEqual(codexModelsFromPayload({
       models: [
-        { slug: "gpt-5.5", display_name: "GPT-5.5", supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }], default_reasoning_level: "medium" },
+        { slug: "gpt-5.5", display_name: "GPT-5.5", priority: 5, supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }], default_reasoning_level: "medium" },
         { slug: "internal-model", visibility: "hide" },
+        { slug: "unlisted-model", visibility: "none", priority: 0 },
+        { slug: "gpt-6", display_name: "GPT-6", visibility: "list", priority: 1 },
       ],
     }), [
+      { id: "gpt-6", name: "GPT-6" },
       { id: "gpt-5.5", name: "GPT-5.5", reasoning: { supportedEfforts: ["low", "high"], defaultEffort: "medium" } },
     ]);
   });

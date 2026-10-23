@@ -687,7 +687,7 @@ export class OpenAICompatibleProvider {
     if (this.isCodex()) {
       try {
         const endpoint = codexModelsEndpoint(this.settings.endpoint);
-        const response = await this.authorizedFetch(endpoint, { method: "GET", signal: combined.signal }, false);
+        const response = await this.authorizedFetch(endpoint, { method: "GET", cache: "no-store", signal: combined.signal }, false);
         const payload = await response.json().catch(() => null);
         if (!response.ok) throw new ResearchProviderError(mapStatusError(response.status, responseErrorMessage(payload, "获取模型列表失败"), endpoint));
         const models = codexModelsFromPayload(payload);

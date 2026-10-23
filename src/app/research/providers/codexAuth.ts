@@ -6,7 +6,9 @@ import { updateResearchProviderApiKey } from "../storage";
 export const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const CODEX_ISSUER = "https://auth.openai.com";
 export const CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
-export const CODEX_CLIENT_VERSION = "0.153.0";
+// The backend only lists models whose minimal_client_version is at or below this, so bump it
+// with each Codex CLI release (npm view @openai/codex version) or newer models stay hidden.
+export const CODEX_CLIENT_VERSION = "0.164.0";
 export const CODEX_PERMISSION_ORIGINS = [
   "https://chatgpt.com/*",
   "https://auth.openai.com/*",
@@ -417,10 +419,15 @@ function effortValue(value: unknown): ResearchThinkingLevel | undefined {
 export function codexModelsFromPayload(payload: unknown): ResearchModelDefinition[] {
   const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
   const items = Array.isArray(record.models) ? record.models : Array.isArray(record.data) ? record.data : [];
-  return items.flatMap((item): ResearchModelDefinition[] => {
+  // Mirror the Codex CLI picker: only "list" models, ordered by catalog priority.
+  const priority = (item: unknown) => {
+    const value = item && typeof item === "object" ? (item as Record<string, unknown>).priority : undefined;
+    return typeof value === "number" && Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
+  };
+  return [...items].sort((left, right) => priority(left) - priority(right)).flatMap((item): ResearchModelDefinition[] => {
     if (!item || typeof item !== "object") return [];
     const model = item as Record<string, unknown>;
-    if (model.visibility === "hide") return [];
+    if (model.visibility === "hide" || model.visibility === "none") return [];
     const id = stringValue(model.slug) ?? stringValue(model.id);
     if (!id) return [];
     const supportedEfforts = Array.isArray(model.supported_reasoning_levels)

@@ -86,6 +86,26 @@ function cleanModels(models: ResearchModelDefinition[]) {
   });
 }
 
+// The Codex catalog is authoritative for a subscription, so it replaces the library (retired
+// models drop out, priority order is kept); other providers keep manually added IDs.
+function mergeDiscoveredModels(profile: ResearchProviderSettings, discovered: ResearchModelDefinition[]): Partial<ResearchProviderSettings> {
+  if (profile.preset === "openai_codex" || profile.authMode === "chatgpt_oauth") {
+    const available = new Set(discovered.map((model) => model.id));
+    const keep = (id: string) => (available.has(id) ? id : "");
+    return {
+      models: discovered,
+      model: keep(profile.model) || discovered[0]?.id || "",
+      fastModel: keep(profile.fastModel),
+      synthesisModel: keep(profile.synthesisModel),
+      auditModel: keep(profile.auditModel),
+    };
+  }
+  const existing = cleanModels(profile.models);
+  const known = new Set(existing.map((model) => model.id.toLowerCase()));
+  const models = [...existing, ...discovered.filter((model) => !known.has(model.id.toLowerCase()))];
+  return { models, model: profile.model || models[0]?.id || "" };
+}
+
 function modelLabel(model: ResearchModelDefinition) {
   return model.name && model.name !== model.id ? `${model.name} · ${model.id}` : model.id;
 }
@@ -527,10 +547,7 @@ export function ProviderSettingsCard({
     try {
       setSessionResearchApiKey(settings.apiKey, settings.id);
       const discovered = await new OpenAICompatibleProvider(settings).listModels();
-      const existing = cleanModels(settings.models);
-      const known = new Set(existing.map((model) => model.id.toLowerCase()));
-      const models = [...existing, ...discovered.filter((model) => !known.has(model.id.toLowerCase()))];
-      updateProfile({ models, model: settings.model || models[0]?.id || "" });
+      updateProfile(mergeDiscoveredModels(settings, discovered));
       setMessageType("success");
       setMessage(isEn ? `Loaded ${discovered.length} model(s)` : `已获取 ${discovered.length} 个模型`);
     } catch (error) {
@@ -660,13 +677,7 @@ export function ProviderSettingsCard({
       const discovered = await new OpenAICompatibleProvider(profile).listModels();
       const synced = {
         ...signedIn,
-        profiles: signedIn.profiles.map((item) => {
-          if (item.id !== profileId) return item;
-          const existing = cleanModels(item.models);
-          const known = new Set(existing.map((model) => model.id.toLowerCase()));
-          const models = [...existing, ...discovered.filter((model) => !known.has(model.id.toLowerCase()))];
-          return { ...item, models, model: item.model || models[0]?.id || "" };
-        }),
+        profiles: signedIn.profiles.map((item) => item.id === profileId ? { ...item, ...mergeDiscoveredModels(item, discovered) } : item),
       };
       await saveCollection(synced);
       setMessageType("success");
