@@ -360,6 +360,70 @@ describe("ChatGPT (Codex) OAuth", () => {
     }
   });
 
+  // Emits events on a timer; stops after `count` (or never, when count is Infinity).
+  const tickingStream = (events: (index: number) => unknown, everyMs: number, count: number) => {
+    let timer: ReturnType<typeof setInterval> | undefined;
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        let index = 0;
+        timer = setInterval(() => {
+          if (index >= count) return;
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(events(index))}\n\n`));
+          index += 1;
+        }, everyMs);
+      },
+      cancel() { clearInterval(timer); },
+    });
+  };
+
+  test("lets a research stream that keeps delivering data outlive the request timeout", { timeout: 5000 }, async () => {
+    const originalFetch = globalThis.fetch;
+    const steps = 8;
+    globalThis.fetch = async () => new Response(tickingStream((index) => index === steps - 1
+      ? { type: "response.completed", response: {} }
+      : index % 2 ? { type: "response.web_search_call.searching", item_id: `ws_${index}` } : { type: "response.output_text.delta", delta: "." }, 100, steps));
+    try {
+      // 0.3 s request timeout, ~0.8 s of streaming: only silence may fail a started stream.
+      const provider = new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 0.3 }, { idleMs: 300 });
+      const types: string[] = [];
+      for await (const event of provider.run({ messages: [{ role: "user", content: "research" }], enableWebSearch: true })) types.push(event.type);
+      assert.equal(types.at(-1), "done");
+      assert.equal(types.filter((type) => type === "delta").length, 4);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("fails a started stream only after it goes silent", { timeout: 5000 }, async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(tickingStream(() => ({ type: "response.web_search_call.searching", item_id: "ws_1" }), 20, 3));
+    try {
+      await assert.rejects(
+        (async () => {
+          for await (const _event of new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 5 }, { idleMs: 200 }).run({ messages: [{ role: "user", content: "research" }] })) void _event;
+        })(),
+        /没有新数据.*3 个事件.*最后事件 response\.web_search_call\.searching/,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("caps a stream that never finishes", { timeout: 5000 }, async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(tickingStream(() => ({ type: "response.output_text.delta", delta: "." }), 20, Infinity));
+    try {
+      await assert.rejects(
+        (async () => {
+          for await (const _event of new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 5 }, { idleMs: 1000, maxMs: 300 }).run({ messages: [{ role: "user", content: "research" }] })) void _event;
+        })(),
+        /仍未完成/,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("times out a headerless body that stops delivering data", { timeout: 1000 }, async () => {
     const originalFetch = globalThis.fetch;
     let cancelled = false;

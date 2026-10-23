@@ -551,19 +551,47 @@ function readWebSearchEvents(payload: unknown): ModelStreamEvent[] {
   return events;
 }
 
+// Abort reasons (DOMException messages) that tell the timeout kinds apart.
+const REQUEST_TIMEOUT = "Request timed out";
+const STREAM_IDLE_TIMEOUT = "Stream idle";
+const STREAM_MAX_DURATION = "Stream exceeded max duration";
+
+// Like the Codex CLI: once a stream has started, only silence fails it (no total deadline per
+// request); a long cap still stops a stream that never finishes.
+const STREAM_IDLE_MIN_MS = 300_000;
+const STREAM_MAX_MS = 30 * 60_000;
+
 function combineSignal(external: AbortSignal | undefined, timeoutMs: number) {
   const controller = new AbortController();
   const abort = () => controller.abort(external?.reason);
   external?.addEventListener("abort", abort, { once: true });
   if (external?.aborted) abort();
-  const timeout = globalThis.setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
+  const timers = new Map<string, ReturnType<typeof setTimeout>>();
+  const arm = (name: string, ms: number, reason: string) => {
+    globalThis.clearTimeout(timers.get(name));
+    timers.set(name, globalThis.setTimeout(() => controller.abort(new DOMException(reason, "TimeoutError")), ms));
+  };
+  arm("deadline", timeoutMs, REQUEST_TIMEOUT);
   return {
     signal: controller.signal,
+    /** Replaces the request deadline with an idle timer, plus an overall cap. */
+    startStream: (idleMs: number, maxMs: number) => {
+      arm("deadline", idleMs, STREAM_IDLE_TIMEOUT);
+      arm("max", maxMs, STREAM_MAX_DURATION);
+    },
+    /** Data arrived: restart the idle timer. */
+    touch: (idleMs: number) => arm("deadline", idleMs, STREAM_IDLE_TIMEOUT),
     dispose: () => {
-      globalThis.clearTimeout(timeout);
+      timers.forEach((timer) => globalThis.clearTimeout(timer));
       external?.removeEventListener("abort", abort);
     },
   };
+}
+
+function timeoutKind(signal: AbortSignal) {
+  return signal.aborted && signal.reason instanceof DOMException && signal.reason.name === "TimeoutError"
+    ? signal.reason.message
+    : "";
 }
 
 // A transport (or a token refresh) may not reject its own promise on abort.
@@ -769,7 +797,11 @@ function requestBody(settings: ResearchProviderSettings, request: ModelRunReques
 }
 
 export class OpenAICompatibleProvider {
-  constructor(private settings: ResearchProviderSettings) {}
+  constructor(
+    private settings: ResearchProviderSettings,
+    /** Stream deadlines; defaults to the research ones (idle ≥ 5 min, 30 min cap). */
+    private streamTiming: { idleMs?: number; maxMs?: number } = {},
+  ) {}
 
   async listModels(signal?: AbortSignal) {
     this.validateEndpointAndKey();
@@ -970,7 +1002,9 @@ export class OpenAICompatibleProvider {
         yield* this.readNdjson(response);
         return;
       }
-      const stream = this.readResponse(response, combined.signal);
+      const idleMs = this.streamTiming.idleMs ?? Math.max(this.settings.requestTimeoutSeconds * 1000, STREAM_IDLE_MIN_MS);
+      combined.startStream(idleMs, this.streamTiming.maxMs ?? STREAM_MAX_MS);
+      const stream = this.readResponse(response, combined.signal, () => combined.touch(idleMs), idleMs);
       let observed = false;
       for await (const event of stream) {
         if (event.type === "web_search") {
@@ -986,7 +1020,7 @@ export class OpenAICompatibleProvider {
         yield event;
       }
     } catch (error) {
-      if (!(error instanceof ResearchProviderError) && combined.signal.aborted && combined.signal.reason instanceof DOMException && combined.signal.reason.name === "TimeoutError") {
+      if (!(error instanceof ResearchProviderError) && timeoutKind(combined.signal) === REQUEST_TIMEOUT) {
         throw new ResearchProviderError({
           code: "network",
           message: `模型请求超时（${this.settings.requestTimeoutSeconds} 秒）：${connectionStage}；尚未收到可读取的模型响应，不能据此判断为思考过慢`,
@@ -999,7 +1033,12 @@ export class OpenAICompatibleProvider {
     }
   }
 
-  private async *readResponse(response: Response, signal: AbortSignal): AsyncGenerator<ModelStreamEvent> {
+  private async *readResponse(
+    response: Response,
+    signal: AbortSignal,
+    onData: () => void = () => undefined,
+    idleMs = this.settings.requestTimeoutSeconds * 1000,
+  ): AsyncGenerator<ModelStreamEvent> {
     if (!response.body) throw new ResearchProviderError({ code: "invalid_response", message: emptyResponseMessage(response, null, ""), retryable: true });
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -1009,6 +1048,7 @@ export class OpenAICompatibleProvider {
     const read = async () => {
       const chunk = await withAbort(signal, () => reader.read());
       received.bytes += chunk.value?.byteLength ?? 0;
+      if (chunk.value?.byteLength) onData();
       return chunk;
     };
     try {
@@ -1038,13 +1078,20 @@ export class OpenAICompatibleProvider {
       if (usage) yield { type: "usage", usage };
       yield { type: "done" };
     } catch (error) {
-      if (signal.aborted && signal.reason instanceof DOMException && signal.reason.name === "TimeoutError") {
+      const kind = timeoutKind(signal);
+      if (kind) {
         const progress = received.bytes === 0
           ? "已收到响应头，但正文数据为 0 字节；尚无法确认模型开始处理，请先测试职责模型并检查代理是否缓冲流式响应"
           : `已收到 ${received.bytes} 字节、${received.events} 个事件${received.lastEvent ? `，最后事件 ${received.lastEvent}` : ""}；响应尚未完成`;
+        const maxMinutes = Math.round((this.streamTiming.maxMs ?? STREAM_MAX_MS) / 60_000);
+        const what = kind === STREAM_MAX_DURATION
+          ? `模型响应超时：超过 ${maxMinutes} 分钟仍未完成`
+          : kind === STREAM_IDLE_TIMEOUT
+            ? `模型响应超时：已 ${Math.max(1, Math.round(idleMs / 1000))} 秒没有新数据`
+            : `模型响应超时（${this.settings.requestTimeoutSeconds} 秒）`;
         throw new ResearchProviderError({
           code: "network",
-          message: `模型响应超时（${this.settings.requestTimeoutSeconds} 秒 · HTTP ${response.status} · ${contentType || "no content-type"}）：${progress}`,
+          message: `${what}（HTTP ${response.status} · ${contentType || "no content-type"}）：${progress}`,
           retryable: true,
         });
       }
@@ -1180,10 +1227,12 @@ export class OpenAICompatibleProvider {
   private async testCodexConnection(signal?: AbortSignal, modelOverride?: string) {
     const permission = await ensureModelEndpointPermission(this.settings.endpoint);
     if (!permission) throw new ResearchProviderError({ code: "permission", message: "未授予模型服务域名访问权限", retryable: false });
+    // A one-word reply needs no research-length stream allowance.
+    const diagnosticMs = Math.min(30, this.settings.requestTimeoutSeconds) * 1000;
     const diagnosticProvider = new OpenAICompatibleProvider({
       ...this.settings,
-      requestTimeoutSeconds: Math.min(30, this.settings.requestTimeoutSeconds),
-    });
+      requestTimeoutSeconds: diagnosticMs / 1000,
+    }, { idleMs: diagnosticMs, maxMs: diagnosticMs });
     let text = "";
     for await (const event of diagnosticProvider.run({
       model: modelOverride?.trim() || this.settings.model,
