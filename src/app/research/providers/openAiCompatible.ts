@@ -976,8 +976,9 @@ export class OpenAICompatibleProvider {
   }
 
   /**
-   * Streams one model call, retrying transport failures (no response, or a dropped stream) like the
-   * Codex CLI does. A retry only happens before any answer text was emitted, so text never repeats.
+   * Streams one model call, retrying transport failures (no response, or a dropped stream) from
+   * scratch like the Codex CLI does. If the failed attempt already emitted text, the retry event
+   * says so and consumers discard it, so text never repeats.
    */
   async *run(request: ModelRunRequest, signal?: AbortSignal): AsyncGenerator<ModelStreamEvent> {
     for (let attempt = 0; ; attempt += 1) {
@@ -990,10 +991,10 @@ export class OpenAICompatibleProvider {
         }
         return;
       } catch (error) {
-        const retry = error instanceof ResearchProviderError && error.transport && !wroteText
+        const retry = error instanceof ResearchProviderError && error.transport
           && attempt < TRANSPORT_MAX_RETRIES && !signal?.aborted;
         if (!retry) throw error;
-        yield { type: "retry", attempt: attempt + 1, maxAttempts: TRANSPORT_MAX_RETRIES, reason: error.message };
+        yield { type: "retry", attempt: attempt + 1, maxAttempts: TRANSPORT_MAX_RETRIES, reason: error.message, discardOutput: wroteText };
         const jitter = 0.9 + Math.random() * 0.2;
         try {
           await waitOrAbort((this.streamTiming.retryBaseMs ?? TRANSPORT_RETRY_BASE_MS) * 2 ** attempt * jitter, signal);
@@ -1103,10 +1104,15 @@ export class OpenAICompatibleProvider {
     const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
     // Only counts and event names: never include prompts, text, headers or tokens.
     const received = { bytes: 0, events: 0, lastEvent: "" };
+    const startedAt = Date.now();
+    let lastDataAt = startedAt;
     const read = async () => {
       const chunk = await withAbort(signal, () => reader.read());
       received.bytes += chunk.value?.byteLength ?? 0;
-      if (chunk.value?.byteLength) onData();
+      if (chunk.value?.byteLength) {
+        lastDataAt = Date.now();
+        onData();
+      }
       return chunk;
     };
     try {
@@ -1158,7 +1164,8 @@ export class OpenAICompatibleProvider {
       const detail = error instanceof Error ? error.message : String(error);
       throw new ResearchProviderError({
         code: "network",
-        message: `读取模型响应中断（HTTP ${response.status} · ${contentType || "no content-type"} · 已收到 ${received.bytes} 字节）：${detail}`,
+        // The silence before a drop separates proxy/edge idle cut-offs from other resets.
+        message: `读取模型响应中断（HTTP ${response.status} · ${contentType || "no content-type"} · 已收到 ${received.bytes} 字节、${received.events} 个事件 · 距上次数据 ${Math.round((Date.now() - lastDataAt) / 1000)} 秒 · 已持续 ${Math.round((Date.now() - startedAt) / 1000)} 秒${received.lastEvent ? ` · 最后事件 ${received.lastEvent}` : ""}）：${detail}`,
         retryable: true,
       }, { transport: true });
     } finally {
@@ -1297,6 +1304,7 @@ export class OpenAICompatibleProvider {
       messages: [{ role: "user", content: "Reply with OK only." }],
       thinkingLevel: "low",
     }, signal)) {
+      if (event.type === "retry" && event.discardOutput) text = "";
       if (event.type === "delta") text += event.text;
     }
     if (!text.trim()) throw new ResearchProviderError({ code: "invalid_response", message: "模型连接测试未收到回答，不能仅凭 HTTP 200 判定连接成功", retryable: true });

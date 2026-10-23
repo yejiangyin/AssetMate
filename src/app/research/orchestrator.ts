@@ -466,7 +466,8 @@ export async function runResearchJob(
           continue;
         }
         if (event.type === "retry") {
-          options.onProgress?.({ job, message: message(`连接中断，正在重试（${event.attempt}/${event.maxAttempts}）`, `Connection dropped; retrying (${event.attempt}/${event.maxAttempts})`) });
+          if (event.discardOutput) content = "";
+          options.onProgress?.({ job, message: message(`连接中断，正在重新生成（${event.attempt}/${event.maxAttempts}）`, `Connection dropped; regenerating (${event.attempt}/${event.maxAttempts})`), resetPreview: event.discardOutput });
           continue;
         }
         if (event.type === "reasoning") {
@@ -582,7 +583,8 @@ export async function runResearchJob(
             continue;
           }
           if (event.type === "retry") {
-            options.onProgress?.({ job, message: message(`连接中断，正在重试（${event.attempt}/${event.maxAttempts}）`, `Connection dropped; retrying (${event.attempt}/${event.maxAttempts})`) });
+            if (event.discardOutput) content = "";
+            options.onProgress?.({ job, message: message(`连接中断，正在重新生成综合报告（${event.attempt}/${event.maxAttempts}）`, `Connection dropped; regenerating the synthesis (${event.attempt}/${event.maxAttempts})`), resetPreview: event.discardOutput });
             continue;
           }
           if (event.type === "reasoning") {
@@ -687,6 +689,7 @@ export async function runResearchJob(
         maxOutputTokens: auditSettings.maxOutputTokens,
       });
       for await (const event of auditProvider.run(request, options.signal)) {
+        if (event.type === "retry" && event.discardOutput) auditContent = "";
         if (event.type === "delta") auditContent += event.text;
       }
       // The audit request sets thinkingLevel: "off" so reasoning models don't
@@ -707,6 +710,7 @@ export async function runResearchJob(
         let repairedContent = "";
         const repairRequest = buildModelAuditRepairRequest({ content: auditContent, model: auditModel });
         for await (const event of auditProvider.run(repairRequest, options.signal)) {
+          if (event.type === "retry" && event.discardOutput) repairedContent = "";
           if (event.type === "delta") repairedContent += event.text;
         }
         parsedReview = parseModelAuditResult(repairedContent, auditModel, independent);

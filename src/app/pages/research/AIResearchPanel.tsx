@@ -767,6 +767,7 @@ export function AIResearchPanel({
           setActiveJob(event.job);
           setJobs((current) => [event.job, ...current.filter((item) => item.id !== event.job.id)]);
           setMessage(event.message);
+          if (event.resetPreview) setStreamPreview("");
           if (event.delta) setStreamPreview((current) => `${current}${event.delta}`.slice(-6000));
         },
       });

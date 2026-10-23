@@ -474,16 +474,28 @@ describe("ChatGPT (Codex) OAuth", () => {
     }
   });
 
-  test("does not retry once answer text was emitted, so text never repeats", { timeout: 5000 }, async () => {
+  test("restarts a stream that drops mid-answer and tells consumers to discard the partial text", { timeout: 5000 }, async () => {
     const originalFetch = globalThis.fetch;
     let calls = 0;
     globalThis.fetch = async () => {
       calls += 1;
-      return new Response(droppingStream([{ type: "response.output_text.delta", delta: "Half an answer" }]), { headers: { "content-type": "text/event-stream" } });
+      return new Response(calls === 1
+        ? droppingStream([{ type: "response.output_text.delta", delta: "Half an answer" }])
+        : doneStream(), { headers: { "content-type": "text/event-stream" } });
     };
     try {
-      await assert.rejects(collect(new OpenAICompatibleProvider(codexTestSettings(), { retryBaseMs: 1 })), /读取模型响应中断/);
-      assert.equal(calls, 1);
+      const events = await collect(new OpenAICompatibleProvider(codexTestSettings(), { retryBaseMs: 1 }));
+      assert.equal(calls, 2);
+      const retry = events.find((event) => event.type === "retry");
+      assert.equal(retry?.type === "retry" && retry.discardOutput, true);
+      assert.match(retry?.type === "retry" ? retry.reason : "", /距上次数据 \d+ 秒 · 已持续 \d+ 秒/);
+      // What a consumer keeps: text after the last discarding retry.
+      let text = "";
+      for (const event of events) {
+        if (event.type === "retry" && event.discardOutput) text = "";
+        if (event.type === "delta") text += event.text;
+      }
+      assert.equal(text, "OK");
     } finally {
       globalThis.fetch = originalFetch;
     }

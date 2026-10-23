@@ -164,6 +164,46 @@ describe("research orchestrator", () => {
     }
   });
 
+  test("regenerates an agent whose stream dropped mid-report without duplicating text", async () => {
+    await clearResearchLibrary();
+    const originalFetch = globalThis.fetch;
+    const report = "# Apple快速检查\n数据截止日期：2026-07-15\n## 看多优势\n[Filing](https://example.com/filing)\n## 看空风险\n风险存在。\n## 研究局限\n不构成投资建议。";
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      const body = calls === 1
+        ? new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "# Apple 半截" })}\n\n`));
+            setTimeout(() => controller.error(new TypeError("network error")), 5);
+          },
+        })
+        : [{ type: "response.output_text.delta", delta: report }, { type: "response.completed", response: {} }].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+      return new Response(body, { headers: { "content-type": "text/event-stream" } });
+    };
+    try {
+      const job = createResearchJob({
+        workflowId: "quick_check",
+        target: { symbol: "AAPL", name: "Apple", market: "US", assetType: "stock", currency: "USD" },
+        publicContext: {
+          target: { symbol: "AAPL", name: "Apple", market: "US", assetType: "stock", currency: "USD" },
+          generatedAt: "2026-07-15T00:00:00.000Z",
+          dataCutoff: "2026-07-15",
+        },
+      });
+      const progress: Array<{ message: string; resetPreview?: boolean }> = [];
+      const result = await runResearchJob(job, { ...settings, protocol: "responses", endpoint: "https://model.example/v1" }, {
+        onProgress: (event) => progress.push({ message: event.message, resetPreview: event.resetPreview }),
+      });
+      assert.equal(result.job.status, "completed");
+      assert.equal(result.job.agentResults[0]?.content, report.trim());
+      assert.ok(progress.some((item) => item.resetPreview && item.message.includes("重新生成")));
+    } finally {
+      globalThis.fetch = originalFetch;
+      await clearResearchLibrary();
+    }
+  });
+
   test("injects independent search evidence when the model has no native browsing", async () => {
     await clearResearchLibrary();
     const originalFetch = globalThis.fetch;

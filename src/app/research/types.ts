@@ -781,14 +781,19 @@ export type ModelStreamEvent =
   }
   /** The model is reasoning before it writes; carries no text, only drives progress. */
   | { type: "reasoning" }
-  /** A transport failure is being retried; nothing from the failed attempt's text was emitted. */
-  | { type: "retry"; attempt: number; maxAttempts: number; reason: string }
+  /**
+   * A transport failure is being retried from scratch. When `discardOutput` is set, the failed
+   * attempt already emitted text: consumers must drop what they collected from this call.
+   */
+  | { type: "retry"; attempt: number; maxAttempts: number; reason: string; discardOutput: boolean }
   | { type: "done" };
 
 export interface ResearchProgressEvent {
   job: ResearchJob;
   message: string;
   delta?: string;
+  /** Clear the live preview: the call streaming into it restarted after a dropped connection. */
+  resetPreview?: boolean;
 }
 
 export interface ResearchRunOptions {
