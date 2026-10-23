@@ -587,7 +587,8 @@ export type ResearchAuthMode =
   | "x_api_key"
   | "x_google_api_key"
   | "none"
-  | "custom_header";
+  | "custom_header"
+  | "chatgpt_oauth";
 export type ResearchThinkingLevel =
   | "auto"
   | "off"
@@ -600,6 +601,7 @@ export type ResearchThinkingLevel =
   | "max";
 export type ResearchProviderPreset =
   | "openai"
+  | "openai_codex"
   | "anthropic"
   | "xai"
   | "volcengine_ark"

@@ -11,6 +11,15 @@ import type {
 } from "../types";
 import { effectiveResearchThinkingLevel, getResearchThinkingControl } from "../thinkingCapabilities";
 import { getResearchWebSearchCapability } from "../webSearchCapabilities";
+import {
+  CodexAuthError,
+  codexModelsEndpoint,
+  codexModelsFromPayload,
+  codexRequestHeaders,
+  ensureFreshCodexCredentials,
+  parseCodexCredentials,
+  serializeCodexCredentials,
+} from "./codexAuth";
 
 type ChromePermissions = {
   contains: (permissions: { origins: string[] }) => Promise<boolean>;
@@ -565,6 +574,22 @@ function thinkingRetryMessage(level: ResearchThinkingLevel | undefined) {
   return level ? `思考深度已自动降级为 ${level}` : "思考深度已自动降级为服务商默认";
 }
 
+// The Codex backend only streams, rejects output caps and requires top-level instructions.
+function codexBody(model: string, request: ModelRunRequest) {
+  const instructions = request.messages.filter((message) => message.role === "system").map((message) => message.content).join("\n\n");
+  return {
+    model,
+    instructions: instructions || "You are a careful financial research assistant.",
+    input: request.messages.filter((message) => message.role !== "system").map((message) => ({
+      type: "message",
+      role: message.role === "assistant" ? "assistant" : "user",
+      content: [{ type: message.role === "assistant" ? "output_text" : "input_text", text: message.content }],
+    })),
+    stream: true,
+    store: false,
+  } as Record<string, unknown>;
+}
+
 function requestBody(settings: ResearchProviderSettings, request: ModelRunRequest, stream: boolean, thinkingLevel?: ResearchThinkingLevel) {
   const model = request.model || settings.model;
   const webSearchRequested = Boolean(request.enableWebSearch && (settings.webSearchMode === "native" || settings.webSearchMode === "auto"));
@@ -577,7 +602,10 @@ function requestBody(settings: ResearchProviderSettings, request: ModelRunReques
     });
   }
   let body: Record<string, unknown>;
-  if (settings.protocol === "responses") {
+  if (settings.preset === "openai_codex") {
+    body = codexBody(model, request);
+    if (webSearchRequested) body.tools = [{ type: "web_search" }];
+  } else if (settings.protocol === "responses") {
     body = {
       model,
       input: request.messages,
@@ -656,12 +684,27 @@ export class OpenAICompatibleProvider {
     const permission = await ensureModelEndpointPermission(this.settings.endpoint);
     if (!permission) throw new ResearchProviderError({ code: "permission", message: "未授予模型服务域名访问权限", retryable: false });
     const combined = combineSignal(signal, Math.min(30, this.settings.requestTimeoutSeconds) * 1000);
+    if (this.isCodex()) {
+      try {
+        const endpoint = codexModelsEndpoint(this.settings.endpoint);
+        const response = await this.authorizedFetch(endpoint, { method: "GET", signal: combined.signal }, false);
+        const payload = await response.json().catch(() => null);
+        if (!response.ok) throw new ResearchProviderError(mapStatusError(response.status, responseErrorMessage(payload, "获取模型列表失败"), endpoint));
+        const models = codexModelsFromPayload(payload);
+        if (!models.length) throw new ResearchProviderError({ code: "invalid_response", message: "ChatGPT 未返回可用模型，请手动添加模型 ID", retryable: false });
+        return models;
+      } catch (error) {
+        throw this.mapThrownError(error);
+      } finally {
+        combined.dispose();
+      }
+    }
     const endpoint = resolveModelListEndpoint(this.settings.endpoint, this.settings.protocol);
     try {
       const payloads: unknown[] = [];
       let nextEndpoint = endpoint;
       for (let page = 0; page < 20 && nextEndpoint; page += 1) {
-        const response = await fetch(nextEndpoint, { method: "GET", headers: this.headers(), signal: combined.signal });
+        const response = await this.authorizedFetch(nextEndpoint, { method: "GET", signal: combined.signal }, false);
         const payload = await response.json().catch(() => null);
         if (!response.ok) throw new ResearchProviderError(mapStatusError(response.status, responseErrorMessage(payload, "获取模型列表失败"), nextEndpoint));
         payloads.push(payload);
@@ -686,6 +729,7 @@ export class OpenAICompatibleProvider {
 
   async testConnection(signal?: AbortSignal, modelOverride?: string) {
     this.validateRequiredSettings();
+    if (this.isCodex()) return this.testCodexConnection(signal, modelOverride);
     const permission = await ensureModelEndpointPermission(this.settings.endpoint);
     if (!permission) throw new ResearchProviderError({ code: "permission", message: "未授予模型服务域名访问权限", retryable: false });
     const combined = combineSignal(signal, Math.min(30, this.settings.requestTimeoutSeconds) * 1000);
@@ -701,12 +745,11 @@ export class OpenAICompatibleProvider {
       const attempts = thinkingAttemptLevels(this.settings, model);
       for (let index = 0; index < attempts.length; index += 1) {
         const thinkingLevel = attempts[index];
-        const response = await fetch(endpoint, {
+        const response = await this.authorizedFetch(endpoint, {
           method: "POST",
-          headers: this.headers(),
           body: JSON.stringify(requestBody(this.settings, request, false, thinkingLevel)),
           signal: combined.signal,
-        });
+        }, false);
         const payload = await response.json().catch(() => null);
         if (response.ok) {
           const suffix = index > 0 ? ` · ${thinkingRetryMessage(thinkingLevel)}` : "";
@@ -795,12 +838,11 @@ export class OpenAICompatibleProvider {
       for (let index = 0; index < attempts.length; index += 1) {
         const thinkingLevel = attempts[index];
         const effectiveRequest = webSearchActive ? request : { ...request, enableWebSearch: false };
-        response = await fetch(endpoint, {
+        response = await this.authorizedFetch(endpoint, {
           method: "POST",
-          headers: this.headers(),
           body: JSON.stringify(requestBody(this.settings, effectiveRequest, true, thinkingLevel)),
           signal: combined.signal,
-        });
+        }, true);
         if (response.ok) break;
         const payload = await response.json().catch(() => null);
         const message = responseErrorMessage(payload, "模型请求失败");
@@ -957,6 +999,40 @@ export class OpenAICompatibleProvider {
     yield { type: "done" };
   }
 
+  private isCodex() {
+    return this.settings.preset === "openai_codex" || this.settings.authMode === "chatgpt_oauth";
+  }
+
+  private async testCodexConnection(signal?: AbortSignal, modelOverride?: string) {
+    const permission = await ensureModelEndpointPermission(this.settings.endpoint);
+    if (!permission) throw new ResearchProviderError({ code: "permission", message: "未授予模型服务域名访问权限", retryable: false });
+    let text = "";
+    for await (const event of this.run({
+      model: modelOverride?.trim() || this.settings.model,
+      messages: [{ role: "user", content: "Reply with OK only." }],
+    }, signal)) {
+      if (event.type === "delta") text += event.text;
+    }
+    return { ok: true, message: text.trim() || "OK" };
+  }
+
+  /** Adds auth headers; ChatGPT OAuth tokens are refreshed near expiry and once more after a 401. */
+  private async authorizedFetch(url: string, init: RequestInit, stream: boolean) {
+    if (!this.isCodex()) return fetch(url, { ...init, headers: this.headers() });
+    try {
+      const credentials = await ensureFreshCodexCredentials(this.settings.id, this.settings.apiKey);
+      this.settings = { ...this.settings, apiKey: serializeCodexCredentials(credentials) };
+      const response = await fetch(url, { ...init, headers: codexRequestHeaders(credentials, stream) });
+      if (response.status !== 401) return response;
+      const refreshed = await ensureFreshCodexCredentials(this.settings.id, this.settings.apiKey, true);
+      this.settings = { ...this.settings, apiKey: serializeCodexCredentials(refreshed) };
+      return fetch(url, { ...init, headers: codexRequestHeaders(refreshed, stream) });
+    } catch (error) {
+      if (error instanceof CodexAuthError) throw new ResearchProviderError({ code: "auth", message: error.message, retryable: false });
+      throw error;
+    }
+  }
+
   private headers(): Record<string, string> {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (this.settings.authMode === "bearer") headers.Authorization = `Bearer ${this.settings.apiKey}`;
@@ -981,6 +1057,10 @@ export class OpenAICompatibleProvider {
       endpointOriginPattern(resolveResearchEndpoint(this.settings.endpoint, this.settings.protocol, this.settings.model || "model"));
     } catch {
       throw new ResearchProviderError({ code: "unknown", message: "模型 API 地址无效", retryable: false });
+    }
+    if (this.settings.authMode === "chatgpt_oauth") {
+      if (!parseCodexCredentials(this.settings.apiKey)) throw new ResearchProviderError({ code: "auth", message: "请先登录 ChatGPT 账号", retryable: false });
+      return;
     }
     if (this.settings.authMode !== "none" && !this.settings.apiKey) {
       throw new ResearchProviderError({ code: "auth", message: "请填写 API Key / Token", retryable: false });

@@ -31,6 +31,7 @@ type CapabilityRule = {
 
 const RULES: Partial<Record<ResearchProviderPreset, CapabilityRule>> = {
   openai: { protocols: ["responses"], adapter: "openai_responses", modelDependent: true },
+  openai_codex: { protocols: ["responses"], adapter: "openai_responses", modelDependent: true },
   xai: { protocols: ["responses"], adapter: "openai_responses", modelDependent: true },
   volcengine_ark: { protocols: ["responses"], adapter: "openai_responses", modelDependent: true },
   anthropic: { protocols: ["anthropic_messages"], adapter: "anthropic_server", modelDependent: true },

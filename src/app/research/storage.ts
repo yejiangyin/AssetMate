@@ -35,6 +35,7 @@ export const MAX_RESEARCH_JOBS = 1000;
 
 const PROVIDER_PRESETS: ResearchProviderSettings["preset"][] = [
   "openai",
+  "openai_codex",
   "anthropic",
   "xai",
   "volcengine_ark",
@@ -69,6 +70,7 @@ const AUTH_MODES: ResearchProviderSettings["authMode"][] = [
   "x_google_api_key",
   "none",
   "custom_header",
+  "chatgpt_oauth",
 ];
 
 const THINKING_LEVELS: ResearchProviderSettings["thinkingLevel"][] = [
@@ -498,6 +500,23 @@ export function setSessionResearchApiKey(apiKey: string, profileId = DEFAULT_PRO
     const keys = await readSessionValue<Record<string, string>>(SESSION_API_KEY_STORAGE_KEY);
     await writeSessionValue(SESSION_API_KEY_STORAGE_KEY, { ...(keys ?? {}), [profileId]: apiKey.trim() });
   }).catch(() => undefined);
+}
+
+/**
+ * Replaces one profile's credential without touching any other field, keeping its
+ * session/device persistence choice. Used when OAuth tokens rotate mid-research.
+ */
+export async function updateResearchProviderApiKey(profileId: string, apiKey: string) {
+  const value = apiKey.trim();
+  sessionApiKeys.set(profileId, value);
+  await sessionApiKeyWriteQueue;
+  const sessionKeys = await readSessionValue<Record<string, string>>(SESSION_API_KEY_STORAGE_KEY) ?? {};
+  await writeSessionValue(SESSION_API_KEY_STORAGE_KEY, { ...sessionKeys, [profileId]: value });
+  const stored = await readSmallValue<StoredProviderCollection>(SETTINGS_KEY);
+  if (stored?.profiles?.some((profile) => profile.id === profileId && profile.hasSavedApiKey)) {
+    const savedKeys = await readSmallValue<Record<string, string>>(API_KEY_STORAGE_KEY) ?? {};
+    await writeSmallValue(API_KEY_STORAGE_KEY, { ...savedKeys, [profileId]: value });
+  }
 }
 
 export async function clearSavedResearchApiKey(profileId?: string) {

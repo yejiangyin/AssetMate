@@ -129,7 +129,7 @@ export function AISettings() {
               {isEn ? "The default is used only by research workflows set to “Follow default” and as a fallback. It does not overwrite workflow-specific model responsibilities." : "默认连接仅供选择“跟随默认”的研究模式使用，并作为回退连接；不会覆盖研究模式的专属调用分工。"}
             </p>
             <section className="rounded-xl p-3" style={{ background: tc.bgCard, border: `1px solid ${tc.border}` }}>
-              <ProviderSettingsCard language={language} compact includeExternalSearch={false} defaultExpanded={false} onSaved={handleProviderSaved} onOpenWebSearch={() => selectTab("search")} />
+              <ProviderSettingsCard language={language} onSaved={handleProviderSaved} onOpenWebSearch={() => selectTab("search")} />
             </section>
           </div>
         ) : tab === "search" ? (
@@ -149,7 +149,7 @@ export function AISettings() {
               <span className="rounded-full px-2 py-1 text-[11px] font-medium" style={{ background: activeSearch?.apiKey ? "rgba(49,208,139,0.1)" : "rgba(148,163,184,0.12)", color: activeSearch?.apiKey ? "#31D08B" : tc.textMicro }}>{activeSearch?.apiKey ? (isEn ? "Default" : "默认") : (isEn ? "No key" : "未配置 Key")}</span>
             </section>
             <section className="rounded-xl p-3" style={{ background: tc.bgCard, border: `1px solid ${tc.border}` }}>
-              <ExternalSearchSettingsCard language={language} defaultExpanded={false} onSaved={handleSearchSaved} />
+              <ExternalSearchSettingsCard language={language} onSaved={handleSearchSaved} />
             </section>
           </div>
         ) : (

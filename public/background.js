@@ -156,3 +156,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   return false;
 });
+
+// ChatGPT (Codex) sign-in redirects to the Codex CLI's loopback callback, which nothing
+// listens on inside a browser. Capture that navigation, hand the URL to an open settings
+// view, or reopen the settings page so the login can finish after the popup closed.
+const CODEX_PENDING_KEY = "asset-helper:codex-oauth-pending:v1";
+const CODEX_CALLBACK_KEY = "asset-helper:codex-oauth-callback:v1";
+const CODEX_CALLBACK_MESSAGE = "asset-helper:codex-oauth-callback";
+
+function isCodexCallbackUrl(value) {
+  try {
+    const url = new URL(value);
+    return (url.hostname === "localhost" || url.hostname === "127.0.0.1") && url.port === "1455" && url.pathname === "/auth/callback";
+  } catch {
+    return false;
+  }
+}
+
+async function captureCodexCallback(tabId, url) {
+  if (!chrome.storage.session) return;
+  const data = await chrome.storage.session.get(CODEX_PENDING_KEY);
+  const pending = data[CODEX_PENDING_KEY];
+  if (!pending || new URL(url).searchParams.get("state") !== pending.state) return;
+  await chrome.storage.session.set({ [CODEX_CALLBACK_KEY]: { url, receivedAt: Date.now() } });
+  await chrome.tabs.remove(tabId).catch(() => undefined);
+  const response = await chrome.runtime.sendMessage({ type: CODEX_CALLBACK_MESSAGE }).catch(() => null);
+  if (!response?.handled) {
+    await chrome.tabs.create({ url: chrome.runtime.getURL("index.html#/settings/ai?codex=callback") });
+  }
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url && isCodexCallbackUrl(changeInfo.url)) void captureCodexCallback(tabId, changeInfo.url);
+});
