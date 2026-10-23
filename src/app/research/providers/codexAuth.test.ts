@@ -179,6 +179,46 @@ describe("ChatGPT (Codex) OAuth", () => {
     }
   });
 
+  // A stream that sends its events but never closes, like a kept-alive connection.
+  const openStream = (events: unknown[]) => new ReadableStream<Uint8Array>({
+    start(controller) {
+      const encoder = new TextEncoder();
+      for (const event of events) controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+    },
+  });
+
+  test("stops reading a Codex stream at response.completed", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(openStream([
+      { type: "response.web_search_call.completed", item_id: "ws_1" },
+      { type: "response.output_text.annotation.added", annotation: { type: "url_citation", url: "https://platform.openai.com/docs", title: "OpenAI docs" } },
+      { type: "response.output_text.delta", delta: "See the docs." },
+      { type: "response.completed", response: {} },
+    ]), { headers: { "content-type": "text/event-stream" } });
+    try {
+      const result = await new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 5 }).testWebSearch();
+      assert.equal(result.sources.length, 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("surfaces response.failed from a Codex stream", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(openStream([
+      { type: "response.created", response: {} },
+      { type: "response.failed", response: { error: { code: "server_error", message: "Web search is unavailable for this model" } } },
+    ]), { headers: { "content-type": "text/event-stream" } });
+    try {
+      await assert.rejects(
+        new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 5 }).testWebSearch(),
+        /Web search is unavailable for this model/,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("reports what a non-streaming Codex reply contained", async () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => new Response(JSON.stringify({ detail: "Tool web_search is not enabled for this account" }), { headers: { "content-type": "application/json" } });

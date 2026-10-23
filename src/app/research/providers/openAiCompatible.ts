@@ -165,6 +165,24 @@ function responseErrorMessage(payload: unknown, fallback: string): string {
   return fallback;
 }
 
+const TERMINAL_STREAM_EVENTS = new Set(["response.completed", "response.done", "response.incomplete", "message_stop"]);
+
+function isTerminalStreamEvent(payload: unknown) {
+  const type = payload && typeof payload === "object" ? (payload as Record<string, unknown>).type : undefined;
+  return typeof type === "string" && TERMINAL_STREAM_EVENTS.has(type);
+}
+
+/** Error text from a Responses `response.failed` or a bare `error` stream event, if any. */
+function streamFailureMessage(payload: unknown) {
+  if (!payload || typeof payload !== "object") return "";
+  const record = payload as Record<string, unknown>;
+  if (record.type === "response.failed") {
+    return responseErrorMessage(record.response, "") || "模型服务返回失败（response.failed）";
+  }
+  if (record.type === "error") return responseErrorMessage(record, "") || "模型服务返回了错误事件";
+  return "";
+}
+
 // Names what actually came back so an unreadable 200 is diagnosable instead of "empty".
 function emptyResponseMessage(response: Response, payload: unknown, text: string) {
   const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "no content-type";
@@ -942,32 +960,47 @@ export class OpenAICompatibleProvider {
     const parseBlock = (block: string) => block.split(/\r?\n/)
       .filter((line) => line.startsWith("data:"))
       .map((line) => line.slice(5).trim());
+    // Like the Codex CLI, stop at the terminal event instead of waiting for the server to close
+    // the connection, which a kept-alive stream may not do until the request times out.
+    let finished = false;
     const emit = function* (data: string): Generator<ModelStreamEvent> {
-      if (!data || data === "[DONE]") return;
-      try {
-        const payload: unknown = JSON.parse(data);
-        yield* readWebSearchEvents(payload);
-        const delta = readDelta(payload);
-        if (delta) yield { type: "delta", text: delta };
-        const usage = readUsage(payload);
-        if (usage) yield { type: "usage", usage };
-      } catch {
-        // Ignore malformed or truncated provider events.
+      if (!data) return;
+      if (data === "[DONE]") {
+        finished = true;
+        return;
       }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        return; // Ignore malformed or truncated provider events.
+      }
+      const failure = streamFailureMessage(payload);
+      if (failure) throw new ResearchProviderError({ code: "invalid_response", message: failure, retryable: true });
+      yield* readWebSearchEvents(payload);
+      const delta = readDelta(payload);
+      if (delta) yield { type: "delta", text: delta };
+      const usage = readUsage(payload);
+      if (usage) yield { type: "usage", usage };
+      if (isTerminalStreamEvent(payload)) finished = true;
     };
     try {
-      while (true) {
+      while (!finished) {
         const { value, done } = await reader.read();
         buffer += decoder.decode(value, { stream: !done });
         const blocks = buffer.split(/\r?\n\r?\n/);
         buffer = blocks.pop() ?? "";
-        for (const block of blocks) for (const data of parseBlock(block)) yield* emit(data);
+        for (const block of blocks) {
+          for (const data of parseBlock(block)) yield* emit(data);
+          if (finished) break;
+        }
         if (done) break;
       }
-      for (const data of parseBlock(buffer)) yield* emit(data);
+      if (!finished) for (const data of parseBlock(buffer)) yield* emit(data);
     } finally {
-      // Release the stream lock so the response body can be GC'd even when
-      // the consumer aborts or breaks out of the generator early.
+      // Close a still-open stream (terminal event, error, or the consumer breaking out early),
+      // then release the lock so the body can be GC'd. Cancelling a finished stream is a no-op.
+      await reader.cancel().catch(() => undefined);
       reader.releaseLock();
     }
     yield { type: "done" };
