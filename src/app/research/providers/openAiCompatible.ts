@@ -160,7 +160,16 @@ function responseErrorMessage(payload: unknown, fallback: string): string {
     return (error as { message: string }).message;
   }
   if (typeof record.message === "string") return record.message;
+  // The ChatGPT (Codex) backend reports errors as { detail: "..." }.
+  if (typeof record.detail === "string") return record.detail;
   return fallback;
+}
+
+// Names what actually came back so an unreadable 200 is diagnosable instead of "empty".
+function emptyResponseMessage(response: Response, payload: unknown, text: string) {
+  const contentType = response.headers.get("content-type")?.split(";")[0]?.trim() || "no content-type";
+  const detail = responseErrorMessage(payload, "") || text.replace(/\s+/g, " ").trim().slice(0, 160);
+  return `模型返回了空响应（HTTP ${response.status} · ${contentType}）${detail ? `：${detail}` : ""}`;
 }
 
 function readModels(payload: unknown): ResearchModelDefinition[] {
@@ -605,7 +614,8 @@ function requestBody(settings: ResearchProviderSettings, request: ModelRunReques
   let body: Record<string, unknown>;
   if (settings.preset === "openai_codex") {
     body = codexBody(model, request);
-    if (webSearchRequested) body.tools = [{ type: "web_search" }];
+    // Same live-search tool the Codex CLI sends; without external_web_access it is cache-only.
+    if (webSearchRequested) body.tools = [{ type: "web_search", external_web_access: true }];
   } else if (settings.protocol === "responses") {
     body = {
       model,
@@ -865,32 +875,44 @@ export class OpenAICompatibleProvider {
         return;
       }
       const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-      if (!response.body || !contentType.includes("text/event-stream")) {
-        const payload = await response.json().catch(() => null);
-        const webEvents = readWebSearchEvents(payload);
-        let observed = false;
-        for (const event of webEvents) {
-          if (event.type === "web_search") {
-            observed ||= event.phase === "searching" || event.phase === "completed";
-            if (event.phase === "failed" && !request.continueOnWebSearchFailure) {
-              yield event;
-              throw new ResearchProviderError({ code: "network", message: event.error || "联网搜索工具执行失败", retryable: true });
-            }
+      let sseResponse: Response | null = response.body && contentType.includes("text/event-stream") ? response : null;
+      if (!sseResponse) {
+        const text = await response.text().catch(() => "");
+        // Some gateways stream SSE without the event-stream content type.
+        if (/^\s*(event|data):/.test(text)) {
+          sseResponse = new Response(text);
+        } else {
+          let payload: unknown = null;
+          try {
+            payload = JSON.parse(text);
+          } catch {
+            payload = null;
           }
-          yield event;
+          const webEvents = readWebSearchEvents(payload);
+          let observed = false;
+          for (const event of webEvents) {
+            if (event.type === "web_search") {
+              observed ||= event.phase === "searching" || event.phase === "completed";
+              if (event.phase === "failed" && !request.continueOnWebSearchFailure) {
+                yield event;
+                throw new ResearchProviderError({ code: "network", message: event.error || "联网搜索工具执行失败", retryable: true });
+              }
+            }
+            yield event;
+          }
+          const delta = readDelta(payload);
+          if (!delta) throw new ResearchProviderError({ code: "invalid_response", message: emptyResponseMessage(response, payload, text), retryable: true });
+          yield { type: "delta", text: delta };
+          const usage = readUsage(payload);
+          if (usage) yield { type: "usage", usage };
+          if (webSearchActive && !observed) {
+            yield { type: "web_search", phase: "unverified", error: "服务商未返回可验证的搜索事件或结构化引用" };
+          }
+          yield { type: "done" };
+          return;
         }
-        const delta = readDelta(payload);
-        if (!delta) throw new ResearchProviderError({ code: "invalid_response", message: "模型返回了空响应", retryable: true });
-        yield { type: "delta", text: delta };
-        const usage = readUsage(payload);
-        if (usage) yield { type: "usage", usage };
-        if (webSearchActive && !observed) {
-          yield { type: "web_search", phase: "unverified", error: "服务商未返回可验证的搜索事件或结构化引用" };
-        }
-        yield { type: "done" };
-        return;
       }
-      const stream = this.readSse(response);
+      const stream = this.readSse(sseResponse);
       let observed = false;
       for await (const event of stream) {
         if (event.type === "web_search") {

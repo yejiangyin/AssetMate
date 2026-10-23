@@ -130,6 +130,68 @@ describe("ChatGPT (Codex) OAuth", () => {
     }
   });
 
+  const codexTestSettings = (): ResearchProviderSettings => ({
+    id: "codex-test",
+    name: "Codex",
+    preset: "openai_codex",
+    protocol: "responses",
+    authMode: "chatgpt_oauth",
+    authHeaderName: "Authorization",
+    authHeaderPrefix: "Bearer ",
+    endpoint: "https://chatgpt.com/backend-api/codex",
+    apiKey: serializeCodexCredentials(credentialsFromTokenResponse({ access_token: accessToken, refresh_token: "r1", id_token: idToken })),
+    saveApiKey: false,
+    models: [{ id: "gpt-5.5", name: "GPT-5.5" }],
+    model: "gpt-5.5",
+    fastModel: "",
+    synthesisModel: "",
+    auditModel: "",
+    webSearchMode: "auto",
+    thinkingLevel: "auto",
+    maxConcurrency: 1,
+    maxOutputTokens: 8000,
+    requestTimeoutSeconds: 30,
+  });
+
+  test("verifies Codex native web search with the CLI's live-search tool", async () => {
+    const originalFetch = globalThis.fetch;
+    let body: Record<string, unknown> = {};
+    globalThis.fetch = async (_input, init) => {
+      body = JSON.parse(String(init?.body));
+      const stream = [
+        { type: "response.output_item.added", item: { type: "web_search_call", id: "ws_1", status: "in_progress" } },
+        { type: "response.web_search_call.searching", item_id: "ws_1" },
+        { type: "response.web_search_call.completed", item_id: "ws_1" },
+        { type: "response.output_item.done", item: { type: "web_search_call", id: "ws_1", status: "completed", action: { type: "search", query: "openai api docs" } } },
+        { type: "response.output_text.annotation.added", annotation: { type: "url_citation", url: "https://platform.openai.com/docs", title: "OpenAI docs" } },
+        { type: "response.output_text.delta", delta: "See the docs." },
+        { type: "response.completed", response: {} },
+      ].map((event) => `data: ${JSON.stringify(event)}`).join("\n\n");
+      // No event-stream content type: the stream must still be parsed.
+      return new Response(stream, { headers: { "content-type": "application/octet-stream" } });
+    };
+    try {
+      const result = await new OpenAICompatibleProvider(codexTestSettings()).testWebSearch();
+      assert.deepEqual(body.tools, [{ type: "web_search", external_web_access: true }]);
+      assert.deepEqual(result.sources.map((source) => source.url), ["https://platform.openai.com/docs"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("reports what a non-streaming Codex reply contained", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ detail: "Tool web_search is not enabled for this account" }), { headers: { "content-type": "application/json" } });
+    try {
+      await assert.rejects(
+        new OpenAICompatibleProvider(codexTestSettings()).testWebSearch(),
+        /HTTP 200 · application\/json.*Tool web_search is not enabled for this account/,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("streams research requests through the Codex backend", async () => {
     const credentials = credentialsFromTokenResponse({ access_token: accessToken, refresh_token: "r1", id_token: idToken });
     const settings: ResearchProviderSettings = {
