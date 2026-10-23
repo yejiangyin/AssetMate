@@ -165,6 +165,28 @@ function responseErrorMessage(payload: unknown, fallback: string): string {
   return fallback;
 }
 
+const REASONING_STREAM_EVENTS = new Set([
+  "response.reasoning_summary_part.added",
+  "response.reasoning_summary_text.delta",
+  "response.reasoning_text.delta",
+]);
+
+/** Whether a stream event shows the model reasoning (Responses, Anthropic, DeepSeek-style, Ollama). */
+function isReasoningEvent(payload: unknown) {
+  if (!payload || typeof payload !== "object") return false;
+  const record = payload as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type : "";
+  const field = (value: unknown, key: string) => value && typeof value === "object" ? (value as Record<string, unknown>)[key] : undefined;
+  if (REASONING_STREAM_EVENTS.has(type)) return true;
+  if (type === "response.output_item.added" && field(record.item, "type") === "reasoning") return true;
+  if (type === "content_block_start" && field(record.content_block, "type") === "thinking") return true;
+  if (type === "content_block_delta" && field(record.delta, "type") === "thinking_delta") return true;
+  const choice = Array.isArray(record.choices) ? record.choices[0] : undefined;
+  const delta = field(choice, "delta");
+  const reasoning = field(delta, "reasoning_content") ?? field(delta, "reasoning") ?? field(record.message, "thinking");
+  return typeof reasoning === "string" && reasoning.length > 0;
+}
+
 const TERMINAL_STREAM_EVENTS = new Set(["response.completed", "response.done", "response.incomplete", "message_stop"]);
 
 function isTerminalStreamEvent(payload: unknown) {
@@ -520,7 +542,8 @@ function readWebSearchEvents(payload: unknown): ModelStreamEvent[] {
     });
   });
 
-  const events: ModelStreamEvent[] = [...lifecycleEvents, ...queries.map((query): ModelStreamEvent => ({ type: "web_search", phase: "searching", query }))];
+  // Queries first, so a search item's own "completed" is the last phase it reports.
+  const events: ModelStreamEvent[] = [...queries.map((query): ModelStreamEvent => ({ type: "web_search", phase: "searching", query })), ...lifecycleEvents];
   if (sources.length) events.push({ type: "web_search", phase: "completed", sources: [...new Map(sources.map((source) => [source.url, source])).values()] });
   errors.forEach((error) => events.push({ type: "web_search", phase: "failed", error }));
   return events;
@@ -1001,6 +1024,7 @@ export class OpenAICompatibleProvider {
       }
       const failure = streamFailureMessage(payload);
       if (failure) throw new ResearchProviderError({ code: "invalid_response", message: failure, retryable: true });
+      if (isReasoningEvent(payload)) yield { type: "reasoning" };
       yield* readWebSearchEvents(payload);
       const delta = readDelta(payload);
       if (delta) yield { type: "delta", text: delta };
@@ -1049,6 +1073,7 @@ export class OpenAICompatibleProvider {
           } catch {
             return;
           }
+          if (isReasoningEvent(payload)) yield { type: "reasoning" };
           yield* readWebSearchEvents(payload);
           const delta = readDelta(payload);
           if (delta) yield { type: "delta", text: delta };

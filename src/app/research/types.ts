@@ -776,6 +776,8 @@ export type ModelStreamEvent =
     sources?: ResearchSource[];
     error?: string;
   }
+  /** The model is reasoning before it writes; carries no text, only drives progress. */
+  | { type: "reasoning" }
   | { type: "done" };
 
 export interface ResearchProgressEvent {

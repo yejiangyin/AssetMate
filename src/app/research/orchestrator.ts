@@ -181,7 +181,9 @@ function createWebSearchTrace(
 
 function applyWebSearchEvent(trace: ResearchWebSearchTrace, event: Extract<ModelStreamEvent, { type: "web_search" }>) {
   const hasExternalEvidence = trace.sources.some((source) => source.origin === "external_search");
-  if (!hasExternalEvidence || event.phase === "completed" || event.phase === "searching" || event.phase === "requested") {
+  // A query echoed after a finished search (e.g. in response.completed) must not reopen it.
+  const echoesFinishedSearch = trace.phase === "completed" && event.phase === "searching" && Boolean(event.query);
+  if (!echoesFinishedSearch && (!hasExternalEvidence || event.phase === "completed" || event.phase === "searching" || event.phase === "requested")) {
     trace.phase = event.phase;
   }
   if (event.query && !trace.queries.includes(event.query)) trace.queries.push(event.query);
@@ -456,7 +458,15 @@ export async function runResearchJob(
         webSearch = await prepareWebAccess(request, request.model, settings, agentId);
       }
       throwIfAborted(options.signal, agentId);
+      // Reasoning models think for a while before writing; say so once per stretch of thinking.
+      let thinking = false;
       for await (const event of provider.run(request, options.signal)) {
+        if (event.type === "reasoning") {
+          if (!thinking) options.onProgress?.({ job, message: message(`${researchAgentTitle(agentId)}正在思考`, `${researchAgentTitle(agentId, "en")} is thinking`) });
+          thinking = true;
+          continue;
+        }
+        thinking = false;
         if (event.type === "delta") {
           content += event.text;
           options.onProgress?.({ job, message: message(`${researchAgentTitle(agentId)}正在输出`, `${researchAgentTitle(agentId, "en")} is writing`), delta: event.text });
@@ -557,7 +567,14 @@ export async function runResearchJob(
           webSearch = await prepareWebAccess(request, request.model, synthesisSettings, "synthesis", false);
         }
         throwIfAborted(options.signal, "synthesis");
+        let thinking = false;
         for await (const event of synthesisProvider.run(request, options.signal)) {
+          if (event.type === "reasoning") {
+            if (!thinking) options.onProgress?.({ job, message: message("综合阶段正在思考", "Synthesis is thinking") });
+            thinking = true;
+            continue;
+          }
+          thinking = false;
           if (event.type === "delta") {
             content += event.text;
             options.onProgress?.({ job, message: message("正在生成综合报告", "Writing the synthesis report"), delta: event.text });

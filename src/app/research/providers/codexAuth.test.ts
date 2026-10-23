@@ -248,6 +248,23 @@ describe("ChatGPT (Codex) OAuth", () => {
     }
   });
 
+  test("reports reasoning before the answer", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(openStream([
+      { type: "response.output_item.added", item: { type: "reasoning", id: "rs_1" } },
+      { type: "response.reasoning_summary_text.delta", delta: "Checking filings" },
+      { type: "response.output_text.delta", delta: "Done." },
+      { type: "response.completed", response: {} },
+    ]), { headers: { "content-type": "text/event-stream" } });
+    try {
+      const types: string[] = [];
+      for await (const event of new OpenAICompatibleProvider({ ...codexTestSettings(), requestTimeoutSeconds: 5 }).run({ messages: [{ role: "user", content: "hi" }] })) types.push(event.type);
+      assert.deepEqual(types, ["reasoning", "reasoning", "delta", "done"]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("surfaces response.failed from a Codex stream", async () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => new Response(openStream([

@@ -74,7 +74,12 @@ export function ResearchReportView({
   const color = auditColor(report.audit.status);
   const webSearch = report.webSearch;
   const webSearchVerified = webSearch?.phase === "completed" && webSearch.sources.length > 0;
-  const webSearchColor = webSearchVerified ? "#31D08B" : webSearch?.requested ? "#F59E0B" : "#94A3B8";
+  // ChatGPT (Codex) runs searches but returns no structured citations; sources come from answer links.
+  const webSearchRanWithoutCitations = !webSearchVerified
+    && webSearch?.provider === "openai_codex"
+    && (webSearch.phase === "completed" || webSearch.phase === "unverified")
+    && webSearch.queries.length > 0;
+  const webSearchColor = webSearchVerified ? "#31D08B" : webSearchRanWithoutCitations ? "#4F9CF9" : webSearch?.requested ? "#F59E0B" : "#94A3B8";
   const dataStatus = report.dataStatus;
   const localDataSources = [...new Map((report.targetContexts ?? []).flatMap((context) => context.provenance)
     .filter((item) => Boolean(item.sourceUrl))
@@ -231,14 +236,18 @@ export function ResearchReportView({
             <p className="text-[12px] font-semibold">
               {webSearchVerified
                 ? (isEn ? "Web search verified" : "本次实际联网已验证")
-                : webSearch?.requested
+                : webSearchRanWithoutCitations
+                  ? (isEn ? `Searched the web ${webSearch.queries.length} time(s)` : `已联网检索 ${webSearch.queries.length} 次`)
+                  : webSearch?.requested
                   ? (isEn ? "Web search unverified" : "已请求联网，但未验证")
                   : (isEn ? "Offline research" : "本次未联网")}
             </p>
             <p className="mt-0.5 text-[11px] leading-[1.55] opacity-80">
               {webSearchVerified
                 ? `${webSearch.method === "hybrid" ? (isEn ? "Hybrid" : "混合联网") : webSearch.method === "external" ? (isEn ? "External search" : "外部搜索") : (isEn ? "Native search" : "原生联网")} · ${webSearch.sources.length} ${isEn ? "structured sources" : "个结构化来源"}${webSearch.externalProvider ? ` · ${webSearch.externalProvider}` : ""}${webSearch.queries.length ? ` · ${webSearch.queries.length} ${isEn ? "queries" : "条查询"}` : ""}`
-                : webSearch?.errors[0]
+                : webSearchRanWithoutCitations
+                  ? (isEn ? "ChatGPT subscription returns no structured citations; sources are taken from links in the report." : "ChatGPT 订阅接口不返回结构化引用，来源取自报告正文链接。")
+                  : webSearch?.errors[0]
                   || (webSearch?.queries.length
                     ? (isEn
                       ? `${webSearch.queries.length} queries were generated, but no structured search source was returned.`
