@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "资产助手",
-  "version": "2.0.9",
-  "version_name": "2.0.9",
+  "version": "2.0.10",
+  "version_name": "2.0.10",
   "description": "记录持仓与收益，查看行情变化，辅助个人资产管理。",
   "permissions": [
     "sidePanel",

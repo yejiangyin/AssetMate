@@ -114,6 +114,25 @@ describe("financial rigor", () => {
     assert.equal(verified.status, "verified");
   });
 
+  test("treats a Codex search without citations as a review warning, not a failure", () => {
+    const markdown = "# ACME\n数据截止日期：2026-07-15\n## 看多优势\n证据 [Filing](https://example.com/a).\n## 看空风险\n风险存在。\n## 研究局限\n不构成投资建议。";
+    const webSearch = (provider: "openai_codex" | "openai") => ({
+      requested: true,
+      supported: true,
+      phase: "unverified" as const,
+      provider,
+      protocol: "responses" as const,
+      model: "gpt-test",
+      queries: ["ACME filing"],
+      sources: [],
+      errors: [],
+    });
+    const check = (provider: "openai_codex" | "openai") => auditResearchReport({ markdown, dataCutoff: "2026-07-15", sources: [], webSearch: webSearch(provider) })
+      .checks.find((item) => item.id === "web-search");
+    assert.equal(check("openai_codex")?.status, "warning");
+    assert.equal(check("openai")?.status, "fail");
+  });
+
   test("parses K/M/B/T using international financial units", () => {
     const checks = verifyReportCalculations("Price: 100 USD\nShares outstanding: 2B\nMarket cap: 200B USD");
     assert.equal(checks.find((check) => check.id === "marketcap-verify")?.status, "pass");

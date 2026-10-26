@@ -587,7 +587,8 @@ export type ResearchAuthMode =
   | "x_api_key"
   | "x_google_api_key"
   | "none"
-  | "custom_header";
+  | "custom_header"
+  | "chatgpt_oauth";
 export type ResearchThinkingLevel =
   | "auto"
   | "off"
@@ -600,6 +601,7 @@ export type ResearchThinkingLevel =
   | "max";
 export type ResearchProviderPreset =
   | "openai"
+  | "openai_codex"
   | "anthropic"
   | "xai"
   | "volcengine_ark"
@@ -758,6 +760,8 @@ export interface ModelRunRequest {
   temperature?: number;
   maxOutputTokens?: number;
   enableWebSearch?: boolean;
+  /** Require a search for capability diagnostics; normal research lets the model choose. */
+  requireWebSearch?: boolean;
   continueOnWebSearchFailure?: boolean;
   /** Override the provider's thinking level for this request (e.g. "off" for
    * structured-output audits that should not burn tokens on reasoning). */
@@ -765,6 +769,7 @@ export interface ModelRunRequest {
 }
 
 export type ModelStreamEvent =
+  | { type: "response_started" }
   | { type: "delta"; text: string }
   | { type: "usage"; usage: ModelUsage }
   | {
@@ -774,12 +779,21 @@ export type ModelStreamEvent =
     sources?: ResearchSource[];
     error?: string;
   }
+  /** The model is reasoning before it writes; carries no text, only drives progress. */
+  | { type: "reasoning" }
+  /**
+   * A transport failure is being retried from scratch. When `discardOutput` is set, the failed
+   * attempt already emitted text: consumers must drop what they collected from this call.
+   */
+  | { type: "retry"; attempt: number; maxAttempts: number; reason: string; discardOutput: boolean }
   | { type: "done" };
 
 export interface ResearchProgressEvent {
   job: ResearchJob;
   message: string;
   delta?: string;
+  /** Clear the live preview: the call streaming into it restarted after a dropped connection. */
+  resetPreview?: boolean;
 }
 
 export interface ResearchRunOptions {

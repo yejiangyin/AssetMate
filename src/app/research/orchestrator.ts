@@ -181,7 +181,9 @@ function createWebSearchTrace(
 
 function applyWebSearchEvent(trace: ResearchWebSearchTrace, event: Extract<ModelStreamEvent, { type: "web_search" }>) {
   const hasExternalEvidence = trace.sources.some((source) => source.origin === "external_search");
-  if (!hasExternalEvidence || event.phase === "completed" || event.phase === "searching" || event.phase === "requested") {
+  // A query echoed after a finished search (e.g. in response.completed) must not reopen it.
+  const echoesFinishedSearch = trace.phase === "completed" && event.phase === "searching" && Boolean(event.query);
+  if (!echoesFinishedSearch && (!hasExternalEvidence || event.phase === "completed" || event.phase === "searching" || event.phase === "requested")) {
     trace.phase = event.phase;
   }
   if (event.query && !trace.queries.includes(event.query)) trace.queries.push(event.query);
@@ -456,7 +458,24 @@ export async function runResearchJob(
         webSearch = await prepareWebAccess(request, request.model, settings, agentId);
       }
       throwIfAborted(options.signal, agentId);
+      // Reasoning models think for a while before writing; say so once per stretch of thinking.
+      let thinking = false;
       for await (const event of provider.run(request, options.signal)) {
+        if (event.type === "response_started") {
+          options.onProgress?.({ job, message: message("模型已连接，等待分析或搜索结果", "Model connected; waiting for analysis or search results") });
+          continue;
+        }
+        if (event.type === "retry") {
+          if (event.discardOutput) content = "";
+          options.onProgress?.({ job, message: message(`连接中断，正在重新生成（${event.attempt}/${event.maxAttempts}）`, `Connection dropped; regenerating (${event.attempt}/${event.maxAttempts})`), resetPreview: event.discardOutput });
+          continue;
+        }
+        if (event.type === "reasoning") {
+          if (!thinking) options.onProgress?.({ job, message: message(`${researchAgentTitle(agentId)}正在思考`, `${researchAgentTitle(agentId, "en")} is thinking`) });
+          thinking = true;
+          continue;
+        }
+        thinking = false;
         if (event.type === "delta") {
           content += event.text;
           options.onProgress?.({ job, message: message(`${researchAgentTitle(agentId)}正在输出`, `${researchAgentTitle(agentId, "en")} is writing`), delta: event.text });
@@ -471,7 +490,7 @@ export async function runResearchJob(
                 ? message("联网请求未取得可验证引用", "Web search returned no verifiable citations")
                 : event.phase === "failed"
                   ? message("联网工具执行失败", "Web search tool failed")
-                  : message("已请求联网搜索", "Web search requested");
+                  : message("已启用联网搜索，正在连接模型", "Web search enabled; connecting to the model");
           options.onProgress?.({ job, message: statusMessage });
         }
       }
@@ -557,7 +576,23 @@ export async function runResearchJob(
           webSearch = await prepareWebAccess(request, request.model, synthesisSettings, "synthesis", false);
         }
         throwIfAborted(options.signal, "synthesis");
+        let thinking = false;
         for await (const event of synthesisProvider.run(request, options.signal)) {
+          if (event.type === "response_started") {
+            options.onProgress?.({ job, message: message("模型已连接，等待综合分析结果", "Model connected; waiting for synthesis") });
+            continue;
+          }
+          if (event.type === "retry") {
+            if (event.discardOutput) content = "";
+            options.onProgress?.({ job, message: message(`连接中断，正在重新生成综合报告（${event.attempt}/${event.maxAttempts}）`, `Connection dropped; regenerating the synthesis (${event.attempt}/${event.maxAttempts})`), resetPreview: event.discardOutput });
+            continue;
+          }
+          if (event.type === "reasoning") {
+            if (!thinking) options.onProgress?.({ job, message: message("综合阶段正在思考", "Synthesis is thinking") });
+            thinking = true;
+            continue;
+          }
+          thinking = false;
           if (event.type === "delta") {
             content += event.text;
             options.onProgress?.({ job, message: message("正在生成综合报告", "Writing the synthesis report"), delta: event.text });
@@ -654,6 +689,7 @@ export async function runResearchJob(
         maxOutputTokens: auditSettings.maxOutputTokens,
       });
       for await (const event of auditProvider.run(request, options.signal)) {
+        if (event.type === "retry" && event.discardOutput) auditContent = "";
         if (event.type === "delta") auditContent += event.text;
       }
       // The audit request sets thinkingLevel: "off" so reasoning models don't
@@ -674,6 +710,7 @@ export async function runResearchJob(
         let repairedContent = "";
         const repairRequest = buildModelAuditRepairRequest({ content: auditContent, model: auditModel });
         for await (const event of auditProvider.run(repairRequest, options.signal)) {
+          if (event.type === "retry" && event.discardOutput) repairedContent = "";
           if (event.type === "delta") repairedContent += event.text;
         }
         parsedReview = parseModelAuditResult(repairedContent, auditModel, independent);

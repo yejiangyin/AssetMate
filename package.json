@@ -2,7 +2,7 @@
   "name": "asset-helper",
   "description": "记录持仓与收益，查看行情变化，辅助个人资产管理。",
   "private": true,
-  "version": "2.0.9",
+  "version": "2.0.10",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {

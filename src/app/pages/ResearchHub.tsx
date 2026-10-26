@@ -60,27 +60,25 @@ export function ResearchHub() {
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-app-bg">
-      <header className="shrink-0 border-b border-app-border bg-app-bg px-4 pb-2 pt-3">
+      <header className="shrink-0 border-b border-app-border bg-app-bg px-3 pb-2.5 pt-3">
         <div className="flex items-center gap-2">
-          <Microscope size={18} color="#4F9CF9" />
-          <div>
-            <h1 className="text-[15px] font-extrabold text-tp">{isEn ? "Research Center" : "投研中心"}</h1>
-            <p className="text-[9px] text-tmi">{isEn ? "Evidence, scenarios and strategy validation" : "证据研究、情景推演与策略验证"}</p>
+          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-[rgba(79,156,249,0.12)] text-app-accent"><Microscope size={16} /></span>
+          <div className="min-w-0">
+            <h1 className="text-[15px] font-bold leading-5 text-tp">{isEn ? "Research Center" : "投研中心"}</h1>
+            <p className="truncate text-[11px] text-tmi">{isEn ? "Evidence, scenarios and strategy validation" : "证据研究、情景推演与策略验证"}</p>
           </div>
         </div>
-        <div className="mt-3 grid grid-cols-3 rounded-xl bg-app-card p-1">
+        <div className="mt-2.5 grid grid-cols-3 gap-1 rounded-xl border border-app-border bg-app-card p-1" role="tablist" aria-label={isEn ? "Research center sections" : "投研中心页签"}>
           {tabs.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
               type="button"
+              role="tab"
+              aria-selected={tab === id}
               onClick={() => setTab(id)}
-              className="flex items-center justify-center gap-1 rounded-lg py-1.5 text-[10px] font-semibold transition-colors"
-              style={{
-                color: tab === id ? "#4F9CF9" : "var(--text-muted)",
-                background: tab === id ? "rgba(79,156,249,0.14)" : "transparent",
-              }}
+              className={`flex h-8 items-center justify-center gap-1.5 rounded-lg text-[12px] font-semibold transition-colors ${tab === id ? "bg-[rgba(79,156,249,0.13)] text-app-accent" : "text-tm"}`}
             >
-              <Icon size={11} />{label}
+              <Icon size={13} />{label}
             </button>
           ))}
         </div>

@@ -640,12 +640,21 @@ export function auditResearchReport(input: {
         status: "pass",
         detail: `已验证实际联网，并取得 ${structuredSourceCount} 个结构化来源`,
       }
-      : {
-        id: "web-search",
-        label: "联网检索",
-        status: "fail",
-        detail: input.webSearch.errors[0] || "已请求联网，但没有取得可验证的搜索事件或结构化引用",
-      };
+      // ChatGPT (Codex) searches for real but never returns structured citations, so a search that
+      // ran is a review warning rather than a failure; other providers must return citations.
+      : input.webSearch.provider === "openai_codex" && input.webSearch.queries.length > 0 && !input.webSearch.errors.length
+        ? {
+          id: "web-search",
+          label: "联网检索",
+          status: "warning",
+          detail: `已联网检索 ${input.webSearch.queries.length} 次；ChatGPT 订阅接口不返回结构化引用，时效性事实请对照正文链接复核`,
+        }
+        : {
+          id: "web-search",
+          label: "联网检索",
+          status: "fail",
+          detail: input.webSearch.errors[0] || "已请求联网，但没有取得可验证的搜索事件或结构化引用",
+        };
   const dataStatusCheck: ResearchAuditCheck | null = input.publicContext?.dataStatus
     ? {
         id: "market-data-coverage",

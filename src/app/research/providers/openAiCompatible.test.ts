@@ -176,8 +176,8 @@ describe("OpenAI-compatible browser provider", () => {
     }), { headers: { "content-type": "application/json" } });
     try {
       const events = await collect(new OpenAICompatibleProvider(settings));
-      assert.equal(events[0]?.type, "delta");
-      assert.equal(events[0]?.type === "delta" ? events[0].text : "", "JSON answer");
+      assert.equal(events[0]?.type, "response_started");
+      assert.equal(events.find((event) => event.type === "delta")?.text, "JSON answer");
       assert.equal(events.some((event) => event.type === "usage" && event.usage.totalTokens === 13), true);
     } finally {
       globalThis.fetch = originalFetch;
