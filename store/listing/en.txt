@@ -2,7 +2,7 @@ AssetMate helps you record your holdings and review changes in their value and r
 
 You can organize your holdings, review portfolio summaries and historical returns, record recurring investment plans, and open charts for a selected asset.
 
-The Research Center supports historical strategy backtesting and research report management. Optional AI research requires you to configure a model service. Research requests are sent directly to the service you select.
+The Research Center supports historical strategy backtesting and research report management. Optional AI research requires you to configure a model service using API credentials or a supported account sign-in method. Research requests are sent directly to the service you select. For account connections, the extension retains sign-in credentials in your browser according to your save settings to make subsequent requests and renew the session.
 
 Portfolio records are stored in your browser. Market queries and research features connect to external services. Network availability and the services' update frequency can affect the information displayed.
 
