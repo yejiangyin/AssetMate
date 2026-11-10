@@ -346,7 +346,25 @@ function valuationCurrency(raw: string | undefined) {
   return /^[A-Z]{3}$/.test(value) ? value : null;
 }
 
-/** Checks the assumptions the report actually states; no fixed market rates are imposed. */
+/**
+ * Reasonable discount-rate bands per currency, mirroring ai-berkshire terminal_value.py CURRENCY_BANDS.
+ * Other currencies are not range-checked; the report must justify r itself.
+ */
+export const TERMINAL_RATE_BANDS: Record<string, readonly [number, number]> = {
+  CNY: [0.06, 0.09],
+  USD: [0.09, 0.115],
+  HKD: [0.09, 0.115],
+};
+
+function inRateBand(rate: Decimal, band: readonly [number, number] | undefined) {
+  return !band || (rate.gte(band[0] - 1e-9) && rate.lte(band[1] + 1e-9));
+}
+
+function formatRate(rate: Decimal) {
+  return `${rate.times(100).toDecimalPlaces(2).toString()}%`;
+}
+
+/** Checks the assumptions the report actually states against the ai-berkshire ten-year stress-test rules. */
 export function verifyLongTermValuation(markdown: string): ResearchAuditCheck[] {
   if (!/(长期估值参数|十年.{0,16}(?:IRR|终值).{0,16}\d|10[ -]?year.{0,16}(?:IRR|terminal).{0,16}\d|终值\s*PE\s*[:：|]\s*\d|terminal\s*P\/?E\s*[:：|]\s*\d)/i.test(markdown)) return [];
   const rows = longTermValuationRows(markdown);
@@ -393,11 +411,31 @@ export function verifyLongTermValuation(markdown: string): ResearchAuditCheck[] 
     status: deviation.lte(1) ? "pass" : deviation.lte(5) ? "warning" : "fail",
     detail: `按 (1−g/ROIC)/(r−g) 计算为 ${calculatedPe.toDecimalPlaces(2).toString()} 倍；报告为 ${statedPe.toString()} 倍，偏差 ${deviation.toDecimalPlaces(2).toString()}%`,
   });
+  const band = TERMINAL_RATE_BANDS[discountCurrency];
+  if (band) {
+    const ok = inRateBand(r, band);
+    checks.push({
+      id: "terminal-rate-band",
+      label: "折现率币种区间",
+      status: ok ? "pass" : "fail",
+      detail: `${discountCurrency} 合理区间 ${formatRate(new Decimal(band[0]))}–${formatRate(new Decimal(band[1]))}；基准 r 为 ${formatRate(r)}${ok ? "" : "，在区间外，长期估值结论应打回重算"}`,
+    });
+  }
+  const listedRates = sensitivityRates.map((rate) => new Decimal(rate.replace("%", "")).div(100));
+  const listed = (rate: Decimal) => listedRates.some((value) => value.minus(rate).abs().lt(0.0001));
+  const hasShift = (pp: number) => listed(r.minus(pp)) && listed(r.plus(pp));
+  const twoPpOutOfBand = Boolean(band) && !inRateBand(r.minus(0.02), band) && !inRateBand(r.plus(0.02), band);
+  const sensitivityOk = hasShift(0.02) && (!twoPpOutOfBand || hasShift(0.01));
+  const flipStated = /翻转|\bflip/i.test(markdown);
   checks.push({
     id: "terminal-sensitivity",
-    label: "折现率敏感性",
-    status: new Set(sensitivityRates).size >= 2 ? "pass" : "warning",
-    detail: new Set(sensitivityRates).size >= 2 ? "已列出至少两个不同折现率情景" : "请列出至少两个不同折现率及相应结果",
+    label: "折现率敏感性（r±2pp）",
+    status: sensitivityOk && flipStated ? "pass" : "warning",
+    detail: !sensitivityOk
+      ? `需列出 ${formatRate(r.minus(0.02))} 与 ${formatRate(r.plus(0.02))} 两档${twoPpOutOfBand ? `，且 ±2pp 两侧都在区间外，还需补 ${formatRate(r.minus(0.01))} 与 ${formatRate(r.plus(0.01))}` : ""}的结果`
+      : flipStated
+        ? `已列出 r±2pp${twoPpOutOfBand ? " 与 r±1pp" : ""} 情景并说明结论是否翻转`
+        : "已列出 r±2pp 情景，但未写明结论是否随折现率翻转",
   });
   return checks;
 }

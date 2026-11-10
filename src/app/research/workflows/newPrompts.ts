@@ -1,8 +1,16 @@
 import type { IncomeInvestmentContext, PortfolioResearchContext, ThesisDriftContext } from "../types";
+import { TERMINAL_RATE_BANDS } from "../finance/financialRigor";
 
 function safeJson(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
+
+const terminalRateBandText = Object.entries(TERMINAL_RATE_BANDS)
+  .map(([currency, [low, high]]) => `${currency} ${low * 100}%–${high * 100}%`)
+  .join("、");
+
+/** Long-term valuation table shared by every workflow that reports a ten-year IRR or terminal PE (ai-berkshire investment-research). */
+export const TERMINAL_VALUATION_TABLE_RULES = `若使用十年 IRR 或终值 PE，附“长期估值参数”两列表，逐行给出现金流币种、折现率币种、折现率 r、永续增速 g、稳态增量 ROIC、终值 PE、折现率敏感性。折现率 r 须落在币种合理区间内（${terminalRateBandText}；其他币种须说明依据）。折现率敏感性一行写成“r−2pp：期望 IRR …；r：…；r+2pp：…”，三档都要有具体 r 值；若 ±2pp 两侧都落在区间外，再补 r±1pp 两档。终值 PE 按 (1-g/ROIC)/(r-g) 计算；输入不足时不输出数值。说明离散风险在情景中的处理，不能用一个未解释的折现率掩盖风险。`;
 
 /**
  * A/B/C 信息丰富度评级前言 -- 强制 agent 先评估资料丰富度，按评级调整研究深度。
@@ -34,7 +42,7 @@ export function eraAlphaPrompt(context: string, topic: string) {
 逐家公司检查最近 4–8 个季度的财报趋势、周度或月度高频指标、行业供需、竞争、政策和宏观。财报之外的高频数据必须注明指标定义、统计期、来源和发布时间；未取得可靠数据时填“缺失”，不得补造。用一张表同时列出支持证据、矛盾证据及其对结论的影响。
 
 ## 四、估值锚点
-有可验证的同口径历史 PE/PS 序列时，才给 5/10 年历史分位、样本区间和亏损年份处理方式；否则写“历史分位无法计算”。给出增长兑现所需的经营假设及估值敏感性，区分事实、推算与情景。若使用十年 IRR 或终值 PE，附“长期估值参数”两列表：现金流币种、折现率币种、折现率 r、永续增速 g、稳态增量 ROIC、终值 PE、折现率敏感性（至少两个不同 r 值）。终值 PE 使用 (1-g/ROIC)/(r-g)，任何输入不足则不输出数值。
+有可验证的同口径历史 PE/PS 序列时，才给 5/10 年历史分位、样本区间和亏损年份处理方式；否则写“历史分位无法计算”。给出增长兑现所需的经营假设及估值敏感性，区分事实、推算与情景。${TERMINAL_VALUATION_TABLE_RULES}十年折现只作仓位压力测试，不得单独否决结论。
 
 ## 五、拐点观察清单
 逐家公司列出宏观、行业和公司层面的可证伪信号。每条写清“观察指标 / 当前基准 / 触发阈值 / 频率 / 数据来源”；没有可靠基准或阈值时标为待建立，不把主观判断写成已监测事实。

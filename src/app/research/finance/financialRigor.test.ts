@@ -58,14 +58,40 @@ describe("financial rigor", () => {
       "| 永续增速 g | 2% |",
       "| 稳态增量 ROIC | 20% |",
       "| 终值 PE | 15 倍 |",
-      "| 折现率敏感性 | 7%：18 倍；9%：12.86 倍 |",
+      "| 折现率敏感性 | 6%：期望 IRR 9.1%；8%：期望 IRR 8.2%；10%：期望 IRR 7.4% |",
+      "",
+      "结论在人民币合理区间内不随折现率翻转。",
     ].join("\n");
     const checks = verifyLongTermValuation(report);
     assert.equal(checks.find((check) => check.id === "terminal-currency")?.status, "pass");
     assert.equal(checks.find((check) => check.id === "terminal-pe-consistency")?.status, "pass");
     assert.equal(checks.find((check) => check.id === "terminal-sensitivity")?.status, "pass");
     assert.equal(checks.find((check) => check.id === "terminal-assumptions")?.status, "pass");
+    assert.equal(checks.find((check) => check.id === "terminal-rate-band")?.status, "pass");
     assert.equal(verifyLongTermValuation("报告未使用长期终值估值").length, 0);
+  });
+
+  test("requires r±2pp stress tiers, a flip statement and an in-band base rate", () => {
+    const table = (r: string, sensitivity: string) => [
+      "## 长期估值参数",
+      "| 现金流币种 | CNY |",
+      "| 折现率币种 | CNY |",
+      `| 折现率 r | ${r} |`,
+      "| 永续增速 g | 1% |",
+      "| 稳态增量 ROIC | 20% |",
+      `| 终值 PE | ${r === "7.5%" ? "14.62" : "13.57"} 倍 |`,
+      `| 折现率敏感性 | ${sensitivity} |`,
+    ].join("\n");
+    const status = (markdown: string, id: string) => verifyLongTermValuation(markdown).find((check) => check.id === id)?.status;
+
+    const onlyTwoPp = table("7.5%", "5.5%：期望 IRR 10%；7.5%：8%；9.5%：6.5%") + "\n结论随折现率翻转。";
+    assert.equal(status(onlyTwoPp, "terminal-rate-band"), "pass");
+    assert.equal(status(onlyTwoPp, "terminal-sensitivity"), "warning");
+    const withOnePp = table("7.5%", "5.5%：10%；6.5%：9%；7.5%：8%；8.5%：7.2%；9.5%：6.5%") + "\n结论随折现率翻转。";
+    assert.equal(status(withOnePp, "terminal-sensitivity"), "pass");
+    const noFlip = table("7.5%", "5.5%：10%；6.5%：9%；7.5%：8%；8.5%：7.2%；9.5%：6.5%");
+    assert.equal(status(noFlip, "terminal-sensitivity"), "warning");
+    assert.equal(status(table("8%", "6%：9%；8%：8%；10%：7%") + "\n结论不翻转。", "terminal-sensitivity"), "pass");
   });
 
   test("flags mismatched currencies, implausible assumptions and wrong terminal math", () => {
@@ -75,6 +101,7 @@ describe("financial rigor", () => {
     assert.equal(checks.find((check) => check.id === "terminal-assumptions")?.status, "warning");
     assert.equal(checks.find((check) => check.id === "terminal-pe-consistency")?.status, "fail");
     assert.equal(checks.find((check) => check.id === "terminal-sensitivity")?.status, "warning");
+    assert.equal(checks.find((check) => check.id === "terminal-rate-band")?.status, "fail");
     const invalid = verifyLongTermValuation(base.replace("8%", "3%"));
     assert.equal(invalid.find((check) => check.id === "terminal-assumptions")?.status, "fail");
     assert.equal(verifyLongTermValuation("十年 IRR 为 8%，但暂无参数表")[0]?.status, "warning");
