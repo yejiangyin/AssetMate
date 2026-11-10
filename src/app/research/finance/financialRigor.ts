@@ -425,14 +425,14 @@ export function verifyLongTermValuation(markdown: string): ResearchAuditCheck[] 
   const listed = (rate: Decimal) => listedRates.some((value) => value.minus(rate).abs().lt(0.0001));
   const hasShift = (pp: number) => listed(r.minus(pp)) && listed(r.plus(pp));
   const twoPpOutOfBand = Boolean(band) && !inRateBand(r.minus(0.02), band) && !inRateBand(r.plus(0.02), band);
-  const sensitivityOk = hasShift(0.02) && (!twoPpOutOfBand || hasShift(0.01));
+  const sensitivityOk = listed(r) && hasShift(0.02) && (!twoPpOutOfBand || hasShift(0.01));
   const flipStated = /翻转|\bflip/i.test(markdown);
   checks.push({
     id: "terminal-sensitivity",
     label: "折现率敏感性（r±2pp）",
     status: sensitivityOk && flipStated ? "pass" : "warning",
     detail: !sensitivityOk
-      ? `需列出 ${formatRate(r.minus(0.02))} 与 ${formatRate(r.plus(0.02))} 两档${twoPpOutOfBand ? `，且 ±2pp 两侧都在区间外，还需补 ${formatRate(r.minus(0.01))} 与 ${formatRate(r.plus(0.01))}` : ""}的结果`
+      ? `需列出基准 ${formatRate(r)}、${formatRate(r.minus(0.02))} 与 ${formatRate(r.plus(0.02))} 三档${twoPpOutOfBand ? `，且 ±2pp 两侧都在区间外，还需补 ${formatRate(r.minus(0.01))} 与 ${formatRate(r.plus(0.01))}` : ""}的结果`
       : flipStated
         ? `已列出 r±2pp${twoPpOutOfBand ? " 与 r±1pp" : ""} 情景并说明结论是否翻转`
         : "已列出 r±2pp 情景，但未写明结论是否随折现率翻转",

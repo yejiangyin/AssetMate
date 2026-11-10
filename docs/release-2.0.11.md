@@ -32,6 +32,6 @@ This update improves long-term valuation and report checks in AI research.
 
 发布前检查：613 项测试通过，ESLint、TypeScript 检查和生产构建通过。已检查 Manifest V3、版本一致性（`package.json`、`manifest.json`、请求标识规则）、Manifest 引用的文件均存在、无 source map、无 `eval` / `new Function` / 远程脚本入口，以及 ZIP 完整性和解压后文件逐字节一致性。
 
-上架包大小：638,775 字节；共 31 个文件。SHA-256：`e5d53c2c1b7442b288d932a3b56c10d24b8d83eca6b23f6bfad92f2d31937c95`。
+上架包大小：638,817 字节；共 31 个文件。SHA-256：`0e97af8682a40239c5169138d57f3f5253e101b950ce8cdad982668c0fa221eb`。
 
 自动化测试使用模拟响应；生产构建、静态检查和打包验证不代表真实模型研究输出或商店审核已通过。

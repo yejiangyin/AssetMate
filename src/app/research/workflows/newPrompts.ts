@@ -10,7 +10,7 @@ const terminalRateBandText = Object.entries(TERMINAL_RATE_BANDS)
   .join("、");
 
 /** Long-term valuation table shared by every workflow that reports a ten-year IRR or terminal PE (ai-berkshire investment-research). */
-export const TERMINAL_VALUATION_TABLE_RULES = `若使用十年 IRR 或终值 PE，附“长期估值参数”两列表，逐行给出现金流币种、折现率币种、折现率 r、永续增速 g、稳态增量 ROIC、终值 PE、折现率敏感性。折现率 r 须落在币种合理区间内（${terminalRateBandText}；其他币种须说明依据）。折现率敏感性一行写成“r−2pp：期望 IRR …；r：…；r+2pp：…”，三档都要有具体 r 值；若 ±2pp 两侧都落在区间外，再补 r±1pp 两档。终值 PE 按 (1-g/ROIC)/(r-g) 计算；输入不足时不输出数值。说明离散风险在情景中的处理，不能用一个未解释的折现率掩盖风险。`;
+export const TERMINAL_VALUATION_TABLE_RULES = `若使用十年 IRR 或终值 PE，附“长期估值参数”两列表，逐行给出现金流币种、折现率币种、折现率 r、永续增速 g、稳态增量 ROIC、终值 PE、折现率敏感性。折现率 r 须落在币种合理区间内（${terminalRateBandText}；其他币种须说明依据）。折现率敏感性一行写成“r−2pp：期望 IRR …；r：…；r+2pp：…”，三档都要有具体 r 值；若 ±2pp 两侧都落在区间外，再补 r±1pp 两档。表后用一句话写明“结论在币种合理区间内是否随折现率翻转”。终值 PE 按 (1-g/ROIC)/(r-g) 计算；输入不足时不输出数值。说明离散风险在情景中的处理，不能用一个未解释的折现率掩盖风险。`;
 
 /**
  * A/B/C 信息丰富度评级前言 -- 强制 agent 先评估资料丰富度，按评级调整研究深度。

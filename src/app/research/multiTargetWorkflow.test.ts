@@ -37,6 +37,7 @@ describe("AI Berkshire workflow alignment", () => {
     assert.match(prompt, /AI 算力/);
     assert.match(prompt, /高频数据/);
     assert.match(prompt, /历史分位无法计算/);
+    assert.match(prompt, /是否随折现率翻转/);
     assert.match(prompt, /反证或口径差异/);
   });
 

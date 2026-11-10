@@ -92,6 +92,7 @@ describe("financial rigor", () => {
     const noFlip = table("7.5%", "5.5%：10%；6.5%：9%；7.5%：8%；8.5%：7.2%；9.5%：6.5%");
     assert.equal(status(noFlip, "terminal-sensitivity"), "warning");
     assert.equal(status(table("8%", "6%：9%；8%：8%；10%：7%") + "\n结论不翻转。", "terminal-sensitivity"), "pass");
+    assert.equal(status(table("8%", "6%：9%；10%：7%") + "\n结论不翻转。", "terminal-sensitivity"), "warning");
   });
 
   test("flags mismatched currencies, implausible assumptions and wrong terminal math", () => {
