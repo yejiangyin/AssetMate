@@ -37,7 +37,26 @@ describe("AI Berkshire workflow alignment", () => {
     assert.match(prompt, /AI 算力/);
     assert.match(prompt, /高频数据/);
     assert.match(prompt, /历史分位无法计算/);
+    assert.match(prompt, /是否随折现率翻转/);
     assert.match(prompt, /反证或口径差异/);
+  });
+
+  test("treats the ten-year model as a position stress test, not a veto", () => {
+    const request = buildAgentRequest({
+      workflowId: "investment_research",
+      agentId: "investment-researcher",
+      publicContext: buildPublicResearchContext(targets[0]!),
+      webSearchMode: "off",
+      maxOutputTokens: 8000,
+    });
+    const prompt = request.messages[1]?.content ?? "";
+    assert.match(prompt, /仓位压力测试/);
+    assert.match(prompt, /不得单独把结论改成回避\/观望或不通过/);
+    assert.match(prompt, /r−2pp \/ r \/ r\+2pp/);
+    assert.match(prompt, /CNY 6%–9%、USD 9%–11\.5%、HKD 9%–11\.5%/);
+    assert.match(prompt, /估值分歧对账/);
+    assert.match(prompt, /三年：… \/ 十年压力测试：…/);
+    assert.match(prompt, /资料不足，不模拟代言/);
   });
 
   test("keeps multi-target research inside investment-checklist", () => {
